@@ -1,0 +1,40 @@
+[listeners]
+http = "0.0.0.0:80"
+https = "0.0.0.0:443"
+admin = "0.0.0.0:8081"
+metrics = "0.0.0.0:9090"
+
+[tls]
+mode = "local"
+cert_dir = "/data/certs"
+local_subject_alt_names = ["localhost", "pxxlhost", "*.pxxlhost"]
+
+[docker]
+enabled = true
+socket_path = "/var/run/docker.sock"
+poll_seconds = 5
+
+[security.rate_limits]
+requests_per_second = 120
+burst = 240
+
+[security.blacklists]
+cidrs = []
+
+[redis]
+url = "redis://redis:6379"
+blacklist_channel = "pxxl:blacklist"
+
+[storage]
+postgres_url = "postgres://pxxl:pxxl@postgres:5432/pxxl"
+clickhouse_url = "http://clickhouse:8123"
+
+[[routes]]
+id = "admin-example"
+domain = "admin.pxxlhost"
+tls = true
+
+[[routes.upstreams]]
+url = "http://dashboard:3000"
+weight = 1
+

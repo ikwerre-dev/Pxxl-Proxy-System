@@ -1,0 +1,55 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: pxxl-edge
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: pxxl-edge
+  template:
+    metadata:
+      labels:
+        app: pxxl-edge
+    spec:
+      containers:
+        - name: edge
+          image: pxxl/edge:local
+          ports:
+            - containerPort: 80
+            - containerPort: 443
+            - containerPort: 8081
+            - containerPort: 9090
+          volumeMounts:
+            - name: config
+              mountPath: /app/config
+              readOnly: true
+            - name: data
+              mountPath: /data
+      volumes:
+        - name: config
+          configMap:
+            name: pxxl-config
+        - name: data
+          emptyDir: {}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: pxxl-edge
+spec:
+  selector:
+    app: pxxl-edge
+  ports:
+    - name: http
+      port: 80
+      targetPort: 80
+    - name: https
+      port: 443
+      targetPort: 443
+    - name: admin
+      port: 8081
+      targetPort: 8081
+    - name: metrics
+      port: 9090
+      targetPort: 9090

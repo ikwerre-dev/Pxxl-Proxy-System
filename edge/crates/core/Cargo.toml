@@ -1,0 +1,15 @@
+[package]
+name = "pxxl-core"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+
+[dependencies]
+pxxl-common = { path = "../common" }
+pxxl-ddos = { path = "../ddos" }
+pxxl-load-balancer = { path = "../load-balancer" }
+pxxl-metrics = { path = "../metrics" }
+arc-swap = { workspace = true }
+serde = { workspace = true }
+tracing = { workspace = true }
+

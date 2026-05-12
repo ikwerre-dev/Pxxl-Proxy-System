@@ -1,0 +1,13 @@
+[package]
+name = "pxxl-ddos"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+
+[dependencies]
+dashmap = { workspace = true }
+ipnet = { workspace = true }
+parking_lot = { workspace = true }
+serde = { workspace = true }
+tokio = { workspace = true }
+

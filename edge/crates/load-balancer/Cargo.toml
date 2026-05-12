@@ -1,0 +1,11 @@
+[package]
+name = "pxxl-load-balancer"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+
+[dependencies]
+pxxl-common = { path = "../common" }
+dashmap = { workspace = true }
+serde = { workspace = true }
+

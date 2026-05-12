@@ -1,0 +1,9 @@
+/target
+**/target
+/data/certs/*
+/data/secrets/*
+!/data/certs/.gitkeep
+!/data/secrets/.gitkeep
+.env
+.DS_Store
+

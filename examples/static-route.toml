@@ -1,0 +1,16 @@
+[[routes]]
+id = "api"
+domain = "api.pxxlhost"
+tls = true
+
+[[routes.paths]]
+prefix = "/v1"
+
+[[routes.paths.upstreams]]
+url = "http://api-1:3000"
+weight = 1
+
+[[routes.paths.upstreams]]
+url = "http://api-2:3000"
+weight = 1
+

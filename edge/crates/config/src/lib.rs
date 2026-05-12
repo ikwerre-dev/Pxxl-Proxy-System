@@ -1,0 +1,394 @@
+use ipnet::IpNet;
+use pxxl_common::{
+    normalize_path_prefix, ListenerConfig, LoadBalancingAlgorithm, PathRoute, Route, RouteSource,
+    Upstream,
+};
+use serde::{Deserialize, Serialize};
+use std::{path::Path, time::Duration};
+
+#[derive(Debug, thiserror::Error)]
+pub enum ConfigError {
+    #[error("failed to read config {path}: {source}")]
+    Read {
+        path: String,
+        source: std::io::Error,
+    },
+    #[error("failed to parse TOML config {path}: {source}")]
+    Parse {
+        path: String,
+        source: toml::de::Error,
+    },
+    #[error("route for domain {domain} has no upstreams")]
+    MissingUpstreams { domain: String },
+}
+
+pub type Result<T> = std::result::Result<T, ConfigError>;
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PxxlConfig {
+    #[serde(default)]
+    pub listeners: ListenerConfig,
+    #[serde(default)]
+    pub tls: TlsConfig,
+    #[serde(default)]
+    pub docker: DockerConfig,
+    #[serde(default)]
+    pub security: SecurityConfig,
+    #[serde(default)]
+    pub redis: RedisConfig,
+    #[serde(default)]
+    pub storage: StorageConfig,
+    #[serde(default)]
+    pub routes: Vec<RouteConfig>,
+}
+
+impl Default for PxxlConfig {
+    fn default() -> Self {
+        Self {
+            listeners: ListenerConfig::default(),
+            tls: TlsConfig::default(),
+            docker: DockerConfig::default(),
+            security: SecurityConfig::default(),
+            redis: RedisConfig::default(),
+            storage: StorageConfig::default(),
+            routes: Vec::new(),
+        }
+    }
+}
+
+impl PxxlConfig {
+    pub async fn load(path: impl AsRef<Path>) -> Result<Self> {
+        let path = path.as_ref();
+        let content = tokio::fs::read_to_string(path)
+            .await
+            .map_err(|source| ConfigError::Read {
+                path: path.display().to_string(),
+                source,
+            })?;
+        toml::from_str(&content).map_err(|source| ConfigError::Parse {
+            path: path.display().to_string(),
+            source,
+        })
+    }
+
+    pub fn static_routes(&self) -> Result<Vec<Route>> {
+        self.routes
+            .iter()
+            .map(RouteConfig::to_route)
+            .collect::<Result<Vec<_>>>()
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TlsConfig {
+    #[serde(default = "default_tls_mode")]
+    pub mode: String,
+    #[serde(default = "default_cert_dir")]
+    pub cert_dir: String,
+    #[serde(default)]
+    pub local_subject_alt_names: Vec<String>,
+}
+
+impl Default for TlsConfig {
+    fn default() -> Self {
+        Self {
+            mode: default_tls_mode(),
+            cert_dir: default_cert_dir(),
+            local_subject_alt_names: vec![
+                "localhost".to_string(),
+                "pxxlhost".to_string(),
+                "*.pxxlhost".to_string(),
+            ],
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DockerConfig {
+    #[serde(default = "default_false")]
+    pub enabled: bool,
+    #[serde(default = "default_docker_socket")]
+    pub socket_path: String,
+    #[serde(default = "default_docker_poll_seconds")]
+    pub poll_seconds: u64,
+}
+
+impl Default for DockerConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            socket_path: default_docker_socket(),
+            poll_seconds: default_docker_poll_seconds(),
+        }
+    }
+}
+
+impl DockerConfig {
+    pub fn poll_interval(&self) -> Duration {
+        Duration::from_secs(self.poll_seconds.max(1))
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SecurityConfig {
+    #[serde(default)]
+    pub rate_limits: RateLimitConfig,
+    #[serde(default)]
+    pub blacklists: BlacklistConfig,
+}
+
+impl Default for SecurityConfig {
+    fn default() -> Self {
+        Self {
+            rate_limits: RateLimitConfig::default(),
+            blacklists: BlacklistConfig::default(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RateLimitConfig {
+    #[serde(default = "default_requests_per_second")]
+    pub requests_per_second: u32,
+    #[serde(default = "default_burst")]
+    pub burst: u32,
+}
+
+impl Default for RateLimitConfig {
+    fn default() -> Self {
+        Self {
+            requests_per_second: default_requests_per_second(),
+            burst: default_burst(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct BlacklistConfig {
+    #[serde(default)]
+    pub cidrs: Vec<IpNet>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RedisConfig {
+    #[serde(default = "default_redis_url")]
+    pub url: String,
+    #[serde(default = "default_blacklist_channel")]
+    pub blacklist_channel: String,
+}
+
+impl Default for RedisConfig {
+    fn default() -> Self {
+        Self {
+            url: default_redis_url(),
+            blacklist_channel: default_blacklist_channel(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct StorageConfig {
+    #[serde(default = "default_postgres_url")]
+    pub postgres_url: String,
+    #[serde(default = "default_clickhouse_url")]
+    pub clickhouse_url: String,
+}
+
+impl Default for StorageConfig {
+    fn default() -> Self {
+        Self {
+            postgres_url: default_postgres_url(),
+            clickhouse_url: default_clickhouse_url(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RouteConfig {
+    pub domain: String,
+    #[serde(default)]
+    pub id: Option<String>,
+    #[serde(default)]
+    pub tls: Option<bool>,
+    #[serde(default)]
+    pub algorithm: LoadBalancingAlgorithm,
+    #[serde(default)]
+    pub upstreams: Vec<UpstreamConfig>,
+    #[serde(default)]
+    pub paths: Vec<PathConfig>,
+}
+
+impl RouteConfig {
+    pub fn to_route(&self) -> Result<Route> {
+        let paths = if self.paths.is_empty() {
+            if self.upstreams.is_empty() {
+                return Err(ConfigError::MissingUpstreams {
+                    domain: self.domain.clone(),
+                });
+            }
+            vec![PathRoute::new(
+                "/",
+                self.upstreams.iter().map(UpstreamConfig::to_upstream).collect(),
+            )]
+        } else {
+            self.paths
+                .iter()
+                .map(|path| {
+                    let upstreams = if path.upstreams.is_empty() {
+                        self.upstreams.iter().map(UpstreamConfig::to_upstream).collect()
+                    } else {
+                        path.upstreams.iter().map(UpstreamConfig::to_upstream).collect()
+                    };
+
+                    if upstreams.is_empty() {
+                        return Err(ConfigError::MissingUpstreams {
+                            domain: self.domain.clone(),
+                        });
+                    }
+
+                    Ok(PathRoute {
+                        prefix: normalize_path_prefix(path.prefix.as_str()),
+                        upstreams,
+                        middlewares: path.middlewares.clone(),
+                    })
+                })
+                .collect::<Result<Vec<_>>>()?
+        };
+
+        let mut route = Route::new(self.domain.as_str(), paths, RouteSource::Static);
+        route.tls = self.tls.unwrap_or(true);
+        route.algorithm = self.algorithm.clone();
+
+        if let Some(id) = &self.id {
+            route = route.with_id(id);
+        }
+
+        Ok(route)
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PathConfig {
+    #[serde(default = "root_path")]
+    pub prefix: String,
+    #[serde(default)]
+    pub upstreams: Vec<UpstreamConfig>,
+    #[serde(default)]
+    pub middlewares: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct UpstreamConfig {
+    pub url: String,
+    #[serde(default = "default_weight")]
+    pub weight: u32,
+}
+
+impl UpstreamConfig {
+    pub fn to_upstream(&self) -> Upstream {
+        Upstream {
+            url: self.url.clone(),
+            weight: self.weight,
+            healthy: true,
+        }
+    }
+}
+
+fn default_tls_mode() -> String {
+    "local".to_string()
+}
+
+fn default_cert_dir() -> String {
+    "/data/certs".to_string()
+}
+
+fn default_docker_socket() -> String {
+    "/var/run/docker.sock".to_string()
+}
+
+fn default_docker_poll_seconds() -> u64 {
+    5
+}
+
+fn default_requests_per_second() -> u32 {
+    120
+}
+
+fn default_burst() -> u32 {
+    240
+}
+
+fn default_redis_url() -> String {
+    "redis://redis:6379".to_string()
+}
+
+fn default_blacklist_channel() -> String {
+    "pxxl:blacklist".to_string()
+}
+
+fn default_postgres_url() -> String {
+    "postgres://pxxl:pxxl@postgres:5432/pxxl".to_string()
+}
+
+fn default_clickhouse_url() -> String {
+    "http://clickhouse:8123".to_string()
+}
+
+fn default_weight() -> u32 {
+    1
+}
+
+fn default_false() -> bool {
+    false
+}
+
+fn root_path() -> String {
+    "/".to_string()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parses_static_route_with_root_upstreams() {
+        let raw = r#"
+            [listeners]
+            http = "127.0.0.1:8080"
+            https = "127.0.0.1:8443"
+            admin = "127.0.0.1:8081"
+            metrics = "127.0.0.1:9090"
+
+            [[routes]]
+            id = "app"
+            domain = "app.pxxlhost"
+            [[routes.upstreams]]
+            url = "http://web:3000"
+        "#;
+
+        let config: PxxlConfig = toml::from_str(raw).unwrap();
+        let routes = config.static_routes().unwrap();
+
+        assert_eq!(routes[0].id, "app");
+        assert_eq!(routes[0].domain, "app.pxxlhost");
+        assert_eq!(routes[0].paths[0].upstreams[0].url, "http://web:3000");
+    }
+
+    #[test]
+    fn parses_path_specific_upstreams() {
+        let raw = r#"
+            [[routes]]
+            domain = "api.pxxlhost"
+
+            [[routes.paths]]
+            prefix = "/v1"
+            [[routes.paths.upstreams]]
+            url = "http://api:3000"
+        "#;
+
+        let config: PxxlConfig = toml::from_str(raw).unwrap();
+        let routes = config.static_routes().unwrap();
+
+        assert_eq!(routes[0].paths[0].prefix, "/v1");
+    }
+}

@@ -1,0 +1,6 @@
+FROM rust:1-bookworm
+WORKDIR /app
+RUN cargo install cargo-watch
+COPY . .
+EXPOSE 80 443 8081 9090
+CMD ["cargo", "watch", "-w", "edge", "-x", "run -p pxxl-edge"]

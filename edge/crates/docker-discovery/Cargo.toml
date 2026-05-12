@@ -1,0 +1,16 @@
+[package]
+name = "pxxl-docker-discovery"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+
+[dependencies]
+pxxl-common = { path = "../common" }
+pxxl-core = { path = "../core" }
+pxxl-metrics = { path = "../metrics" }
+anyhow = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }
+

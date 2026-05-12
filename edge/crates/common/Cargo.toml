@@ -1,0 +1,14 @@
+[package]
+name = "pxxl-common"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+
+[dependencies]
+chrono = { workspace = true }
+http = { workspace = true }
+serde = { workspace = true }
+thiserror = { workspace = true }
+url = { workspace = true }
+uuid = { workspace = true }
+

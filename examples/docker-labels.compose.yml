@@ -1,0 +1,9 @@
+services:
+  web:
+    image: nginx:alpine
+    labels:
+      - pxxl.enable=true
+      - pxxl.domain=app.pxxlhost
+      - pxxl.port=80
+      - pxxl.path=/
+

@@ -1,0 +1,38 @@
+[package]
+name = "pxxl-edge"
+version = "0.1.0"
+edition = "2021"
+authors = ["Robinson Honour"]
+license = "MIT"
+description = "Pxxl Proxy edge binary"
+repository = "https://github.com/pxxl/proxy"
+
+[dependencies]
+pxxl-api = { path = "crates/api" }
+pxxl-common = { path = "crates/common" }
+pxxl-config = { path = "crates/config" }
+pxxl-core = { path = "crates/core" }
+pxxl-ddos = { path = "crates/ddos" }
+pxxl-docker-discovery = { path = "crates/docker-discovery" }
+pxxl-http-proxy = { path = "crates/http-proxy" }
+pxxl-load-balancer = { path = "crates/load-balancer" }
+pxxl-metrics = { path = "crates/metrics" }
+pxxl-tls = { path = "crates/tls" }
+
+anyhow = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+
+[dev-dependencies]
+bytes = { workspace = true }
+criterion = "0.5"
+http = { workspace = true }
+http-body-util = { workspace = true }
+hyper = { workspace = true }
+hyper-util = { workspace = true }
+tempfile = { workspace = true }
+
+[[bench]]
+name = "hot_path"
+harness = false
