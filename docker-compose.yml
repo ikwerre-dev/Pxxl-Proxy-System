@@ -4,7 +4,7 @@ services:
       context: .
       dockerfile: edge/docker/Dockerfile
     image: pxxl/edge:local
-    container_name: pxxl-edge
+    container_name: pxxl-proxy-edge
     restart: unless-stopped
     environment:
       PXXL_CONFIG: /app/config/pxxl.toml
@@ -25,14 +25,14 @@ services:
 
   redis:
     image: redis:7-alpine
-    container_name: pxxl-redis
+    container_name: pxxl-proxy-redis
     restart: unless-stopped
     ports:
       - "6379:6379"
 
   postgres:
     image: postgres:16-alpine
-    container_name: pxxl-postgres
+    container_name: pxxl-proxy-postgres
     restart: unless-stopped
     environment:
       POSTGRES_USER: pxxl
@@ -45,8 +45,14 @@ services:
 
   clickhouse:
     image: clickhouse/clickhouse-server:24.8
-    container_name: pxxl-clickhouse
+    platform: linux/amd64
+    container_name: pxxl-proxy-clickhouse
     restart: unless-stopped
+    environment:
+      CLICKHOUSE_DB: pxxl
+      CLICKHOUSE_USER: pxxl
+      CLICKHOUSE_PASSWORD: pxxl
+      CLICKHOUSE_DEFAULT_ACCESS_MANAGEMENT: "1"
     ports:
       - "8123:8123"
       - "9000:9000"
@@ -55,7 +61,7 @@ services:
 
   prometheus:
     image: prom/prometheus:v2.55.0
-    container_name: pxxl-prometheus
+    container_name: pxxl-proxy-prometheus
     restart: unless-stopped
     ports:
       - "9091:9090"
@@ -66,7 +72,8 @@ services:
 
   grafana:
     image: grafana/grafana:11.2.0
-    container_name: pxxl-grafana
+    platform: linux/amd64
+    container_name: pxxl-proxy-grafana
     restart: unless-stopped
     environment:
       GF_SECURITY_ADMIN_USER: admin
@@ -83,4 +90,3 @@ volumes:
   postgres-data:
   clickhouse-data:
   grafana-data:
-
