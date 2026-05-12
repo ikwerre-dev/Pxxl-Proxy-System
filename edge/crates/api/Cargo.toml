@@ -5,8 +5,10 @@ edition = "2021"
 license = "MIT"
 
 [dependencies]
+pxxl-common = { path = "../common" }
 pxxl-core = { path = "../core" }
 pxxl-metrics = { path = "../metrics" }
+pxxl-redis-sync = { path = "../redis-sync" }
 anyhow = { workspace = true }
 bytes = { workspace = true }
 http = { workspace = true }

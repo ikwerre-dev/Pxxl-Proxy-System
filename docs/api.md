@@ -30,6 +30,43 @@ GET /v1/routes
 
 Returns the active route snapshot.
 
+## Dynamic Domains
+
+```http
+POST /v1/domains
+Content-Type: application/json
+
+{
+  "domain": "app.pxxlhost",
+  "path": "/",
+  "tls": true,
+  "algorithm": "round_robin",
+  "upstreams": [
+    {
+      "url": "http://host.docker.internal:3000",
+      "weight": 1
+    }
+  ]
+}
+```
+
+API-created domains are persisted in Redis and loaded into the in-memory route registry. Request forwarding does not query Redis.
+
+```http
+GET /v1/domains
+GET /v1/domains/{domain}
+DELETE /v1/domains/{domain}
+```
+
+## Stats
+
+```http
+GET /v1/stats/domains
+GET /v1/domains/{domain}/stats
+```
+
+Returns in-memory per-domain counters, status buckets, average latency, last status, and last-seen timestamp.
+
 ## Upstreams
 
 ```http
@@ -58,4 +95,3 @@ Content-Type: application/json
 ```http
 DELETE /v1/blacklist/{domain_id}/{ip}
 ```
-

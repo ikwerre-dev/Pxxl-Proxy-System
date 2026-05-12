@@ -30,11 +30,19 @@ postgres_url = "postgres://pxxl:pxxl@postgres:5432/pxxl"
 clickhouse_url = "http://clickhouse:8123"
 
 [[routes]]
+id = "local-app"
+domain = "app.pxxlhost"
+tls = true
+
+[[routes.upstreams]]
+url = "http://host.docker.internal:3000"
+weight = 1
+
+[[routes]]
 id = "admin-example"
 domain = "admin.pxxlhost"
 tls = true
 
 [[routes.upstreams]]
-url = "http://dashboard:3000"
+url = "http://grafana:3000"
 weight = 1
-

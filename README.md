@@ -88,10 +88,23 @@ For true wildcard resolution, use dnsmasq or CoreDNS.
 - `GET /healthz`
 - `GET /readyz`
 - `GET /v1/routes`
+- `GET /v1/domains`
+- `POST /v1/domains`
+- `GET /v1/domains/{domain}`
+- `DELETE /v1/domains/{domain}`
+- `GET /v1/stats/domains`
+- `GET /v1/domains/{domain}/stats`
 - `GET /v1/upstreams`
 - `GET /v1/certs`
 - `POST /v1/blacklist/{domain_id}` with `{"ip":"203.0.113.10"}`
 - `DELETE /v1/blacklist/{domain_id}/{ip}`
+
+API-created domains are persisted in Redis and immediately loaded into the in-memory route registry. The proxy hot path does not query Redis.
+
+Postman collection:
+
+- `docs/postman/pxxl-proxy.postman_collection.json`
+- `docs/postman/pxxl-proxy.postman_environment.json`
 
 ## Workspace
 
@@ -126,4 +139,3 @@ Rust is required for local builds. Docker can build the project through the prov
 ## License
 
 MIT License. Created by Robinson Honour.
-

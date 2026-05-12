@@ -7,6 +7,7 @@ use pxxl_docker_discovery::{run_docker_polling, DockerDiscovery};
 use pxxl_http_proxy::{run_http_proxy, run_https_proxy};
 use pxxl_load_balancer::LoadBalancer;
 use pxxl_metrics::PxxlMetrics;
+use pxxl_redis_sync::RedisRouteStore;
 use pxxl_tls::{CertificateIssuer, LocalCertificateStore};
 use std::{net::SocketAddr, path::Path, sync::Arc, time::Duration};
 use tokio::{sync::watch, task::JoinHandle, time};
@@ -28,8 +29,19 @@ async fn main() -> Result<()> {
     };
     apply_env_overrides(&mut config);
 
-    let static_routes = config.static_routes()?;
-    let route_domains = static_routes
+    let mut initial_routes = config.static_routes()?;
+    let route_store = RedisRouteStore::new(config.redis.url.clone(), "pxxl:routes");
+    match route_store.load_routes().await {
+        Ok(routes) => {
+            info!(count = routes.len(), "loaded API routes from Redis");
+            initial_routes.extend(routes);
+        }
+        Err(error) => {
+            warn!(%error, "could not load API routes from Redis; starting with static routes only");
+        }
+    }
+
+    let route_domains = initial_routes
         .iter()
         .map(|route| route.domain.clone())
         .collect::<Vec<_>>();
@@ -43,7 +55,7 @@ async fn main() -> Result<()> {
         burst: config.security.rate_limits.burst,
     }));
     let security = Arc::new(SecurityEngine::new(blacklist, rate_limiter));
-    let routes = Arc::new(RouteRegistry::new(static_routes));
+    let routes = Arc::new(RouteRegistry::new(initial_routes));
     let load_balancer = Arc::new(LoadBalancer::new());
     let state = EdgeState::new(routes, security, load_balancer, metrics.clone());
 
@@ -83,6 +95,7 @@ async fn main() -> Result<()> {
         admin_addr,
         state.clone(),
         config.tls.cert_dir.clone(),
+        Some(route_store.clone()),
         shutdown_rx.clone(),
     )));
     tasks.push(tokio::spawn(run_metrics_server(

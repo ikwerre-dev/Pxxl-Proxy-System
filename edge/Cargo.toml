@@ -17,6 +17,7 @@ pxxl-docker-discovery = { path = "crates/docker-discovery" }
 pxxl-http-proxy = { path = "crates/http-proxy" }
 pxxl-load-balancer = { path = "crates/load-balancer" }
 pxxl-metrics = { path = "crates/metrics" }
+pxxl-redis-sync = { path = "crates/redis-sync" }
 pxxl-tls = { path = "crates/tls" }
 
 anyhow = { workspace = true }

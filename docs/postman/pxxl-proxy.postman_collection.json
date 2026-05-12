@@ -1,0 +1,171 @@
+{
+  "info": {
+    "_postman_id": "6ebc9d7e-1b02-4ffd-a773-f5b48b384ef1",
+    "name": "Pxxl Proxy API",
+    "description": "Local admin API collection for Pxxl Proxy. Import `pxxl-proxy.postman_environment.json` and run Docker Compose before sending requests.",
+    "schema": "https://schema.getpostman.com/json/collection/v2.1.0/collection.json"
+  },
+  "item": [
+    {
+      "name": "Health",
+      "item": [
+        {
+          "name": "Healthz",
+          "request": {
+            "method": "GET",
+            "url": "{{baseUrl}}/healthz"
+          }
+        },
+        {
+          "name": "Readyz",
+          "request": {
+            "method": "GET",
+            "url": "{{baseUrl}}/readyz"
+          }
+        }
+      ]
+    },
+    {
+      "name": "Domains",
+      "item": [
+        {
+          "name": "Create or Update Domain",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"domain\": \"{{domain}}\",\n  \"path\": \"/\",\n  \"tls\": true,\n  \"algorithm\": \"round_robin\",\n  \"upstreams\": [\n    {\n      \"url\": \"{{upstreamUrl}}\",\n      \"weight\": 1\n    }\n  ]\n}"
+            },
+            "url": "{{baseUrl}}/v1/domains"
+          }
+        },
+        {
+          "name": "Create Domain With Multiple Paths",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"domain\": \"api.pxxlhost\",\n  \"tls\": true,\n  \"paths\": [\n    {\n      \"prefix\": \"/v1\",\n      \"upstreams\": [\n        { \"url\": \"http://host.docker.internal:3001\", \"weight\": 1 }\n      ]\n    },\n    {\n      \"prefix\": \"/v2\",\n      \"upstreams\": [\n        { \"url\": \"http://host.docker.internal:3002\", \"weight\": 1 }\n      ]\n    }\n  ]\n}"
+            },
+            "url": "{{baseUrl}}/v1/domains"
+          }
+        },
+        {
+          "name": "List Domains",
+          "request": {
+            "method": "GET",
+            "url": "{{baseUrl}}/v1/domains"
+          }
+        },
+        {
+          "name": "Get Domain",
+          "request": {
+            "method": "GET",
+            "url": "{{baseUrl}}/v1/domains/{{domain}}"
+          }
+        },
+        {
+          "name": "Delete Domain",
+          "request": {
+            "method": "DELETE",
+            "url": "{{baseUrl}}/v1/domains/{{domain}}"
+          }
+        }
+      ]
+    },
+    {
+      "name": "Stats",
+      "item": [
+        {
+          "name": "All Domain Stats",
+          "request": {
+            "method": "GET",
+            "url": "{{baseUrl}}/v1/stats/domains"
+          }
+        },
+        {
+          "name": "Domain Stats",
+          "request": {
+            "method": "GET",
+            "url": "{{baseUrl}}/v1/domains/{{domain}}/stats"
+          }
+        },
+        {
+          "name": "Prometheus Metrics",
+          "request": {
+            "method": "GET",
+            "url": "{{metricsUrl}}/metrics"
+          }
+        }
+      ]
+    },
+    {
+      "name": "Routes and Upstreams",
+      "item": [
+        {
+          "name": "List Routes",
+          "request": {
+            "method": "GET",
+            "url": "{{baseUrl}}/v1/routes"
+          }
+        },
+        {
+          "name": "List Upstreams",
+          "request": {
+            "method": "GET",
+            "url": "{{baseUrl}}/v1/upstreams"
+          }
+        },
+        {
+          "name": "Certificate Metadata",
+          "request": {
+            "method": "GET",
+            "url": "{{baseUrl}}/v1/certs"
+          }
+        }
+      ]
+    },
+    {
+      "name": "Blacklist",
+      "item": [
+        {
+          "name": "Add IP To Domain Blacklist",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"ip\": \"{{blacklistIp}}\"\n}"
+            },
+            "url": "{{baseUrl}}/v1/blacklist/{{domain}}"
+          }
+        },
+        {
+          "name": "Remove IP From Domain Blacklist",
+          "request": {
+            "method": "DELETE",
+            "url": "{{baseUrl}}/v1/blacklist/{{domain}}/{{blacklistIp}}"
+          }
+        }
+      ]
+    }
+  ]
+}
+

@@ -6,8 +6,13 @@ use hyper_util::{
     rt::{TokioExecutor, TokioIo},
     server::conn::auto::Builder as AutoBuilder,
 };
+use pxxl_common::{
+    normalize_domain, normalize_path_prefix, LoadBalancingAlgorithm, PathRoute, Route, RouteSource,
+    Upstream,
+};
 use pxxl_core::EdgeState;
 use pxxl_metrics::PxxlMetrics;
+use pxxl_redis_sync::RedisRouteStore;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use std::{
@@ -25,11 +30,46 @@ type BoxBody = http_body_util::combinators::BoxBody<Bytes, BoxError>;
 struct ApiServer {
     state: EdgeState,
     cert_dir: String,
+    route_store: Option<RedisRouteStore>,
 }
 
 #[derive(Debug, Deserialize)]
 struct BlacklistBody {
     ip: IpAddr,
+}
+
+#[derive(Debug, Deserialize)]
+struct DomainRouteBody {
+    domain: String,
+    #[serde(default)]
+    id: Option<String>,
+    #[serde(default)]
+    path: Option<String>,
+    #[serde(default)]
+    tls: Option<bool>,
+    #[serde(default)]
+    algorithm: LoadBalancingAlgorithm,
+    #[serde(default)]
+    upstreams: Vec<UpstreamBody>,
+    #[serde(default)]
+    paths: Vec<PathBody>,
+}
+
+#[derive(Debug, Deserialize)]
+struct PathBody {
+    #[serde(default = "root_path")]
+    prefix: String,
+    #[serde(default)]
+    upstreams: Vec<UpstreamBody>,
+    #[serde(default)]
+    middlewares: Vec<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct UpstreamBody {
+    url: String,
+    #[serde(default = "default_weight")]
+    weight: u32,
 }
 
 #[derive(Debug, Serialize)]
@@ -46,12 +86,14 @@ pub async fn run_admin_api(
     addr: SocketAddr,
     state: EdgeState,
     cert_dir: impl Into<String>,
+    route_store: Option<RedisRouteStore>,
     shutdown: watch::Receiver<bool>,
 ) -> anyhow::Result<()> {
     let listener = TcpListener::bind(addr).await?;
     let server = ApiServer {
         state,
         cert_dir: cert_dir.into(),
+        route_store,
     };
     info!(%addr, "admin API listening");
     run_api_listener(listener, server, shutdown).await
@@ -161,6 +203,83 @@ impl ApiServer {
             (Method::GET, "/v1/routes") => {
                 json_response(StatusCode::OK, json!({ "routes": self.state.routes.snapshot() }))
             }
+            (Method::GET, "/v1/domains") => {
+                json_response(StatusCode::OK, json!({ "domains": self.state.routes.snapshot() }))
+            }
+            (Method::POST, "/v1/domains") => self.create_domain(req).await,
+            (Method::GET, "/v1/stats/domains") => {
+                json_response(
+                    StatusCode::OK,
+                    json!({ "domains": self.state.stats.snapshots() }),
+                )
+            }
+            (Method::GET, path) if path.starts_with("/v1/domains/") && path.ends_with("/stats") => {
+                let domain = path
+                    .trim_start_matches("/v1/domains/")
+                    .trim_end_matches("/stats")
+                    .trim_matches('/');
+                if domain.is_empty() {
+                    return json_response(StatusCode::BAD_REQUEST, json!({"error": "missing domain"}));
+                }
+                let normalized = normalize_domain(domain);
+                match self.state.stats.snapshot_domain(&normalized) {
+                    Some(stats) => json_response(StatusCode::OK, json!({ "stats": stats })),
+                    None => json_response(
+                        StatusCode::OK,
+                        json!({
+                            "stats": {
+                                "domain": normalized,
+                                "requests_total": 0,
+                                "responses_2xx": 0,
+                                "responses_3xx": 0,
+                                "responses_4xx": 0,
+                                "responses_5xx": 0,
+                                "average_latency_ms": 0.0,
+                                "last_status": null,
+                                "last_seen_unix_ms": null
+                            }
+                        }),
+                    ),
+                }
+            }
+            (Method::GET, path) if path.starts_with("/v1/domains/") => {
+                let domain = path.trim_start_matches("/v1/domains/").trim_matches('/');
+                if domain.is_empty() {
+                    return json_response(StatusCode::BAD_REQUEST, json!({"error": "missing domain"}));
+                }
+                match self.state.routes.find_domain(&normalize_domain(domain)) {
+                    Some(route) => json_response(StatusCode::OK, json!({ "domain": route })),
+                    None => json_response(StatusCode::NOT_FOUND, json!({"error": "domain not found"})),
+                }
+            }
+            (Method::DELETE, path) if path.starts_with("/v1/domains/") => {
+                let domain = normalize_domain(path.trim_start_matches("/v1/domains/").trim_matches('/'));
+                if domain.is_empty() {
+                    return json_response(StatusCode::BAD_REQUEST, json!({"error": "missing domain"}));
+                }
+                let memory_deleted = self.state.delete_api_domain(&domain);
+                let store_deleted = match &self.route_store {
+                    Some(store) => match store.delete_domain(&domain).await {
+                        Ok(deleted) => deleted,
+                        Err(error) => {
+                            return json_response(
+                                StatusCode::BAD_GATEWAY,
+                                json!({"error": format!("failed to delete Redis route: {error}")}),
+                            );
+                        }
+                    },
+                    None => false,
+                };
+                json_response(
+                    StatusCode::OK,
+                    json!({
+                        "status": "deleted",
+                        "domain": domain,
+                        "memory_deleted": memory_deleted,
+                        "store_deleted": store_deleted
+                    }),
+                )
+            }
             (Method::GET, "/v1/upstreams") => {
                 let upstreams = self
                     .state
@@ -232,6 +351,109 @@ impl ApiServer {
             _ => json_response(StatusCode::NOT_FOUND, json!({"error": "not found"})),
         }
     }
+
+    async fn create_domain(&self, req: Request<Incoming>) -> Response<BoxBody> {
+        let collected = match req.into_body().collect().await {
+            Ok(collected) => collected,
+            Err(error) => {
+                return json_response(StatusCode::BAD_REQUEST, json!({"error": error.to_string()}));
+            }
+        };
+        let body = match serde_json::from_slice::<DomainRouteBody>(&collected.to_bytes()) {
+            Ok(body) => body,
+            Err(error) => {
+                return json_response(StatusCode::BAD_REQUEST, json!({"error": error.to_string()}));
+            }
+        };
+        let route = match body.into_route() {
+            Ok(route) => route,
+            Err(error) => return json_response(StatusCode::BAD_REQUEST, json!({"error": error})),
+        };
+
+        if let Some(store) = &self.route_store {
+            if let Err(error) = store.upsert_route(&route).await {
+                return json_response(
+                    StatusCode::BAD_GATEWAY,
+                    json!({"error": format!("failed to persist Redis route: {error}")}),
+                );
+            }
+        }
+
+        self.state.upsert_api_route(route.clone());
+        json_response(
+            StatusCode::CREATED,
+            json!({
+                "status": "created",
+                "domain": route
+            }),
+        )
+    }
+}
+
+impl DomainRouteBody {
+    fn into_route(self) -> Result<Route, String> {
+        let domain = normalize_domain(&self.domain);
+        if domain.is_empty() {
+            return Err("domain is required".to_string());
+        }
+
+        let paths = if self.paths.is_empty() {
+            if self.upstreams.is_empty() {
+                return Err("at least one upstream is required".to_string());
+            }
+            vec![PathRoute {
+                prefix: normalize_path_prefix(self.path.unwrap_or_else(root_path)),
+                upstreams: self
+                    .upstreams
+                    .into_iter()
+                    .map(UpstreamBody::into_upstream)
+                    .collect(),
+                middlewares: Vec::new(),
+            }]
+        } else {
+            self.paths
+                .into_iter()
+                .map(|path| {
+                    if path.upstreams.is_empty() {
+                        return Err("each path needs at least one upstream".to_string());
+                    }
+                    Ok(PathRoute {
+                        prefix: normalize_path_prefix(path.prefix),
+                        upstreams: path
+                            .upstreams
+                            .into_iter()
+                            .map(UpstreamBody::into_upstream)
+                            .collect(),
+                        middlewares: path.middlewares,
+                    })
+                })
+                .collect::<Result<Vec<_>, _>>()?
+        };
+
+        let mut route = Route::new(domain.clone(), paths, RouteSource::Api);
+        route.id = self.id.unwrap_or_else(|| format!("api-{domain}"));
+        route.tls = self.tls.unwrap_or(true);
+        route.algorithm = self.algorithm;
+        Ok(route)
+    }
+}
+
+impl UpstreamBody {
+    fn into_upstream(self) -> Upstream {
+        Upstream {
+            url: self.url,
+            weight: self.weight.max(1),
+            healthy: true,
+        }
+    }
+}
+
+fn default_weight() -> u32 {
+    1
+}
+
+fn root_path() -> String {
+    "/".to_string()
 }
 
 fn json_response(status: StatusCode, value: serde_json::Value) -> Response<BoxBody> {

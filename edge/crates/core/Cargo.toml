@@ -10,6 +10,6 @@ pxxl-ddos = { path = "../ddos" }
 pxxl-load-balancer = { path = "../load-balancer" }
 pxxl-metrics = { path = "../metrics" }
 arc-swap = { workspace = true }
+dashmap = { workspace = true }
 serde = { workspace = true }
 tracing = { workspace = true }
-

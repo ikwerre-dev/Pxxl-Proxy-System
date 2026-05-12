@@ -5,6 +5,7 @@ edition = "2021"
 license = "MIT"
 
 [dependencies]
+pxxl-common = { path = "../common" }
 pxxl-ddos = { path = "../ddos" }
 anyhow = { workspace = true }
 futures-util = { workspace = true }

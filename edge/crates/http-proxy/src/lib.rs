@@ -72,7 +72,13 @@ impl ProxyServer {
                         .blocked_total
                         .with_label_values(&[&domain, &reason])
                         .inc();
-                    self.observe_request(&domain, method.as_str(), StatusCode::FORBIDDEN);
+                    self.observe_request(
+                        &domain,
+                        method.as_str(),
+                        StatusCode::FORBIDDEN,
+                        started,
+                        None,
+                    );
                     return text_response(StatusCode::FORBIDDEN, "request blocked");
                 }
                 SecurityDecision::RateLimited { retry_after } => {
@@ -81,7 +87,13 @@ impl ProxyServer {
                         .rate_limited_total
                         .with_label_values(&[&domain])
                         .inc();
-                    self.observe_request(&domain, method.as_str(), StatusCode::TOO_MANY_REQUESTS);
+                    self.observe_request(
+                        &domain,
+                        method.as_str(),
+                        StatusCode::TOO_MANY_REQUESTS,
+                        started,
+                        None,
+                    );
                     let mut response = text_response(StatusCode::TOO_MANY_REQUESTS, "rate limited");
                     if let Ok(value) = HeaderValue::from_str(&retry_after.as_secs().max(1).to_string()) {
                         response.headers_mut().insert("retry-after", value);
@@ -94,7 +106,13 @@ impl ProxyServer {
         let matched = match self.state.routes.find(&host, &path) {
             Some(matched) => matched,
             None => {
-                self.observe_request(&domain, method.as_str(), StatusCode::NOT_FOUND);
+                self.observe_request(
+                    &domain,
+                    method.as_str(),
+                    StatusCode::NOT_FOUND,
+                    started,
+                    None,
+                );
                 return text_response(StatusCode::NOT_FOUND, "no route matched this host/path");
             }
         };
@@ -108,7 +126,13 @@ impl ProxyServer {
         ) {
             Some(upstream) => upstream,
             None => {
-                self.observe_request(&domain, method.as_str(), StatusCode::SERVICE_UNAVAILABLE);
+                self.observe_request(
+                    &domain,
+                    method.as_str(),
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    started,
+                    None,
+                );
                 return text_response(StatusCode::SERVICE_UNAVAILABLE, "no healthy upstreams");
             }
         };
@@ -116,7 +140,7 @@ impl ProxyServer {
         match self.forward(req, &matched, &upstream, remote_ip).await {
             Ok(response) => {
                 let status = response.status();
-                self.observe_request(&domain, method.as_str(), status);
+                self.observe_request(&domain, method.as_str(), status, started, Some(&upstream.url));
                 self.state
                     .metrics
                     .upstream_latency_seconds
@@ -135,7 +159,13 @@ impl ProxyServer {
             }
             Err(error) => {
                 warn!(%error, domain = %domain, upstream = %upstream.url, "upstream request failed");
-                self.observe_request(&domain, method.as_str(), StatusCode::BAD_GATEWAY);
+                self.observe_request(
+                    &domain,
+                    method.as_str(),
+                    StatusCode::BAD_GATEWAY,
+                    started,
+                    Some(&upstream.url),
+                );
                 text_response(StatusCode::BAD_GATEWAY, "upstream request failed")
             }
         }
@@ -183,12 +213,25 @@ impl ProxyServer {
         ))
     }
 
-    fn observe_request(&self, domain: &str, method: &str, status: StatusCode) {
+    fn observe_request(
+        &self,
+        domain: &str,
+        method: &str,
+        status: StatusCode,
+        started: Instant,
+        upstream: Option<&str>,
+    ) {
         self.state
             .metrics
             .requests_total
             .with_label_values(&[domain, method, &status.as_u16().to_string()])
             .inc();
+        self.state.stats.record(
+            domain,
+            status.as_u16(),
+            started.elapsed().as_millis() as u64,
+            upstream,
+        );
     }
 }
 
