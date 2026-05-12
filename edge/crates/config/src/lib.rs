@@ -234,7 +234,7 @@ impl RouteConfig {
             self.paths
                 .iter()
                 .map(|path| {
-                    let upstreams = if path.upstreams.is_empty() {
+                    let upstreams: Vec<Upstream> = if path.upstreams.is_empty() {
                         self.upstreams.iter().map(UpstreamConfig::to_upstream).collect()
                     } else {
                         path.upstreams.iter().map(UpstreamConfig::to_upstream).collect()

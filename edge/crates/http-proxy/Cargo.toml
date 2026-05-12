@@ -7,6 +7,7 @@ license = "MIT"
 [dependencies]
 pxxl-common = { path = "../common" }
 pxxl-core = { path = "../core" }
+pxxl-ddos = { path = "../ddos" }
 pxxl-metrics = { path = "../metrics" }
 pxxl-tls = { path = "../tls" }
 anyhow = { workspace = true }

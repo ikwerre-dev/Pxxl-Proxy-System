@@ -1,0 +1,5 @@
+FROM rust:1-bookworm
+WORKDIR /src
+COPY Cargo.toml ./
+COPY edge ./edge
+RUN cargo test --workspace --all-targets

@@ -28,7 +28,7 @@ pub enum TlsError {
         source: std::io::Error,
     },
     #[error("failed to generate local certificate: {0}")]
-    Generate(#[from] rcgen::RcgenError),
+    Generate(#[from] rcgen::Error),
     #[error("failed to parse PEM file: {0}")]
     Pem(#[from] std::io::Error),
     #[error("private key file did not contain a supported key")]
