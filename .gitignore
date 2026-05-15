@@ -2,6 +2,7 @@
 **/target
 /data/certs/*
 /data/secrets/*
+/data/*.sock
 !/data/certs/.gitkeep
 !/data/secrets/.gitkeep
 .env

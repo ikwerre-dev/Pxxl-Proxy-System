@@ -13,8 +13,10 @@ pxxl-metrics = { path = "../metrics" }
 pxxl-tls = { path = "../tls" }
 anyhow = { workspace = true }
 arc-swap = { workspace = true }
+base64 = { workspace = true }
 bytes = { workspace = true }
 dashmap = { workspace = true }
+flate2 = { workspace = true }
 http = { workspace = true }
 http-body-util = { workspace = true }
 hyper = { workspace = true }

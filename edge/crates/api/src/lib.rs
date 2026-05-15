@@ -9,7 +9,7 @@ use hyper_util::{
 use ipnet::IpNet;
 use pxxl_common::{
     normalize_domain, normalize_path_prefix, DomainRules, LoadBalancingAlgorithm, PathRoute, Route,
-    RouteSource, Upstream,
+    RouteSource, Upstream, UpstreamTransport,
 };
 use pxxl_core::EdgeState;
 use pxxl_metrics::PxxlMetrics;
@@ -87,6 +87,10 @@ struct UpstreamBody {
     url: String,
     #[serde(default = "default_weight")]
     weight: u32,
+    #[serde(default)]
+    backup: bool,
+    #[serde(default)]
+    transport: UpstreamTransport,
 }
 
 #[derive(Debug, Serialize)]
@@ -726,6 +730,8 @@ impl UpstreamBody {
             url: self.url,
             weight: self.weight.max(1),
             healthy: true,
+            backup: self.backup,
+            transport: self.transport,
         }
     }
 }

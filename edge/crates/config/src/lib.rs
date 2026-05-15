@@ -394,6 +394,10 @@ pub struct UpstreamConfig {
     pub url: String,
     #[serde(default = "default_weight")]
     pub weight: u32,
+    #[serde(default)]
+    pub backup: bool,
+    #[serde(default)]
+    pub transport: pxxl_common::UpstreamTransport,
 }
 
 impl UpstreamConfig {
@@ -402,6 +406,8 @@ impl UpstreamConfig {
             url: self.url.clone(),
             weight: self.weight,
             healthy: true,
+            backup: self.backup,
+            transport: self.transport.clone(),
         }
     }
 }

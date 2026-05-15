@@ -1,11 +1,14 @@
 use anyhow::Context;
 use arc_swap::ArcSwap;
+use base64::Engine;
 use bytes::Bytes;
+use flate2::{write::GzEncoder, Compression};
 use dashmap::DashMap;
 use http::{
     header::{
-        HeaderMap, HeaderName, HeaderValue, ACCESS_CONTROL_REQUEST_METHOD, CACHE_CONTROL,
-        CONNECTION, CONTENT_LENGTH, CONTENT_TYPE, HOST, LOCATION, ORIGIN, UPGRADE, VARY,
+        HeaderMap, HeaderName, HeaderValue, ACCEPT_ENCODING, ACCESS_CONTROL_REQUEST_METHOD,
+        AUTHORIZATION, CACHE_CONTROL, CONNECTION, CONTENT_ENCODING, CONTENT_LENGTH, CONTENT_TYPE,
+        COOKIE, HOST, LOCATION, ORIGIN, SET_COOKIE, UPGRADE, VARY, WWW_AUTHENTICATE,
     },
     Method, Request, Response, StatusCode, Uri,
 };
@@ -18,8 +21,11 @@ use hyper_util::{
 };
 use parking_lot::Mutex;
 use pxxl_common::{
-    normalize_domain, DomainRateLimit, DomainRules, GeoLocation, PxxlError, RateLimitScope,
-    RouteMatch, TrafficSplitRule, Upstream,
+    normalize_domain, BasicAuthConfig, BufferingConfig, CircuitBreakerConfig, CompressionConfig,
+    ContentTypeAutoDetectConfig, DomainRateLimit, DomainRules, ForwardAuthConfig, GeoLocation,
+    InFlightLimitConfig, InFlightLimitScope, MiddlewareDefinition, PassiveHealthConfig, PxxlError,
+    RateLimitScope, RetryConfig, RouteMatch, StickySessionConfig, TrafficMirrorConfig,
+    TrafficSplitRule, Upstream, ClientCertForwardingConfig,
 };
 use pxxl_core::{EdgeState, RequestObservation};
 use pxxl_ddos::SecurityDecision;
@@ -28,9 +34,13 @@ use rustls::ServerConfig;
 use std::{
     collections::HashMap,
     convert::Infallible,
+    io::Write,
     net::{IpAddr, SocketAddr},
     path::{Path, PathBuf},
-    sync::Arc,
+    sync::{
+        atomic::{AtomicUsize, Ordering},
+        Arc,
+    },
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 use tokio::{
@@ -169,6 +179,9 @@ impl ErrorPageRenderer {
 #[derive(Clone, Debug, Default)]
 pub struct PolicyEnforcer {
     rate_limiter: Arc<PolicyRateLimiter>,
+    circuit_breakers: Arc<DashMap<String, Mutex<CircuitBreakerState>>>,
+    in_flight_limits: Arc<DashMap<String, AtomicUsize>>,
+    passive_health: Arc<DashMap<String, Mutex<PassiveHealthState>>>,
 }
 
 #[derive(Debug, Default)]
@@ -188,6 +201,17 @@ struct PolicyRateKey {
 struct PolicyRateBucket {
     tokens: f64,
     last_refill: Instant,
+}
+
+#[derive(Debug, Default)]
+struct CircuitBreakerState {
+    failures: u32,
+    open_until: Option<Instant>,
+}
+
+#[derive(Debug, Default)]
+struct PassiveHealthState {
+    failures: u32,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -244,6 +268,84 @@ struct ProxyRequestContext<'a> {
     scheme: RequestScheme,
     location: &'a GeoLocation,
     timestamp_unix_ms: u64,
+}
+
+#[derive(Debug, Clone)]
+struct EffectiveMiddleware {
+    request_buffering: BufferingConfig,
+    response_buffering: BufferingConfig,
+    compression: CompressionConfig,
+    content_type_autodetect: ContentTypeAutoDetectConfig,
+    retry: RetryConfig,
+    circuit_breaker: CircuitBreakerConfig,
+    in_flight_limit: InFlightLimitConfig,
+    sticky_sessions: StickySessionConfig,
+    passive_health: PassiveHealthConfig,
+    traffic_mirroring: TrafficMirrorConfig,
+    client_cert_forwarding: ClientCertForwardingConfig,
+    basic_auth: Option<BasicAuthConfig>,
+    forward_auth: Option<ForwardAuthConfig>,
+}
+
+impl EffectiveMiddleware {
+    fn from_rules(rules: &DomainRules, names: &[String]) -> Self {
+        let mut effective = Self {
+            request_buffering: rules.request_buffering.clone(),
+            response_buffering: rules.response_buffering.clone(),
+            compression: rules.compression.clone(),
+            content_type_autodetect: rules.content_type_autodetect.clone(),
+            retry: rules.retry.clone(),
+            circuit_breaker: rules.circuit_breaker.clone(),
+            in_flight_limit: rules.in_flight_limit.clone(),
+            sticky_sessions: rules.sticky_sessions.clone(),
+            passive_health: rules.passive_health.clone(),
+            traffic_mirroring: rules.traffic_mirroring.clone(),
+            client_cert_forwarding: rules.client_cert_forwarding.clone(),
+            basic_auth: None,
+            forward_auth: None,
+        };
+        let mut expanded = Vec::new();
+        expand_middleware_names(names, rules, &mut expanded, 0);
+        for name in expanded {
+            if let Some(middleware) = rules.middlewares.get(&name) {
+                effective.apply(middleware);
+            }
+        }
+        effective
+    }
+
+    fn apply(&mut self, middleware: &MiddlewareDefinition) {
+        if let Some(value) = &middleware.basic_auth {
+            self.basic_auth = Some(value.clone());
+        }
+        if let Some(value) = &middleware.forward_auth {
+            self.forward_auth = Some(value.clone());
+        }
+        if let Some(value) = &middleware.request_buffering {
+            self.request_buffering = value.clone();
+        }
+        if let Some(value) = &middleware.response_buffering {
+            self.response_buffering = value.clone();
+        }
+        if let Some(value) = &middleware.compression {
+            self.compression = value.clone();
+        }
+        if let Some(value) = &middleware.content_type_autodetect {
+            self.content_type_autodetect = value.clone();
+        }
+        if let Some(value) = &middleware.retry {
+            self.retry = value.clone();
+        }
+        if let Some(value) = &middleware.circuit_breaker {
+            self.circuit_breaker = value.clone();
+        }
+        if let Some(value) = &middleware.in_flight_limit {
+            self.in_flight_limit = value.clone();
+        }
+        if let Some(value) = &middleware.pass_tls_client_cert {
+            self.client_cert_forwarding = value.clone();
+        }
+    }
 }
 
 impl PolicyEnforcer {
@@ -636,6 +738,166 @@ impl PolicyEnforcer {
             headers.insert("access-control-allow-origin", HeaderValue::from_static("*"));
         }
     }
+
+    fn circuit_is_open(&self, route_id: &str, path_prefix: &str, upstream: &str) -> bool {
+        let key = circuit_key(route_id, path_prefix, upstream);
+        let Some(state) = self.circuit_breakers.get(&key) else {
+            return false;
+        };
+        let mut state = state.lock();
+        if state
+            .open_until
+            .is_some_and(|open_until| Instant::now() < open_until)
+        {
+            return true;
+        }
+        state.open_until = None;
+        false
+    }
+
+    fn try_acquire_in_flight(
+        &self,
+        limit: &InFlightLimitConfig,
+        matched: &RouteMatch,
+        upstream: &Upstream,
+    ) -> Result<Option<String>, &'static str> {
+        if !limit.enabled {
+            return Ok(None);
+        }
+        let Some(max) = limit.max else {
+            return Ok(None);
+        };
+        let (key, scope) = in_flight_key(limit, matched, upstream);
+        let counter = self
+            .in_flight_limits
+            .entry(key.clone())
+            .or_insert_with(|| AtomicUsize::new(0));
+
+        loop {
+            let current = counter.load(Ordering::Relaxed);
+            if current >= max as usize {
+                return Err(scope);
+            }
+            if counter
+                .compare_exchange_weak(
+                    current,
+                    current + 1,
+                    Ordering::Relaxed,
+                    Ordering::Relaxed,
+                )
+                .is_ok()
+            {
+                return Ok(Some(key));
+            }
+        }
+    }
+
+    fn release_in_flight(&self, key: Option<String>) {
+        if let Some(key) = key {
+            if let Some(counter) = self.in_flight_limits.get(&key) {
+                counter
+                    .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |value| {
+                        Some(value.saturating_sub(1))
+                    })
+                    .ok();
+            }
+        }
+    }
+
+    fn record_passive_health(
+        &self,
+        state: &EdgeState,
+        config: &PassiveHealthConfig,
+        domain: &str,
+        upstream: &str,
+        status: StatusCode,
+        error: Option<&PxxlError>,
+    ) {
+        if !config.enabled {
+            return;
+        }
+
+        let failed = error.is_some()
+            || config
+                .failure_statuses
+                .iter()
+                .any(|code| *code == status.as_u16())
+            || status.is_server_error();
+        let entry = self
+            .passive_health
+            .entry(upstream.to_string())
+            .or_insert_with(|| Mutex::new(PassiveHealthState::default()));
+        let mut passive = entry.lock();
+
+        if failed {
+            passive.failures = passive.failures.saturating_add(1);
+            state
+                .metrics
+                .passive_health_events_total
+                .with_label_values(&[upstream, "failure"])
+                .inc();
+            if passive.failures >= config.failure_threshold.max(1) {
+                state.set_single_upstream_health(upstream, false);
+                state
+                    .metrics
+                    .passive_health_events_total
+                    .with_label_values(&[upstream, "marked_unhealthy"])
+                    .inc();
+                state
+                    .metrics
+                    .circuit_breaker_open_total
+                    .with_label_values(&[domain, upstream])
+                    .inc();
+                let state = state.clone();
+                let upstream = upstream.to_string();
+                let recovery = Duration::from_secs(config.recovery_seconds.max(1));
+                tokio::spawn(async move {
+                    tokio::time::sleep(recovery).await;
+                    state.set_single_upstream_health(&upstream, true);
+                });
+            }
+        } else {
+            passive.failures = 0;
+        }
+    }
+
+    fn record_circuit_result(
+        &self,
+        config: &CircuitBreakerConfig,
+        domain: &str,
+        route_id: &str,
+        path_prefix: &str,
+        upstream: &str,
+        status: StatusCode,
+        error: bool,
+        state: &EdgeState,
+    ) {
+        if !config.enabled {
+            return;
+        }
+        let key = circuit_key(route_id, path_prefix, upstream);
+        let entry = self
+            .circuit_breakers
+            .entry(key)
+            .or_insert_with(|| Mutex::new(CircuitBreakerState::default()));
+        let mut breaker = entry.lock();
+
+        if error || status.is_server_error() {
+            breaker.failures = breaker.failures.saturating_add(1);
+            if breaker.failures >= config.failure_threshold.max(1) {
+                breaker.open_until =
+                    Some(Instant::now() + Duration::from_secs(config.open_seconds.max(1)));
+                state
+                    .metrics
+                    .circuit_breaker_open_total
+                    .with_label_values(&[domain, upstream])
+                    .inc();
+            }
+        } else {
+            breaker.failures = 0;
+            breaker.open_until = None;
+        }
+    }
 }
 
 impl PolicyRateLimiter {
@@ -712,7 +974,7 @@ impl PolicyRateKey {
 #[derive(Clone)]
 pub struct ProxyServer {
     state: EdgeState,
-    client: Client<HttpConnector, Incoming>,
+    client: Client<HttpConnector, Full<Bytes>>,
     error_pages: ErrorPageRenderer,
     policy: PolicyEnforcer,
     geoip: GeoIpResolver,
@@ -859,6 +1121,7 @@ impl ProxyServer {
         };
 
         let request_origin = req.headers().get(ORIGIN).cloned();
+        let request_accept_encoding = req.headers().get(ACCEPT_ENCODING).cloned();
         if let Some(rejection) = self.policy.evaluate(&req, &matched.route.rules, &context) {
             if rejection.status == StatusCode::TOO_MANY_REQUESTS {
                 self.state
@@ -899,19 +1162,125 @@ impl ProxyServer {
             return response;
         }
 
+        let middleware = EffectiveMiddleware::from_rules(&matched.route.rules, &matched.path.middlewares);
+
+        if let Some(basic_auth) = &middleware.basic_auth {
+            if let Some(response) = self.evaluate_basic_auth(&req, basic_auth, &domain, &path) {
+                self.state
+                    .metrics
+                    .middleware_executions_total
+                    .with_label_values(&[&domain, "basic_auth", "rejected"])
+                    .inc();
+                self.observe_request(&context, response.status(), started, None);
+                return response;
+            }
+            self.state
+                .metrics
+                .middleware_executions_total
+                .with_label_values(&[&domain, "basic_auth", "allowed"])
+                .inc();
+        }
+
+        if let Some(forward_auth) = &middleware.forward_auth {
+            match self.run_forward_auth(&req, forward_auth).await {
+                Ok(true) => self
+                    .state
+                    .metrics
+                    .middleware_executions_total
+                    .with_label_values(&[&domain, "forward_auth", "allowed"])
+                    .inc(),
+                Ok(false) => {
+                    self.state
+                        .metrics
+                        .middleware_executions_total
+                        .with_label_values(&[&domain, "forward_auth", "rejected"])
+                        .inc();
+                    self.observe_request(&context, StatusCode::UNAUTHORIZED, started, None);
+                    return self.error_response(
+                        StatusCode::UNAUTHORIZED,
+                        "forward auth denied the request",
+                        &domain,
+                        &path,
+                    );
+                }
+                Err(error) => {
+                    warn!(%error, domain = %domain, "forward auth request failed");
+                    self.state
+                        .metrics
+                        .middleware_executions_total
+                        .with_label_values(&[&domain, "forward_auth", "error"])
+                        .inc();
+                    self.observe_request(&context, StatusCode::BAD_GATEWAY, started, None);
+                    return self.error_response(
+                        StatusCode::BAD_GATEWAY,
+                        "forward auth request failed",
+                        &domain,
+                        &path,
+                    );
+                }
+            }
+        }
+
         let mut req = req;
         self.policy
             .apply_request_rules(req.headers_mut(), &matched.route.rules);
+        if middleware.content_type_autodetect.enabled {
+            apply_request_content_type_detection(req.headers_mut(), req.uri(), None);
+        }
+
+        let max_request_bytes = request_body_limit(&matched.route.rules, &middleware);
+        let buffered_request = match BufferedRequest::from_request(req, max_request_bytes).await {
+            Ok(mut request) => {
+                ensure_trace_headers(&mut request.headers);
+                if middleware.content_type_autodetect.enabled {
+                    apply_request_content_type_detection(
+                        &mut request.headers,
+                        &request.uri,
+                        Some(&request.body),
+                    );
+                }
+                request
+            }
+            Err(BufferError::TooLarge) => {
+                self.observe_request(&context, StatusCode::PAYLOAD_TOO_LARGE, started, None);
+                return self.error_response(
+                    StatusCode::PAYLOAD_TOO_LARGE,
+                    "request body is too large",
+                    &domain,
+                    &path,
+                );
+            }
+            Err(BufferError::Body(error)) => {
+                warn!(%error, domain = %domain, "failed to buffer request body");
+                self.observe_request(&context, StatusCode::BAD_REQUEST, started, None);
+                return self.error_response(
+                    StatusCode::BAD_REQUEST,
+                    "failed to read request body",
+                    &domain,
+                    &path,
+                );
+            }
+        };
 
         let base_route_key = format!("{}:{}", matched.route.id, matched.path.prefix);
         let (route_key_suffix, upstreams) =
             self.select_upstream_pool(&base_route_key, &matched, &location);
         let route_key = format!("{base_route_key}{route_key_suffix}");
-        let upstream = match self.state.load_balancer.select(
+
+        self.mirror_request(
+            buffered_request.clone(),
+            &matched,
+            &middleware.traffic_mirroring,
+            &domain,
+        );
+
+        let upstream = match self.select_available_upstream(
             &route_key,
-            &matched.route.algorithm,
+            &matched,
             upstreams,
             remote_ip,
+            &buffered_request.headers,
+            &middleware,
         ) {
             Some(upstream) => upstream,
             None => {
@@ -925,22 +1294,117 @@ impl ProxyServer {
             }
         };
 
+        let in_flight_key = match self.policy.try_acquire_in_flight(
+            &middleware.in_flight_limit,
+            &matched,
+            &upstream,
+        ) {
+            Ok(key) => key,
+            Err(scope) => {
+                self.state
+                    .metrics
+                    .in_flight_limited_total
+                    .with_label_values(&[&domain, scope])
+                    .inc();
+                self.observe_request(&context, StatusCode::TOO_MANY_REQUESTS, started, None);
+                return self.error_response(
+                    StatusCode::TOO_MANY_REQUESTS,
+                    "too many in-flight requests",
+                    &domain,
+                    &path,
+                );
+            }
+        };
+
+        self.state
+            .load_balancer
+            .begin_request(&route_key, &upstream.url);
+        self.state
+            .metrics
+            .upstream_in_flight
+            .with_label_values(&[
+                &domain,
+                &matched.route.id,
+                &matched.path.prefix,
+                &upstream.url,
+            ])
+            .inc();
+
         match self
-            .forward(req, &matched, &upstream, remote_ip, scheme)
+            .forward_with_retry(
+                buffered_request,
+                &matched,
+                &upstream,
+                remote_ip,
+                scheme,
+                &middleware,
+                &domain,
+            )
             .await
         {
             Ok(mut response) => {
-                let status = response.status();
+                let status = response.status;
+                self.policy.release_in_flight(in_flight_key);
+                self.state.load_balancer.end_request(
+                    &route_key,
+                    &upstream.url,
+                    started.elapsed().as_micros() as u64,
+                );
+                self.state
+                    .metrics
+                    .upstream_in_flight
+                    .with_label_values(&[
+                        &domain,
+                        &matched.route.id,
+                        &matched.path.prefix,
+                        &upstream.url,
+                    ])
+                    .dec();
+                self.policy.record_passive_health(
+                    &self.state,
+                    &middleware.passive_health,
+                    &domain,
+                    &upstream.url,
+                    status,
+                    None,
+                );
+                self.policy.record_circuit_result(
+                    &middleware.circuit_breaker,
+                    &domain,
+                    &matched.route.id,
+                    &matched.path.prefix,
+                    &upstream.url,
+                    status,
+                    false,
+                    &self.state,
+                );
                 self.policy.apply_response_rules(
-                    response.headers_mut(),
+                    &mut response.headers,
                     &matched.route.rules,
                     request_origin.as_ref(),
                 );
+                apply_response_middleware(
+                    &mut response,
+                    &middleware,
+                    accepts_gzip(request_accept_encoding.as_ref()),
+                );
+                apply_sticky_cookie(&mut response.headers, &middleware.sticky_sessions, &upstream);
                 self.observe_request(&context, status, started, Some(&upstream.url));
                 self.state
                     .metrics
                     .upstream_latency_seconds
                     .with_label_values(&[&domain, &upstream.url])
+                    .observe(started.elapsed().as_secs_f64());
+                self.state
+                    .metrics
+                    .router_request_duration_seconds
+                    .with_label_values(&[
+                        &domain,
+                        &matched.route.id,
+                        &matched.path.prefix,
+                        &upstream.url,
+                        &status.as_u16().to_string(),
+                    ])
                     .observe(started.elapsed().as_secs_f64());
                 info!(
                     domain = %domain,
@@ -951,10 +1415,44 @@ impl ProxyServer {
                     latency_ms = started.elapsed().as_millis(),
                     "proxied request"
                 );
-                response
+                response.into_response()
             }
             Err(error) => {
                 warn!(%error, domain = %domain, upstream = %upstream.url, "upstream request failed");
+                self.policy.release_in_flight(in_flight_key);
+                self.state.load_balancer.end_request(
+                    &route_key,
+                    &upstream.url,
+                    started.elapsed().as_micros() as u64,
+                );
+                self.state
+                    .metrics
+                    .upstream_in_flight
+                    .with_label_values(&[
+                        &domain,
+                        &matched.route.id,
+                        &matched.path.prefix,
+                        &upstream.url,
+                    ])
+                    .dec();
+                self.policy.record_passive_health(
+                    &self.state,
+                    &middleware.passive_health,
+                    &domain,
+                    &upstream.url,
+                    StatusCode::BAD_GATEWAY,
+                    Some(&error),
+                );
+                self.policy.record_circuit_result(
+                    &middleware.circuit_breaker,
+                    &domain,
+                    &matched.route.id,
+                    &matched.path.prefix,
+                    &upstream.url,
+                    StatusCode::BAD_GATEWAY,
+                    true,
+                    &self.state,
+                );
                 self.observe_request(
                     &context,
                     StatusCode::BAD_GATEWAY,
@@ -971,16 +1469,66 @@ impl ProxyServer {
         }
     }
 
-    async fn forward(
+    async fn forward_with_retry(
         &self,
-        mut req: Request<Incoming>,
+        request: BufferedRequest,
         matched: &RouteMatch,
         upstream: &Upstream,
         remote_ip: Option<IpAddr>,
         scheme: RequestScheme,
-    ) -> Result<Response<BoxBody>, PxxlError> {
-        let uri = build_upstream_uri(upstream, req.uri())?;
-        *req.uri_mut() = uri;
+        middleware: &EffectiveMiddleware,
+        domain: &str,
+    ) -> Result<BufferedResponse, PxxlError> {
+        let attempts = if middleware.retry.enabled {
+            middleware.retry.attempts.max(1)
+        } else {
+            1
+        };
+        let mut last_error = None;
+
+        for attempt in 1..=attempts {
+            match self
+                .forward_buffered(&request, matched, upstream, remote_ip, scheme, middleware)
+                .await
+            {
+                Ok(response)
+                    if attempt < attempts && retryable_status(response.status, &middleware.retry) =>
+                {
+                    self.state
+                        .metrics
+                        .retries_total
+                        .with_label_values(&[domain, &upstream.url, "status"])
+                        .inc();
+                    tokio::time::sleep(Duration::from_millis(middleware.retry.backoff_ms)).await;
+                    continue;
+                }
+                Ok(response) => return Ok(response),
+                Err(error) if attempt < attempts => {
+                    self.state
+                        .metrics
+                        .retries_total
+                        .with_label_values(&[domain, &upstream.url, "error"])
+                        .inc();
+                    last_error = Some(error);
+                    tokio::time::sleep(Duration::from_millis(middleware.retry.backoff_ms)).await;
+                }
+                Err(error) => return Err(error),
+            }
+        }
+
+        Err(last_error.unwrap_or_else(|| PxxlError::InvalidUpstream(upstream.url.clone())))
+    }
+
+    async fn forward_buffered(
+        &self,
+        request: &BufferedRequest,
+        matched: &RouteMatch,
+        upstream: &Upstream,
+        remote_ip: Option<IpAddr>,
+        scheme: RequestScheme,
+        middleware: &EffectiveMiddleware,
+    ) -> Result<BufferedResponse, PxxlError> {
+        let mut req = request.to_request(upstream)?;
 
         if !matched.route.rules.preserve_host_header {
             let authority = upstream.authority()?;
@@ -1004,18 +1552,24 @@ impl ProxyServer {
                     .insert(HeaderName::from_static("x-forwarded-for"), value);
             }
         }
+        if middleware.client_cert_forwarding.enabled {
+            if let Ok(name) =
+                HeaderName::from_bytes(middleware.client_cert_forwarding.header_name.as_bytes())
+            {
+                req.headers_mut()
+                    .entry(name)
+                    .or_insert(HeaderValue::from_static(""));
+            }
+        }
 
         let response = self
             .client
             .request(req)
             .await
             .map_err(|_| PxxlError::InvalidUpstream(upstream.url.clone()))?;
-        let (parts, body) = response.into_parts();
-        Ok(Response::from_parts(
-            parts,
-            body.map_err(|error| -> BoxError { Box::new(error) })
-                .boxed(),
-        ))
+        BufferedResponse::from_response(response, middleware.response_buffering.max_response_bytes)
+            .await
+            .map_err(|_| PxxlError::InvalidUpstream(upstream.url.clone()))
     }
 
     fn error_response(
@@ -1087,6 +1641,239 @@ impl ProxyServer {
             .map(|(name, upstreams)| (format!(":location:{name}"), upstreams))
             .unwrap_or_else(|| (String::new(), matched.path.upstreams.as_slice()))
     }
+
+    fn select_available_upstream(
+        &self,
+        route_key: &str,
+        matched: &RouteMatch,
+        upstreams: &[Upstream],
+        remote_ip: Option<IpAddr>,
+        headers: &HeaderMap,
+        middleware: &EffectiveMiddleware,
+    ) -> Option<Upstream> {
+        if let Some(upstream) = sticky_upstream(headers, upstreams, &middleware.sticky_sessions) {
+            if upstream.healthy
+                && !self
+                    .policy
+                    .circuit_is_open(&matched.route.id, &matched.path.prefix, &upstream.url)
+            {
+                return Some(upstream);
+            }
+        }
+
+        let primary = upstreams
+            .iter()
+            .filter(|upstream| {
+                !upstream.backup
+                    && upstream.healthy
+                    && !self.policy.circuit_is_open(
+                        &matched.route.id,
+                        &matched.path.prefix,
+                        &upstream.url,
+                    )
+            })
+            .cloned()
+            .collect::<Vec<_>>();
+        if let Some(upstream) =
+            self.state
+                .load_balancer
+                .select(route_key, &matched.route.algorithm, &primary, remote_ip)
+        {
+            return Some(upstream);
+        }
+
+        let backup = upstreams
+            .iter()
+            .filter(|upstream| {
+                upstream.backup
+                    && upstream.healthy
+                    && !self.policy.circuit_is_open(
+                        &matched.route.id,
+                        &matched.path.prefix,
+                        &upstream.url,
+                    )
+            })
+            .cloned()
+            .collect::<Vec<_>>();
+        self.state
+            .load_balancer
+            .select(route_key, &matched.route.algorithm, &backup, remote_ip)
+    }
+
+    fn evaluate_basic_auth(
+        &self,
+        req: &Request<Incoming>,
+        config: &BasicAuthConfig,
+        domain: &str,
+        path: &str,
+    ) -> Option<Response<BoxBody>> {
+        if !config.enabled {
+            return None;
+        }
+        let authorized = req
+            .headers()
+            .get(AUTHORIZATION)
+            .and_then(|value| value.to_str().ok())
+            .and_then(|value| value.strip_prefix("Basic "))
+            .and_then(|encoded| {
+                base64::engine::general_purpose::STANDARD
+                    .decode(encoded.trim())
+                    .ok()
+            })
+            .and_then(|decoded| String::from_utf8(decoded).ok())
+            .and_then(|decoded| decoded.split_once(':').map(|(user, pass)| (user.to_string(), pass.to_string())))
+            .is_some_and(|(user, pass)| config.users.get(&user).is_some_and(|expected| expected == &pass));
+
+        if authorized {
+            return None;
+        }
+
+        let mut response = self.error_response(StatusCode::UNAUTHORIZED, "authentication required", domain, path);
+        if let Ok(value) = HeaderValue::from_str(&format!("Basic realm=\"{}\"", config.realm)) {
+            response.headers_mut().insert(WWW_AUTHENTICATE, value);
+        }
+        Some(response)
+    }
+
+    async fn run_forward_auth(
+        &self,
+        req: &Request<Incoming>,
+        config: &ForwardAuthConfig,
+    ) -> Result<bool, PxxlError> {
+        if !config.enabled {
+            return Ok(true);
+        }
+        let mut builder = Request::builder().method(Method::GET).uri(&config.url);
+        for header in &config.request_headers {
+            if let Ok(name) = HeaderName::from_bytes(header.as_bytes()) {
+                if let Some(value) = req.headers().get(&name) {
+                    builder = builder.header(name, value.clone());
+                }
+            }
+        }
+        let request = builder
+            .body(Full::new(Bytes::new()))
+            .map_err(|_| PxxlError::InvalidUpstream(config.url.clone()))?;
+        let response = self
+            .client
+            .request(request)
+            .await
+            .map_err(|_| PxxlError::InvalidUpstream(config.url.clone()))?;
+        Ok(response.status().is_success())
+    }
+
+    fn mirror_request(
+        &self,
+        request: BufferedRequest,
+        matched: &RouteMatch,
+        mirror: &TrafficMirrorConfig,
+        domain: &str,
+    ) {
+        if !mirror.enabled || mirror.upstreams.is_empty() || mirror.percent == 0 {
+            return;
+        }
+        for upstream in mirror.upstreams.iter().filter(|upstream| upstream.healthy) {
+            if !mirror_should_run(domain, &request.uri, &upstream.url, mirror.percent) {
+                continue;
+            }
+            let server = self.clone();
+            let request = request.clone();
+            let matched = matched.clone();
+            let upstream = upstream.clone();
+            let domain = domain.to_string();
+            tokio::spawn(async move {
+                let result = server
+                    .forward_buffered(
+                        &request,
+                        &matched,
+                        &upstream,
+                        None,
+                        RequestScheme::Http,
+                        &EffectiveMiddleware::from_rules(&matched.route.rules, &[]),
+                    )
+                    .await;
+                let label = if result.is_ok() { "ok" } else { "error" };
+                server
+                    .state
+                    .metrics
+                    .mirror_requests_total
+                    .with_label_values(&[&domain, &upstream.url, label])
+                    .inc();
+            });
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+struct BufferedRequest {
+    method: Method,
+    uri: Uri,
+    headers: HeaderMap,
+    body: Bytes,
+}
+
+impl BufferedRequest {
+    async fn from_request(req: Request<Incoming>, max_bytes: u64) -> Result<Self, BufferError> {
+        let (parts, body) = req.into_parts();
+        let body = collect_body_with_limit(body, max_bytes).await?;
+        Ok(Self {
+            method: parts.method,
+            uri: parts.uri,
+            headers: parts.headers,
+            body,
+        })
+    }
+
+    fn to_request(&self, upstream: &Upstream) -> Result<Request<Full<Bytes>>, PxxlError> {
+        let mut request = Request::builder()
+            .method(self.method.clone())
+            .uri(build_upstream_uri(upstream, &self.uri)?)
+            .body(Full::new(self.body.clone()))
+            .map_err(|_| PxxlError::InvalidUpstream(upstream.url.clone()))?;
+        *request.headers_mut() = self.headers.clone();
+        if let Ok(length) = HeaderValue::from_str(&self.body.len().to_string()) {
+            request.headers_mut().insert(CONTENT_LENGTH, length);
+        }
+        Ok(request)
+    }
+}
+
+#[derive(Debug)]
+struct BufferedResponse {
+    status: StatusCode,
+    headers: HeaderMap,
+    body: Bytes,
+}
+
+impl BufferedResponse {
+    async fn from_response(
+        response: Response<Incoming>,
+        max_bytes: u64,
+    ) -> Result<Self, BufferError> {
+        let (parts, body) = response.into_parts();
+        let body = collect_body_with_limit(body, max_bytes).await?;
+        Ok(Self {
+            status: parts.status,
+            headers: parts.headers,
+            body,
+        })
+    }
+
+    fn into_response(self) -> Response<BoxBody> {
+        let body = Full::new(self.body)
+            .map_err(|never| match never {})
+            .boxed();
+        let mut response = Response::new(body);
+        *response.status_mut() = self.status;
+        *response.headers_mut() = self.headers;
+        response
+    }
+}
+
+#[derive(Debug)]
+enum BufferError {
+    TooLarge,
+    Body(String),
 }
 
 pub fn build_upstream_uri(upstream: &Upstream, original: &Uri) -> Result<Uri, PxxlError> {
@@ -1617,6 +2404,290 @@ fn insert_static_header(headers: &mut HeaderMap, name: &'static str, value: &'st
         HeaderName::from_static(name),
         HeaderValue::from_static(value),
     );
+}
+
+async fn collect_body_with_limit(body: Incoming, max_bytes: u64) -> Result<Bytes, BufferError> {
+    let collected = body
+        .collect()
+        .await
+        .map_err(|error| BufferError::Body(error.to_string()))?;
+    let bytes = collected.to_bytes();
+    if bytes.len() as u64 > max_bytes {
+        return Err(BufferError::TooLarge);
+    }
+    Ok(bytes)
+}
+
+fn expand_middleware_names(
+    names: &[String],
+    rules: &DomainRules,
+    output: &mut Vec<String>,
+    depth: usize,
+) {
+    if depth > 8 {
+        return;
+    }
+    for name in names {
+        if let Some(chain) = rules.middleware_chains.get(name) {
+            expand_middleware_names(chain, rules, output, depth + 1);
+            continue;
+        }
+        output.push(name.clone());
+        if let Some(middleware) = rules.middlewares.get(name) {
+            expand_middleware_names(&middleware.chain, rules, output, depth + 1);
+        }
+    }
+}
+
+fn request_body_limit(rules: &DomainRules, middleware: &EffectiveMiddleware) -> u64 {
+    rules
+        .max_body_bytes
+        .unwrap_or(middleware.request_buffering.max_request_bytes)
+        .min(middleware.request_buffering.max_request_bytes)
+}
+
+fn retryable_status(status: StatusCode, retry: &RetryConfig) -> bool {
+    retry.enabled
+        && (retry.retry_statuses.is_empty()
+            || retry
+                .retry_statuses
+                .iter()
+                .any(|code| *code == status.as_u16()))
+}
+
+fn apply_request_content_type_detection(
+    headers: &mut HeaderMap,
+    uri: &Uri,
+    body: Option<&Bytes>,
+) {
+    if headers.contains_key(CONTENT_TYPE) {
+        return;
+    }
+    let detected = detect_content_type(uri.path(), body);
+    if let Some(content_type) = detected {
+        headers.insert(CONTENT_TYPE, HeaderValue::from_static(content_type));
+    }
+}
+
+fn ensure_trace_headers(headers: &mut HeaderMap) {
+    if !headers.contains_key("traceparent") {
+        let trace_id = format!("{:032x}", now_unix_ms() as u128);
+        let span_id = format!("{:016x}", monotonic_nanos() as u64);
+        if let Ok(value) = HeaderValue::from_str(&format!("00-{trace_id}-{span_id}-01")) {
+            headers.insert(HeaderName::from_static("traceparent"), value);
+        }
+    }
+    if !headers.contains_key("x-request-id") {
+        let request_id = format!("{:x}-{:x}", now_unix_ms(), monotonic_nanos());
+        if let Ok(value) = HeaderValue::from_str(&request_id) {
+            headers.insert(HeaderName::from_static("x-request-id"), value);
+        }
+    }
+}
+
+fn monotonic_nanos() -> u128 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_nanos())
+        .unwrap_or_default()
+}
+
+fn detect_content_type(path: &str, body: Option<&Bytes>) -> Option<&'static str> {
+    let lower = path.to_ascii_lowercase();
+    if lower.ends_with(".json") {
+        return Some("application/json");
+    }
+    if lower.ends_with(".html") || lower.ends_with(".htm") {
+        return Some("text/html; charset=utf-8");
+    }
+    if lower.ends_with(".css") {
+        return Some("text/css; charset=utf-8");
+    }
+    if lower.ends_with(".js") || lower.ends_with(".mjs") {
+        return Some("application/javascript");
+    }
+    if lower.ends_with(".svg") {
+        return Some("image/svg+xml");
+    }
+    if lower.ends_with(".txt") {
+        return Some("text/plain; charset=utf-8");
+    }
+    let body = body?;
+    let trimmed = body
+        .iter()
+        .copied()
+        .skip_while(|byte| byte.is_ascii_whitespace())
+        .take(16)
+        .collect::<Vec<_>>();
+    if matches!(trimmed.first(), Some(b'{') | Some(b'[')) {
+        return Some("application/json");
+    }
+    if trimmed.starts_with(b"<!doctype") || trimmed.starts_with(b"<html") {
+        return Some("text/html; charset=utf-8");
+    }
+    None
+}
+
+fn apply_response_middleware(
+    response: &mut BufferedResponse,
+    middleware: &EffectiveMiddleware,
+    accepts_gzip: bool,
+) {
+    if middleware.content_type_autodetect.enabled && !response.headers.contains_key(CONTENT_TYPE) {
+        if let Some(content_type) = detect_content_type("", Some(&response.body)) {
+            response
+                .headers
+                .insert(CONTENT_TYPE, HeaderValue::from_static(content_type));
+        }
+    }
+
+    if !middleware.compression.enabled
+        || !accepts_gzip
+        || response.body.len() < middleware.compression.min_bytes
+        || response.headers.contains_key(CONTENT_ENCODING)
+        || !response_is_compressible(&response.headers, &middleware.compression)
+    {
+        return;
+    }
+
+    if let Ok(body) = gzip_bytes(&response.body) {
+        response.body = Bytes::from(body);
+        response
+            .headers
+            .insert(CONTENT_ENCODING, HeaderValue::from_static("gzip"));
+        response.headers.remove(CONTENT_LENGTH);
+        response.headers.insert(VARY, HeaderValue::from_static("accept-encoding"));
+    }
+}
+
+fn response_is_compressible(headers: &HeaderMap, compression: &CompressionConfig) -> bool {
+    let Some(content_type) = headers.get(CONTENT_TYPE).and_then(|value| value.to_str().ok()) else {
+        return true;
+    };
+    if !compression.content_types.is_empty() {
+        return compression
+            .content_types
+            .iter()
+            .any(|expected| content_type_matches(content_type, expected));
+    }
+    content_type.starts_with("text/")
+        || content_type_matches(content_type, "application/json")
+        || content_type_matches(content_type, "application/javascript")
+        || content_type_matches(content_type, "image/svg+xml")
+}
+
+fn gzip_bytes(body: &[u8]) -> std::io::Result<Vec<u8>> {
+    let mut encoder = GzEncoder::new(Vec::new(), Compression::default());
+    encoder.write_all(body)?;
+    encoder.finish()
+}
+
+fn accepts_gzip(value: Option<&HeaderValue>) -> bool {
+    value
+        .and_then(|value| value.to_str().ok())
+        .is_some_and(|value| value.split(',').any(|part| part.trim().starts_with("gzip")))
+}
+
+fn sticky_upstream(
+    headers: &HeaderMap,
+    upstreams: &[Upstream],
+    sticky: &StickySessionConfig,
+) -> Option<Upstream> {
+    if !sticky.enabled {
+        return None;
+    }
+    let cookie = headers.get(COOKIE)?.to_str().ok()?;
+    let wanted = cookie_value(cookie, &sticky.cookie_name)?;
+    upstreams
+        .iter()
+        .find(|upstream| sticky_upstream_id(&upstream.url) == wanted)
+        .cloned()
+}
+
+fn apply_sticky_cookie(
+    headers: &mut HeaderMap,
+    sticky: &StickySessionConfig,
+    upstream: &Upstream,
+) {
+    if !sticky.enabled {
+        return;
+    }
+    let mut cookie = format!(
+        "{}={}; Path=/",
+        sticky.cookie_name,
+        sticky_upstream_id(&upstream.url)
+    );
+    if sticky.http_only {
+        cookie.push_str("; HttpOnly");
+    }
+    if sticky.secure {
+        cookie.push_str("; Secure");
+    }
+    if let Some(same_site) = &sticky.same_site {
+        cookie.push_str("; SameSite=");
+        cookie.push_str(same_site);
+    }
+    if let Some(max_age) = sticky.max_age_seconds {
+        cookie.push_str("; Max-Age=");
+        cookie.push_str(&max_age.to_string());
+    }
+    if let Ok(value) = HeaderValue::from_str(&cookie) {
+        headers.insert(SET_COOKIE, value);
+    }
+}
+
+fn cookie_value(cookie: &str, name: &str) -> Option<String> {
+    cookie.split(';').find_map(|part| {
+        let (cookie_name, value) = part.trim().split_once('=')?;
+        if cookie_name == name {
+            Some(value.to_string())
+        } else {
+            None
+        }
+    })
+}
+
+fn sticky_upstream_id(upstream: &str) -> String {
+    let mut hash = 0xcbf29ce484222325_u64;
+    for byte in upstream.as_bytes() {
+        hash ^= *byte as u64;
+        hash = hash.wrapping_mul(0x100000001b3);
+    }
+    format!("{hash:x}")
+}
+
+fn mirror_should_run(domain: &str, uri: &Uri, upstream: &str, percent: u8) -> bool {
+    if percent >= 100 {
+        return true;
+    }
+    let mut hash = 0xcbf29ce484222325_u64;
+    for byte in format!("{domain}:{uri}:{upstream}").as_bytes() {
+        hash ^= *byte as u64;
+        hash = hash.wrapping_mul(0x100000001b3);
+    }
+    (hash % 100) < u64::from(percent)
+}
+
+fn circuit_key(route_id: &str, path_prefix: &str, upstream: &str) -> String {
+    format!("{route_id}:{path_prefix}:{upstream}")
+}
+
+fn in_flight_key(
+    limit: &InFlightLimitConfig,
+    matched: &RouteMatch,
+    upstream: &Upstream,
+) -> (String, &'static str) {
+    match limit.scope {
+        InFlightLimitScope::Domain => (matched.route.domain.clone(), "domain"),
+        InFlightLimitScope::Upstream => (
+            format!("{}:{}:{}", matched.route.id, matched.path.prefix, upstream.url),
+            "upstream",
+        ),
+        InFlightLimitScope::Route => (
+            format!("{}:{}", matched.route.id, matched.path.prefix),
+            "route",
+        ),
+    }
 }
 
 fn path_without_query(path: &str) -> &str {

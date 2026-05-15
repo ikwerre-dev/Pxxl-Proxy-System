@@ -58,6 +58,9 @@ pub enum LoadBalancingAlgorithm {
     IpHash,
     WeightedRoundRobin,
     EwmaLatency,
+    P2c,
+    Hrw,
+    LatencyAware,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -67,6 +70,10 @@ pub struct Upstream {
     pub weight: u32,
     #[serde(default = "default_true")]
     pub healthy: bool,
+    #[serde(default)]
+    pub backup: bool,
+    #[serde(default)]
+    pub transport: UpstreamTransport,
 }
 
 impl Upstream {
@@ -75,6 +82,8 @@ impl Upstream {
             url: url.into(),
             weight: default_weight(),
             healthy: true,
+            backup: false,
+            transport: UpstreamTransport::default(),
         }
     }
 
@@ -226,6 +235,46 @@ pub struct DomainRules {
     pub cors_allowed_headers: Vec<String>,
     #[serde(default = "default_true")]
     pub cors_preflight_enabled: bool,
+    #[serde(default)]
+    pub middlewares: HashMap<String, MiddlewareDefinition>,
+    #[serde(default)]
+    pub middleware_chains: HashMap<String, Vec<String>>,
+    #[serde(default)]
+    pub request_buffering: BufferingConfig,
+    #[serde(default)]
+    pub response_buffering: BufferingConfig,
+    #[serde(default)]
+    pub compression: CompressionConfig,
+    #[serde(default)]
+    pub content_type_autodetect: ContentTypeAutoDetectConfig,
+    #[serde(default)]
+    pub retry: RetryConfig,
+    #[serde(default)]
+    pub circuit_breaker: CircuitBreakerConfig,
+    #[serde(default)]
+    pub in_flight_limit: InFlightLimitConfig,
+    #[serde(default)]
+    pub sticky_sessions: StickySessionConfig,
+    #[serde(default)]
+    pub passive_health: PassiveHealthConfig,
+    #[serde(default)]
+    pub traffic_mirroring: TrafficMirrorConfig,
+    #[serde(default)]
+    pub client_cert_forwarding: ClientCertForwardingConfig,
+    #[serde(default)]
+    pub services: HashMap<String, ServiceDefinition>,
+    #[serde(default)]
+    pub upstream_transport: UpstreamTransport,
+    #[serde(default)]
+    pub tls_options: RouterTlsOptions,
+    #[serde(default)]
+    pub acme: AcmeConfig,
+    #[serde(default)]
+    pub tcp: TcpRoutingConfig,
+    #[serde(default)]
+    pub udp: UdpRoutingConfig,
+    #[serde(default)]
+    pub http3: Http3Config,
 }
 
 impl Default for DomainRules {
@@ -264,8 +313,379 @@ impl Default for DomainRules {
             cors_allowed_methods: Vec::new(),
             cors_allowed_headers: Vec::new(),
             cors_preflight_enabled: true,
+            middlewares: HashMap::new(),
+            middleware_chains: HashMap::new(),
+            request_buffering: BufferingConfig::default(),
+            response_buffering: BufferingConfig::default(),
+            compression: CompressionConfig::default(),
+            content_type_autodetect: ContentTypeAutoDetectConfig::default(),
+            retry: RetryConfig::default(),
+            circuit_breaker: CircuitBreakerConfig::default(),
+            in_flight_limit: InFlightLimitConfig::default(),
+            sticky_sessions: StickySessionConfig::default(),
+            passive_health: PassiveHealthConfig::default(),
+            traffic_mirroring: TrafficMirrorConfig::default(),
+            client_cert_forwarding: ClientCertForwardingConfig::default(),
+            services: HashMap::new(),
+            upstream_transport: UpstreamTransport::default(),
+            tls_options: RouterTlsOptions::default(),
+            acme: AcmeConfig::default(),
+            tcp: TcpRoutingConfig::default(),
+            udp: UdpRoutingConfig::default(),
+            http3: Http3Config::default(),
         }
     }
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct MiddlewareDefinition {
+    #[serde(default)]
+    pub chain: Vec<String>,
+    #[serde(default)]
+    pub basic_auth: Option<BasicAuthConfig>,
+    #[serde(default)]
+    pub digest_auth: Option<DigestAuthConfig>,
+    #[serde(default)]
+    pub forward_auth: Option<ForwardAuthConfig>,
+    #[serde(default)]
+    pub request_buffering: Option<BufferingConfig>,
+    #[serde(default)]
+    pub response_buffering: Option<BufferingConfig>,
+    #[serde(default)]
+    pub compression: Option<CompressionConfig>,
+    #[serde(default)]
+    pub content_type_autodetect: Option<ContentTypeAutoDetectConfig>,
+    #[serde(default)]
+    pub retry: Option<RetryConfig>,
+    #[serde(default)]
+    pub circuit_breaker: Option<CircuitBreakerConfig>,
+    #[serde(default)]
+    pub in_flight_limit: Option<InFlightLimitConfig>,
+    #[serde(default)]
+    pub pass_tls_client_cert: Option<ClientCertForwardingConfig>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct BasicAuthConfig {
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+    #[serde(default = "default_auth_realm")]
+    pub realm: String,
+    #[serde(default)]
+    pub users: HashMap<String, String>,
+}
+
+impl Default for BasicAuthConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            realm: default_auth_realm(),
+            users: HashMap::new(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct DigestAuthConfig {
+    #[serde(default)]
+    pub enabled: bool,
+    #[serde(default = "default_auth_realm")]
+    pub realm: String,
+    #[serde(default)]
+    pub users: HashMap<String, String>,
+}
+
+impl Default for DigestAuthConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            realm: default_auth_realm(),
+            users: HashMap::new(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ForwardAuthConfig {
+    #[serde(default)]
+    pub enabled: bool,
+    pub url: String,
+    #[serde(default)]
+    pub request_headers: Vec<String>,
+    #[serde(default)]
+    pub response_headers: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct BufferingConfig {
+    #[serde(default)]
+    pub enabled: bool,
+    #[serde(default = "default_request_buffer_bytes")]
+    pub max_request_bytes: u64,
+    #[serde(default = "default_response_buffer_bytes")]
+    pub max_response_bytes: u64,
+}
+
+impl Default for BufferingConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            max_request_bytes: default_request_buffer_bytes(),
+            max_response_bytes: default_response_buffer_bytes(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct CompressionConfig {
+    #[serde(default)]
+    pub enabled: bool,
+    #[serde(default = "default_min_compress_bytes")]
+    pub min_bytes: usize,
+    #[serde(default)]
+    pub content_types: Vec<String>,
+}
+
+impl Default for CompressionConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            min_bytes: default_min_compress_bytes(),
+            content_types: Vec::new(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ContentTypeAutoDetectConfig {
+    #[serde(default)]
+    pub enabled: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct RetryConfig {
+    #[serde(default)]
+    pub enabled: bool,
+    #[serde(default = "default_retry_attempts")]
+    pub attempts: u32,
+    #[serde(default = "default_retry_backoff_ms")]
+    pub backoff_ms: u64,
+    #[serde(default)]
+    pub retry_statuses: Vec<u16>,
+}
+
+impl Default for RetryConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            attempts: default_retry_attempts(),
+            backoff_ms: default_retry_backoff_ms(),
+            retry_statuses: vec![502, 503, 504],
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct CircuitBreakerConfig {
+    #[serde(default)]
+    pub enabled: bool,
+    #[serde(default = "default_circuit_failures")]
+    pub failure_threshold: u32,
+    #[serde(default = "default_circuit_open_seconds")]
+    pub open_seconds: u64,
+}
+
+impl Default for CircuitBreakerConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            failure_threshold: default_circuit_failures(),
+            open_seconds: default_circuit_open_seconds(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct InFlightLimitConfig {
+    #[serde(default)]
+    pub enabled: bool,
+    #[serde(default)]
+    pub max: Option<u32>,
+    #[serde(default)]
+    pub scope: InFlightLimitScope,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum InFlightLimitScope {
+    #[default]
+    Route,
+    Domain,
+    Upstream,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct StickySessionConfig {
+    #[serde(default)]
+    pub enabled: bool,
+    #[serde(default = "default_sticky_cookie_name")]
+    pub cookie_name: String,
+    #[serde(default = "default_true")]
+    pub http_only: bool,
+    #[serde(default)]
+    pub secure: bool,
+    #[serde(default)]
+    pub same_site: Option<String>,
+    #[serde(default)]
+    pub max_age_seconds: Option<u64>,
+}
+
+impl Default for StickySessionConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            cookie_name: default_sticky_cookie_name(),
+            http_only: true,
+            secure: false,
+            same_site: None,
+            max_age_seconds: None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct PassiveHealthConfig {
+    #[serde(default)]
+    pub enabled: bool,
+    #[serde(default = "default_passive_failure_threshold")]
+    pub failure_threshold: u32,
+    #[serde(default = "default_passive_recovery_seconds")]
+    pub recovery_seconds: u64,
+    #[serde(default)]
+    pub failure_statuses: Vec<u16>,
+}
+
+impl Default for PassiveHealthConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            failure_threshold: default_passive_failure_threshold(),
+            recovery_seconds: default_passive_recovery_seconds(),
+            failure_statuses: vec![500, 502, 503, 504],
+        }
+    }
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct TrafficMirrorConfig {
+    #[serde(default)]
+    pub enabled: bool,
+    #[serde(default)]
+    pub upstreams: Vec<Upstream>,
+    #[serde(default = "default_mirror_percent")]
+    pub percent: u8,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ClientCertForwardingConfig {
+    #[serde(default)]
+    pub enabled: bool,
+    #[serde(default = "default_client_cert_header")]
+    pub header_name: String,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ServiceDefinition {
+    #[serde(default)]
+    pub upstreams: Vec<Upstream>,
+    #[serde(default)]
+    pub weighted: Vec<WeightedServiceTarget>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct WeightedServiceTarget {
+    pub service: String,
+    #[serde(default = "default_weight")]
+    pub weight: u32,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct UpstreamTransport {
+    #[serde(default)]
+    pub server_name: Option<String>,
+    #[serde(default)]
+    pub insecure_skip_verify: bool,
+    #[serde(default)]
+    pub ca_roots: Vec<String>,
+    #[serde(default)]
+    pub mtls_cert_path: Option<String>,
+    #[serde(default)]
+    pub mtls_key_path: Option<String>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct RouterTlsOptions {
+    #[serde(default)]
+    pub min_version: Option<String>,
+    #[serde(default)]
+    pub cipher_suites: Vec<String>,
+    #[serde(default)]
+    pub client_auth: ClientAuthConfig,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ClientAuthConfig {
+    #[serde(default)]
+    pub required: bool,
+    #[serde(default)]
+    pub ca_roots: Vec<String>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct AcmeConfig {
+    #[serde(default)]
+    pub enabled: bool,
+    #[serde(default)]
+    pub email: Option<String>,
+    #[serde(default)]
+    pub directory_url: Option<String>,
+    #[serde(default)]
+    pub challenge: AcmeChallenge,
+    #[serde(default)]
+    pub dns_provider: Option<String>,
+    #[serde(default)]
+    pub wildcard: bool,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum AcmeChallenge {
+    #[default]
+    Http01,
+    Dns01,
+    TlsAlpn01,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct TcpRoutingConfig {
+    #[serde(default)]
+    pub enabled: bool,
+    #[serde(default)]
+    pub host_sni: Vec<String>,
+    #[serde(default)]
+    pub tls_passthrough: bool,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct UdpRoutingConfig {
+    #[serde(default)]
+    pub enabled: bool,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct Http3Config {
+    #[serde(default)]
+    pub enabled: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -515,6 +935,58 @@ fn default_domain_rate_burst() -> u32 {
 
 fn default_rate_limit_status_code() -> u16 {
     429
+}
+
+fn default_auth_realm() -> String {
+    "Pxxl".to_string()
+}
+
+fn default_request_buffer_bytes() -> u64 {
+    16 * 1024 * 1024
+}
+
+fn default_response_buffer_bytes() -> u64 {
+    32 * 1024 * 1024
+}
+
+fn default_min_compress_bytes() -> usize {
+    1024
+}
+
+fn default_retry_attempts() -> u32 {
+    2
+}
+
+fn default_retry_backoff_ms() -> u64 {
+    50
+}
+
+fn default_circuit_failures() -> u32 {
+    5
+}
+
+fn default_circuit_open_seconds() -> u64 {
+    30
+}
+
+fn default_sticky_cookie_name() -> String {
+    "pxxl_upstream".to_string()
+}
+
+fn default_passive_failure_threshold() -> u32 {
+    3
+}
+
+fn default_passive_recovery_seconds() -> u64 {
+    30
+}
+
+fn default_mirror_percent() -> u8 {
+    100
+}
+
+fn default_client_cert_header() -> String {
+    "x-forwarded-tls-client-cert".to_string()
 }
 
 fn deserialize_ip_nets<'de, D>(deserializer: D) -> std::result::Result<Vec<IpNet>, D::Error>

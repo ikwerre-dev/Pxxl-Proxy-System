@@ -181,6 +181,10 @@ impl RouteRegistry {
         }
         self.replace_all(routes);
     }
+
+    pub fn set_single_upstream_health(&self, upstream_url: &str, healthy: bool) {
+        self.set_upstream_health(&HashMap::from([(upstream_url.to_string(), healthy)]));
+    }
 }
 
 #[derive(Clone)]
@@ -235,6 +239,25 @@ impl EdgeState {
         let deleted = self.routes.delete_api_domain(domain);
         refresh_route_metrics(&self.routes, &self.metrics);
         deleted
+    }
+
+    pub fn set_upstream_health(&self, health: &HashMap<String, bool>) {
+        self.routes.set_upstream_health(health);
+        for (upstream, healthy) in health {
+            self.metrics
+                .upstream_health_status
+                .with_label_values(&[upstream])
+                .set(i64::from(*healthy));
+        }
+    }
+
+    pub fn set_single_upstream_health(&self, upstream_url: &str, healthy: bool) {
+        self.routes
+            .set_single_upstream_health(upstream_url, healthy);
+        self.metrics
+            .upstream_health_status
+            .with_label_values(&[upstream_url])
+            .set(i64::from(healthy));
     }
 }
 

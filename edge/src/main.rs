@@ -26,6 +26,7 @@ use pxxl_tls::LocalCertificateStore;
 use std::{
     collections::{BTreeSet, HashMap},
     net::SocketAddr,
+    os::unix::fs::FileTypeExt,
     path::Path,
     sync::Arc,
     time::Duration,
@@ -199,13 +200,20 @@ async fn main() -> Result<()> {
 
     if config.docker.enabled {
         let discovery = DockerDiscovery::new(config.docker.socket_path.clone());
-        let poll_interval = config.docker.poll_interval();
-        let state = state.clone();
-        let shutdown_rx = shutdown_rx.clone();
-        tasks.push(tokio::spawn(async move {
-            run_docker_polling(discovery, state, poll_interval, shutdown_rx.clone()).await;
-            Ok(())
-        }));
+        if unix_socket_available(&config.docker.socket_path) {
+            let poll_interval = config.docker.poll_interval();
+            let state = state.clone();
+            let shutdown_rx = shutdown_rx.clone();
+            tasks.push(tokio::spawn(async move {
+                run_docker_polling(discovery, state, poll_interval, shutdown_rx.clone()).await;
+                Ok(())
+            }));
+        } else {
+            warn!(
+                socket_path = %config.docker.socket_path,
+                "docker discovery enabled but socket path is not available"
+            );
+        }
     }
 
     if config.podman.enabled {
@@ -213,13 +221,20 @@ async fn main() -> Result<()> {
             config.podman.socket_path.clone(),
             config.podman.published_host.clone(),
         );
-        let poll_interval = config.podman.poll_interval();
-        let state = state.clone();
-        let shutdown_rx = shutdown_rx.clone();
-        tasks.push(tokio::spawn(async move {
-            run_docker_polling(discovery, state, poll_interval, shutdown_rx.clone()).await;
-            Ok(())
-        }));
+        if unix_socket_available(&config.podman.socket_path) {
+            let poll_interval = config.podman.poll_interval();
+            let state = state.clone();
+            let shutdown_rx = shutdown_rx.clone();
+            tasks.push(tokio::spawn(async move {
+                run_docker_polling(discovery, state, poll_interval, shutdown_rx.clone()).await;
+                Ok(())
+            }));
+        } else {
+            warn!(
+                socket_path = %config.podman.socket_path,
+                "podman discovery enabled but socket path is not available"
+            );
+        }
     }
 
     info!(
@@ -270,7 +285,7 @@ async fn run_health_checks(
                     let healthy = check_upstream(&client, &upstream, &config.path, timeout).await;
                     health.insert(upstream, healthy);
                 }
-                state.routes.set_upstream_health(&health);
+                state.set_upstream_health(&health);
             }
             changed = shutdown.changed() => {
                 if changed.is_ok() && *shutdown.borrow() {
@@ -389,6 +404,12 @@ fn certificate_domains(local_subject_alt_names: &[String], state: &EdgeState) ->
     domains.sort();
     domains.dedup();
     domains
+}
+
+fn unix_socket_available(path: &str) -> bool {
+    std::fs::metadata(path)
+        .map(|metadata| metadata.file_type().is_socket())
+        .unwrap_or(false)
 }
 
 fn init_tracing() {

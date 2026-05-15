@@ -23,6 +23,15 @@ pub struct PxxlMetrics {
     pub docker_route_changes_total: IntCounter,
     pub tls_certificates_total: IntCounterVec,
     pub routes_total: IntGaugeVec,
+    pub router_request_duration_seconds: HistogramVec,
+    pub upstream_in_flight: IntGaugeVec,
+    pub middleware_executions_total: IntCounterVec,
+    pub upstream_health_status: IntGaugeVec,
+    pub passive_health_events_total: IntCounterVec,
+    pub retries_total: IntCounterVec,
+    pub mirror_requests_total: IntCounterVec,
+    pub circuit_breaker_open_total: IntCounterVec,
+    pub in_flight_limited_total: IntCounterVec,
 }
 
 impl PxxlMetrics {
@@ -72,6 +81,66 @@ impl PxxlMetrics {
             Opts::new("pxxl_routes_total", "Current configured routes"),
             &["source"],
         )?;
+        let router_request_duration_seconds = HistogramVec::new(
+            HistogramOpts::new(
+                "pxxl_router_request_duration_seconds",
+                "End-to-end router request duration",
+            ),
+            &["domain", "route_id", "path_prefix", "upstream", "status"],
+        )?;
+        let upstream_in_flight = IntGaugeVec::new(
+            Opts::new(
+                "pxxl_upstream_in_flight",
+                "Current in-flight requests by route and upstream",
+            ),
+            &["domain", "route_id", "path_prefix", "upstream"],
+        )?;
+        let middleware_executions_total = IntCounterVec::new(
+            Opts::new(
+                "pxxl_middleware_executions_total",
+                "Middleware executions by result",
+            ),
+            &["domain", "middleware", "result"],
+        )?;
+        let upstream_health_status = IntGaugeVec::new(
+            Opts::new(
+                "pxxl_upstream_health_status",
+                "Current upstream health status, 1 for healthy and 0 for unhealthy",
+            ),
+            &["upstream"],
+        )?;
+        let passive_health_events_total = IntCounterVec::new(
+            Opts::new(
+                "pxxl_passive_health_events_total",
+                "Passive health state changes and failure observations",
+            ),
+            &["upstream", "event"],
+        )?;
+        let retries_total = IntCounterVec::new(
+            Opts::new("pxxl_retries_total", "Retry attempts by route and upstream"),
+            &["domain", "upstream", "result"],
+        )?;
+        let mirror_requests_total = IntCounterVec::new(
+            Opts::new(
+                "pxxl_mirror_requests_total",
+                "Traffic mirror requests by route and mirror upstream",
+            ),
+            &["domain", "upstream", "result"],
+        )?;
+        let circuit_breaker_open_total = IntCounterVec::new(
+            Opts::new(
+                "pxxl_circuit_breaker_open_total",
+                "Circuit breaker openings by route and upstream",
+            ),
+            &["domain", "upstream"],
+        )?;
+        let in_flight_limited_total = IntCounterVec::new(
+            Opts::new(
+                "pxxl_in_flight_limited_total",
+                "Requests rejected by in-flight limit",
+            ),
+            &["domain", "scope"],
+        )?;
 
         registry.register(Box::new(requests_total.clone()))?;
         registry.register(Box::new(active_connections.clone()))?;
@@ -82,6 +151,15 @@ impl PxxlMetrics {
         registry.register(Box::new(docker_route_changes_total.clone()))?;
         registry.register(Box::new(tls_certificates_total.clone()))?;
         registry.register(Box::new(routes_total.clone()))?;
+        registry.register(Box::new(router_request_duration_seconds.clone()))?;
+        registry.register(Box::new(upstream_in_flight.clone()))?;
+        registry.register(Box::new(middleware_executions_total.clone()))?;
+        registry.register(Box::new(upstream_health_status.clone()))?;
+        registry.register(Box::new(passive_health_events_total.clone()))?;
+        registry.register(Box::new(retries_total.clone()))?;
+        registry.register(Box::new(mirror_requests_total.clone()))?;
+        registry.register(Box::new(circuit_breaker_open_total.clone()))?;
+        registry.register(Box::new(in_flight_limited_total.clone()))?;
 
         Ok(Self {
             registry,
@@ -94,6 +172,15 @@ impl PxxlMetrics {
             docker_route_changes_total,
             tls_certificates_total,
             routes_total,
+            router_request_duration_seconds,
+            upstream_in_flight,
+            middleware_executions_total,
+            upstream_health_status,
+            passive_health_events_total,
+            retries_total,
+            mirror_requests_total,
+            circuit_breaker_open_total,
+            in_flight_limited_total,
         })
     }
 
