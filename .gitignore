@@ -7,4 +7,6 @@
 !/data/secrets/.gitkeep
 .env
 .DS_Store
+*.swp
+*.swo
 .ai-context/
