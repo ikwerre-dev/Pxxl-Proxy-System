@@ -19,13 +19,29 @@ use tracing::{debug, info, warn};
 
 #[derive(Debug, Clone)]
 pub struct DockerDiscovery {
+    provider: ContainerProvider,
     socket_path: PathBuf,
+    published_port_host: Option<String>,
 }
 
 impl DockerDiscovery {
     pub fn new(socket_path: impl Into<PathBuf>) -> Self {
+        Self::with_provider(ContainerProvider::Docker, socket_path)
+    }
+
+    pub fn podman(socket_path: impl Into<PathBuf>, published_port_host: impl Into<String>) -> Self {
         Self {
+            provider: ContainerProvider::Podman,
             socket_path: socket_path.into(),
+            published_port_host: Some(published_port_host.into()),
+        }
+    }
+
+    pub fn with_provider(provider: ContainerProvider, socket_path: impl Into<PathBuf>) -> Self {
+        Self {
+            provider,
+            socket_path: socket_path.into(),
+            published_port_host: None,
         }
     }
 
@@ -43,11 +59,11 @@ impl DockerDiscovery {
             .into_iter()
             .filter_map(|container| {
                 let name = container.primary_name();
-                route_target_from_labels(&container.labels, &name)
+                route_target_from_container(&container, &name, self.published_port_host.as_deref())
             })
             .collect::<Vec<_>>();
 
-        Ok(routes_from_targets(targets))
+        Ok(routes_from_targets(targets, self.provider))
     }
 
     async fn docker_get(&self, path: &str) -> Result<Vec<u8>> {
@@ -60,6 +76,28 @@ impl DockerDiscovery {
         let mut response = Vec::new();
         stream.read_to_end(&mut response).await?;
         parse_http_response_body(&response).context("Docker HTTP response did not include a body")
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ContainerProvider {
+    Docker,
+    Podman,
+}
+
+impl ContainerProvider {
+    fn label(self) -> &'static str {
+        match self {
+            Self::Docker => "docker",
+            Self::Podman => "podman",
+        }
+    }
+
+    fn route_source(self) -> RouteSource {
+        match self {
+            Self::Docker => RouteSource::Docker,
+            Self::Podman => RouteSource::Podman,
+        }
     }
 }
 
@@ -76,18 +114,26 @@ pub async fn run_docker_polling(
             _ = ticker.tick() => {
                 match discovery.discover_once().await {
                     Ok(routes) => {
-                        debug!(count = routes.len(), "discovered Docker routes");
-                        state.replace_routes_from_source(RouteSource::Docker, routes);
-                        state.metrics.docker_route_changes_total.inc();
+                        let provider = discovery.provider;
+                        debug!(provider = provider.label(), count = routes.len(), "discovered container routes");
+                        state.replace_routes_from_source(provider.route_source(), routes);
+                        state
+                            .metrics
+                            .container_route_changes_total
+                            .with_label_values(&[provider.label()])
+                            .inc();
+                        if provider == ContainerProvider::Docker {
+                            state.metrics.docker_route_changes_total.inc();
+                        }
                     }
                     Err(error) => {
-                        warn!(%error, "Docker discovery failed");
+                        warn!(provider = discovery.provider.label(), %error, "container discovery failed");
                     }
                 }
             }
             changed = shutdown.changed() => {
                 if changed.is_ok() && *shutdown.borrow() {
-                    info!("stopping Docker discovery");
+                    info!(provider = discovery.provider.label(), "stopping container discovery");
                     break;
                 }
             }
@@ -102,6 +148,8 @@ struct DockerContainerSummary {
     names: Vec<String>,
     #[serde(default)]
     labels: HashMap<String, String>,
+    #[serde(default)]
+    ports: Vec<DockerPort>,
 }
 
 impl DockerContainerSummary {
@@ -112,6 +160,21 @@ impl DockerContainerSummary {
             .filter(|name| !name.is_empty())
             .unwrap_or_else(|| "localhost".to_string())
     }
+
+    fn published_port_for(&self, private_port: u16) -> Option<u16> {
+        self.ports
+            .iter()
+            .find(|port| port.private_port == private_port && port.public_port.is_some())
+            .and_then(|port| port.public_port)
+    }
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "PascalCase")]
+struct DockerPort {
+    private_port: u16,
+    #[serde(default)]
+    public_port: Option<u16>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -122,13 +185,54 @@ struct DockerRouteTarget {
 }
 
 pub fn route_from_labels(labels: &HashMap<String, String>, container_name: &str) -> Option<Route> {
-    route_target_from_labels(labels, container_name).map(route_from_target)
+    route_target_from_labels(labels, container_name)
+        .map(|target| route_from_target(target, ContainerProvider::Docker))
 }
 
 fn route_target_from_labels(
     labels: &HashMap<String, String>,
     container_name: &str,
 ) -> Option<DockerRouteTarget> {
+    let label_config = label_route_config(labels)?;
+    let host = label_config.host.unwrap_or(container_name);
+    Some(route_target_from_label_config(
+        &label_config,
+        host,
+        label_config.port,
+    ))
+}
+
+fn route_target_from_container(
+    container: &DockerContainerSummary,
+    container_name: &str,
+    published_port_host: Option<&str>,
+) -> Option<DockerRouteTarget> {
+    let label_config = label_route_config(&container.labels)?;
+    let (host, port) = match label_config.host {
+        Some(host) => (host, label_config.port),
+        None => match published_port_host {
+            Some(host) => (
+                host,
+                container
+                    .published_port_for(label_config.port)
+                    .unwrap_or(label_config.port),
+            ),
+            None => (container_name, label_config.port),
+        },
+    };
+
+    Some(route_target_from_label_config(&label_config, host, port))
+}
+
+struct LabelRouteConfig<'a> {
+    domain: &'a str,
+    path: &'a str,
+    scheme: &'a str,
+    host: Option<&'a str>,
+    port: u16,
+}
+
+fn label_route_config(labels: &HashMap<String, String>) -> Option<LabelRouteConfig<'_>> {
     let enabled = labels
         .get("pxxl.enable")
         .is_some_and(|value| value.eq_ignore_ascii_case("true"));
@@ -143,29 +247,43 @@ fn route_target_from_labels(
         .get("pxxl.scheme")
         .map(String::as_str)
         .unwrap_or("http");
-    let host = labels
-        .get("pxxl.host")
-        .map(String::as_str)
-        .unwrap_or(container_name);
+    let host = labels.get("pxxl.host").map(String::as_str);
 
-    Some(DockerRouteTarget {
-        domain: normalize_domain(domain),
-        path: normalize_path_prefix(path),
-        upstream: Upstream::new(format!("{scheme}://{host}:{port}")),
+    Some(LabelRouteConfig {
+        domain,
+        path,
+        scheme,
+        host,
+        port,
     })
 }
 
-fn route_from_target(target: DockerRouteTarget) -> Route {
-    let id = docker_route_id(&target.domain, Some(&target.path));
+fn route_target_from_label_config(
+    label_config: &LabelRouteConfig<'_>,
+    host: &str,
+    port: u16,
+) -> DockerRouteTarget {
+    DockerRouteTarget {
+        domain: normalize_domain(label_config.domain),
+        path: normalize_path_prefix(label_config.path),
+        upstream: Upstream::new(format!("{}://{}:{}", label_config.scheme, host, port)),
+    }
+}
+
+fn route_from_target(target: DockerRouteTarget, provider: ContainerProvider) -> Route {
+    let id = container_route_id(provider, &target.domain, Some(&target.path));
     Route::new(
         target.domain,
         vec![PathRoute::new(target.path, vec![target.upstream])],
-        RouteSource::Docker,
+        provider.route_source(),
     )
     .with_id(id)
 }
 
-fn routes_from_targets(targets: impl IntoIterator<Item = DockerRouteTarget>) -> Vec<Route> {
+fn routes_from_targets(
+    targets: impl IntoIterator<Item = DockerRouteTarget>,
+    provider: ContainerProvider,
+) -> Vec<Route> {
     let mut grouped: BTreeMap<String, BTreeMap<String, Vec<Upstream>>> = BTreeMap::new();
 
     for target in targets {
@@ -194,16 +312,16 @@ fn routes_from_targets(targets: impl IntoIterator<Item = DockerRouteTarget>) -> 
                 })
                 .collect::<Vec<_>>();
 
-            Route::new(domain.clone(), paths, RouteSource::Docker)
-                .with_id(docker_route_id(&domain, None))
+            Route::new(domain.clone(), paths, provider.route_source())
+                .with_id(container_route_id(provider, &domain, None))
         })
         .collect()
 }
 
-fn docker_route_id(domain: &str, path: Option<&str>) -> String {
+fn container_route_id(provider: ContainerProvider, domain: &str, path: Option<&str>) -> String {
     match path {
-        Some(path) => format!("docker-{}-{}", domain, path.replace('/', "_")),
-        None => format!("docker-{domain}"),
+        Some(path) => format!("{}-{}-{}", provider.label(), domain, path.replace('/', "_")),
+        None => format!("{}-{domain}", provider.label()),
     }
 }
 
@@ -304,10 +422,13 @@ mod tests {
             ("pxxl.path".to_string(), "/".to_string()),
         ]);
 
-        let routes = routes_from_targets([
-            route_target_from_labels(&labels, "web-1").unwrap(),
-            route_target_from_labels(&labels, "web-2").unwrap(),
-        ]);
+        let routes = routes_from_targets(
+            [
+                route_target_from_labels(&labels, "web-1").unwrap(),
+                route_target_from_labels(&labels, "web-2").unwrap(),
+            ],
+            ContainerProvider::Docker,
+        );
 
         assert_eq!(routes.len(), 1);
         assert_eq!(routes[0].domain, "app.pxxlhost");
@@ -337,10 +458,13 @@ mod tests {
             ("pxxl.path".to_string(), "/api".to_string()),
         ]);
 
-        let routes = routes_from_targets([
-            route_target_from_labels(&root_labels, "web").unwrap(),
-            route_target_from_labels(&api_labels, "api").unwrap(),
-        ]);
+        let routes = routes_from_targets(
+            [
+                route_target_from_labels(&root_labels, "web").unwrap(),
+                route_target_from_labels(&api_labels, "api").unwrap(),
+            ],
+            ContainerProvider::Docker,
+        );
 
         assert_eq!(routes.len(), 1);
         assert_eq!(
@@ -351,6 +475,79 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec!["/", "/api"]
         );
+    }
+
+    #[test]
+    fn podman_provider_uses_podman_route_source_and_ids() {
+        let labels = HashMap::from([
+            ("pxxl.enable".to_string(), "true".to_string()),
+            ("pxxl.domain".to_string(), "app.pxxlhost".to_string()),
+            ("pxxl.port".to_string(), "8080".to_string()),
+        ]);
+
+        let routes = routes_from_targets(
+            [route_target_from_labels(&labels, "podman-web").unwrap()],
+            ContainerProvider::Podman,
+        );
+
+        assert_eq!(routes.len(), 1);
+        assert_eq!(routes[0].id, "podman-app.pxxlhost");
+        assert_eq!(routes[0].source, RouteSource::Podman);
+        assert_eq!(
+            routes[0].paths[0].upstreams[0].url,
+            "http://podman-web:8080"
+        );
+    }
+
+    #[test]
+    fn podman_container_uses_published_host_port_when_host_label_is_absent() {
+        let container = DockerContainerSummary {
+            names: vec!["/my-html-site".to_string()],
+            labels: HashMap::from([
+                ("pxxl.enable".to_string(), "true".to_string()),
+                ("pxxl.domain".to_string(), "app.pxxlhost".to_string()),
+                ("pxxl.port".to_string(), "80".to_string()),
+            ]),
+            ports: vec![DockerPort {
+                private_port: 80,
+                public_port: Some(8080),
+            }],
+        };
+
+        let target = route_target_from_container(
+            &container,
+            &container.primary_name(),
+            Some("host.docker.internal"),
+        )
+        .unwrap();
+
+        assert_eq!(target.upstream.url, "http://host.docker.internal:8080");
+    }
+
+    #[test]
+    fn explicit_host_label_skips_published_port_rewrite() {
+        let container = DockerContainerSummary {
+            names: vec!["/my-html-site".to_string()],
+            labels: HashMap::from([
+                ("pxxl.enable".to_string(), "true".to_string()),
+                ("pxxl.domain".to_string(), "app.pxxlhost".to_string()),
+                ("pxxl.port".to_string(), "80".to_string()),
+                ("pxxl.host".to_string(), "my-html-site".to_string()),
+            ]),
+            ports: vec![DockerPort {
+                private_port: 80,
+                public_port: Some(8080),
+            }],
+        };
+
+        let target = route_target_from_container(
+            &container,
+            &container.primary_name(),
+            Some("host.docker.internal"),
+        )
+        .unwrap();
+
+        assert_eq!(target.upstream.url, "http://my-html-site:80");
     }
 
     #[test]

@@ -19,6 +19,7 @@ pub struct PxxlMetrics {
     pub upstream_latency_seconds: HistogramVec,
     pub rate_limited_total: IntCounterVec,
     pub blocked_total: IntCounterVec,
+    pub container_route_changes_total: IntCounterVec,
     pub docker_route_changes_total: IntCounter,
     pub tls_certificates_total: IntCounterVec,
     pub routes_total: IntGaugeVec,
@@ -49,6 +50,13 @@ impl PxxlMetrics {
             Opts::new("pxxl_blocked_total", "Blocked requests"),
             &["domain", "reason"],
         )?;
+        let container_route_changes_total = IntCounterVec::new(
+            Opts::new(
+                "pxxl_container_route_changes_total",
+                "Container provider route registry updates",
+            ),
+            &["provider"],
+        )?;
         let docker_route_changes_total = IntCounter::with_opts(Opts::new(
             "pxxl_docker_route_changes_total",
             "Docker route registry updates",
@@ -70,6 +78,7 @@ impl PxxlMetrics {
         registry.register(Box::new(upstream_latency_seconds.clone()))?;
         registry.register(Box::new(rate_limited_total.clone()))?;
         registry.register(Box::new(blocked_total.clone()))?;
+        registry.register(Box::new(container_route_changes_total.clone()))?;
         registry.register(Box::new(docker_route_changes_total.clone()))?;
         registry.register(Box::new(tls_certificates_total.clone()))?;
         registry.register(Box::new(routes_total.clone()))?;
@@ -81,6 +90,7 @@ impl PxxlMetrics {
             upstream_latency_seconds,
             rate_limited_total,
             blocked_total,
+            container_route_changes_total,
             docker_route_changes_total,
             tls_certificates_total,
             routes_total,

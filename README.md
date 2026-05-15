@@ -45,9 +45,9 @@ curl http://127.0.0.1:8081/readyz
 curl http://127.0.0.1:9090/metrics
 ```
 
-## Docker Labels
+## Container Labels
 
-Pxxl Proxy discovers enabled containers through the Docker socket:
+Pxxl Proxy discovers enabled Docker and Podman containers through their runtime sockets:
 
 ```yaml
 labels:
@@ -65,7 +65,22 @@ labels:
   - pxxl.host=my-service
 ```
 
-Containers with the same `pxxl.domain` and `pxxl.path` are merged into one route with multiple upstreams. Requests are load-balanced across those upstreams, so stopping one replica removes it from the route on the next Docker discovery poll while traffic keeps flowing to the remaining replicas.
+Enable each provider independently in `config/pxxl.toml`:
+
+```toml
+[docker]
+enabled = true
+socket_path = "/var/run/docker.sock"
+
+[podman]
+enabled = true
+socket_path = "/var/run/podman/podman.sock"
+published_host = "host.docker.internal"
+```
+
+Containers with the same `pxxl.domain` and `pxxl.path` are merged into one route with multiple upstreams. Requests are load-balanced across those upstreams, so stopping one replica removes it from the route on the next discovery poll while traffic keeps flowing to the remaining replicas.
+
+When Pxxl itself is running in Docker and the target is a Podman container, Podman container names are usually not resolvable from the Docker network. In that case Pxxl uses Podman's published port mapping and the configured `published_host`. For example, a Podman container labeled `pxxl.port=80` and published as `-p 8080:80` becomes `http://host.docker.internal:8080`.
 
 ## Local Wildcard Development
 

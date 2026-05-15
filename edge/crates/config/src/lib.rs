@@ -33,6 +33,8 @@ pub struct PxxlConfig {
     #[serde(default)]
     pub docker: DockerConfig,
     #[serde(default)]
+    pub podman: PodmanConfig,
+    #[serde(default)]
     pub security: SecurityConfig,
     #[serde(default)]
     pub redis: RedisConfig,
@@ -48,6 +50,7 @@ impl Default for PxxlConfig {
             listeners: ListenerConfig::default(),
             tls: TlsConfig::default(),
             docker: DockerConfig::default(),
+            podman: PodmanConfig::default(),
             security: SecurityConfig::default(),
             redis: RedisConfig::default(),
             storage: StorageConfig::default(),
@@ -59,12 +62,13 @@ impl Default for PxxlConfig {
 impl PxxlConfig {
     pub async fn load(path: impl AsRef<Path>) -> Result<Self> {
         let path = path.as_ref();
-        let content = tokio::fs::read_to_string(path)
-            .await
-            .map_err(|source| ConfigError::Read {
-                path: path.display().to_string(),
-                source,
-            })?;
+        let content =
+            tokio::fs::read_to_string(path)
+                .await
+                .map_err(|source| ConfigError::Read {
+                    path: path.display().to_string(),
+                    source,
+                })?;
         toml::from_str(&content).map_err(|source| ConfigError::Parse {
             path: path.display().to_string(),
             source,
@@ -124,6 +128,35 @@ impl Default for DockerConfig {
 }
 
 impl DockerConfig {
+    pub fn poll_interval(&self) -> Duration {
+        Duration::from_secs(self.poll_seconds.max(1))
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PodmanConfig {
+    #[serde(default = "default_false")]
+    pub enabled: bool,
+    #[serde(default = "default_podman_socket")]
+    pub socket_path: String,
+    #[serde(default = "default_podman_published_host")]
+    pub published_host: String,
+    #[serde(default = "default_docker_poll_seconds")]
+    pub poll_seconds: u64,
+}
+
+impl Default for PodmanConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            socket_path: default_podman_socket(),
+            published_host: default_podman_published_host(),
+            poll_seconds: default_docker_poll_seconds(),
+        }
+    }
+}
+
+impl PodmanConfig {
     pub fn poll_interval(&self) -> Duration {
         Duration::from_secs(self.poll_seconds.max(1))
     }
@@ -228,16 +261,25 @@ impl RouteConfig {
             }
             vec![PathRoute::new(
                 "/",
-                self.upstreams.iter().map(UpstreamConfig::to_upstream).collect(),
+                self.upstreams
+                    .iter()
+                    .map(UpstreamConfig::to_upstream)
+                    .collect(),
             )]
         } else {
             self.paths
                 .iter()
                 .map(|path| {
                     let upstreams: Vec<Upstream> = if path.upstreams.is_empty() {
-                        self.upstreams.iter().map(UpstreamConfig::to_upstream).collect()
+                        self.upstreams
+                            .iter()
+                            .map(UpstreamConfig::to_upstream)
+                            .collect()
                     } else {
-                        path.upstreams.iter().map(UpstreamConfig::to_upstream).collect()
+                        path.upstreams
+                            .iter()
+                            .map(UpstreamConfig::to_upstream)
+                            .collect()
                     };
 
                     if upstreams.is_empty() {
@@ -304,6 +346,14 @@ fn default_cert_dir() -> String {
 
 fn default_docker_socket() -> String {
     "/var/run/docker.sock".to_string()
+}
+
+fn default_podman_socket() -> String {
+    "/var/run/podman/podman.sock".to_string()
+}
+
+fn default_podman_published_host() -> String {
+    "host.docker.internal".to_string()
 }
 
 fn default_docker_poll_seconds() -> u64 {
@@ -390,5 +440,23 @@ mod tests {
         let routes = config.static_routes().unwrap();
 
         assert_eq!(routes[0].paths[0].prefix, "/v1");
+    }
+
+    #[test]
+    fn parses_podman_discovery_config() {
+        let raw = r#"
+            [podman]
+            enabled = true
+            socket_path = "/var/run/podman/podman.sock"
+            published_host = "host.docker.internal"
+            poll_seconds = 2
+        "#;
+
+        let config: PxxlConfig = toml::from_str(raw).unwrap();
+
+        assert!(config.podman.enabled);
+        assert_eq!(config.podman.socket_path, "/var/run/podman/podman.sock");
+        assert_eq!(config.podman.published_host, "host.docker.internal");
+        assert_eq!(config.podman.poll_interval(), Duration::from_secs(2));
     }
 }

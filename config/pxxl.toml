@@ -14,6 +14,12 @@ enabled = true
 socket_path = "/var/run/docker.sock"
 poll_seconds = 5
 
+[podman]
+enabled = true
+socket_path = "/var/run/podman/podman.sock"
+published_host = "host.docker.internal"
+poll_seconds = 5
+
 [security.rate_limits]
 requests_per_second = 120
 burst = 240

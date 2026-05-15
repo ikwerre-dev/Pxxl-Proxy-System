@@ -44,6 +44,7 @@ impl Default for ListenerConfig {
 pub enum RouteSource {
     Static,
     Docker,
+    Podman,
     Api,
 }
 
@@ -82,7 +83,8 @@ impl Upstream {
     }
 
     pub fn authority(&self) -> Result<String> {
-        let parsed = Url::parse(&self.url).map_err(|_| PxxlError::InvalidUpstream(self.url.clone()))?;
+        let parsed =
+            Url::parse(&self.url).map_err(|_| PxxlError::InvalidUpstream(self.url.clone()))?;
         parsed
             .host_str()
             .map(|host| match parsed.port() {
@@ -159,7 +161,8 @@ impl Route {
     }
 
     pub fn matches_host(&self, host: &str) -> bool {
-        host_without_port(host).is_some_and(|candidate| candidate.eq_ignore_ascii_case(&self.domain))
+        host_without_port(host)
+            .is_some_and(|candidate| candidate.eq_ignore_ascii_case(&self.domain))
     }
 
     pub fn best_path(&self, path: &str) -> Option<&PathRoute> {
@@ -199,7 +202,10 @@ impl fmt::Display for AccessLogRecord {
 }
 
 pub fn normalize_domain(domain: &str) -> String {
-    host_without_port(domain).unwrap_or(domain).trim_end_matches('.').to_ascii_lowercase()
+    host_without_port(domain)
+        .unwrap_or(domain)
+        .trim_end_matches('.')
+        .to_ascii_lowercase()
 }
 
 pub fn host_without_port(host: &str) -> Option<&str> {
@@ -209,7 +215,10 @@ pub fn host_without_port(host: &str) -> Option<&str> {
     }
 
     if trimmed.starts_with('[') {
-        return trimmed.split(']').next().map(|part| part.trim_start_matches('['));
+        return trimmed
+            .split(']')
+            .next()
+            .map(|part| part.trim_start_matches('['));
     }
 
     trimmed.split(':').next()
@@ -265,7 +274,10 @@ mod tests {
             RouteSource::Static,
         );
 
-        assert_eq!(route.best_path("/v1/admin/users").unwrap().prefix, "/v1/admin");
+        assert_eq!(
+            route.best_path("/v1/admin/users").unwrap().prefix,
+            "/v1/admin"
+        );
         assert_eq!(route.best_path("/v1/users").unwrap().prefix, "/v1");
         assert_eq!(route.best_path("/health").unwrap().prefix, "/");
     }

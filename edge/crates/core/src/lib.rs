@@ -1,12 +1,14 @@
 use arc_swap::ArcSwap;
 use dashmap::DashMap;
-use pxxl_common::{normalize_domain, PxxlError, Route, RouteMatch, RouteSource};
+use pxxl_common::{
+    normalize_domain, PathRoute, PxxlError, Route, RouteMatch, RouteSource, Upstream,
+};
 use pxxl_ddos::SecurityEngine;
 use pxxl_load_balancer::LoadBalancer;
 use pxxl_metrics::PxxlMetrics;
 use serde::Serialize;
 use std::{
-    collections::HashMap,
+    collections::{BTreeMap, HashMap},
     sync::{
         atomic::{AtomicU64, Ordering},
         Arc,
@@ -101,13 +103,12 @@ impl RouteRegistry {
 
     pub fn find_domain(&self, domain: &str) -> Option<Route> {
         let table = self.routes.load();
-        table
+        let routes = table
             .by_domain
             .get(&normalize_domain(domain))
             .into_iter()
-            .flatten()
-            .max_by_key(|route| source_priority(&route.source))
-            .cloned()
+            .flatten();
+        merge_best_domain_routes(routes)
     }
 
     pub fn find(&self, host: &str, path: &str) -> Option<RouteMatch> {
@@ -116,7 +117,7 @@ impl RouteRegistry {
             return None;
         }
         let table = self.routes.load();
-        table
+        let matches = table
             .by_domain
             .get(&normalized_host)
             .into_iter()
@@ -127,19 +128,17 @@ impl RouteRegistry {
                     path: path_route.clone(),
                 })
             })
-            .max_by_key(|matched| {
-                (
-                    matched.path.prefix.len(),
-                    source_priority(&matched.route.source),
-                )
-            })
+            .collect::<Vec<_>>();
+
+        merge_best_route_matches(matches)
     }
 
     pub fn required_match(&self, host: &str, path: &str) -> pxxl_common::Result<RouteMatch> {
-        self.find(host, path).ok_or_else(|| PxxlError::RouteNotFound {
-            host: host.to_string(),
-            path: path.to_string(),
-        })
+        self.find(host, path)
+            .ok_or_else(|| PxxlError::RouteNotFound {
+                host: host.to_string(),
+                path: path.to_string(),
+            })
     }
 }
 
@@ -293,7 +292,88 @@ fn source_priority(source: &RouteSource) -> usize {
     match source {
         RouteSource::Static => 1,
         RouteSource::Docker => 2,
+        RouteSource::Podman => 2,
         RouteSource::Api => 3,
+    }
+}
+
+fn merge_best_domain_routes<'a>(routes: impl Iterator<Item = &'a Route>) -> Option<Route> {
+    let routes = routes.collect::<Vec<_>>();
+    let best_priority = routes
+        .iter()
+        .map(|route| source_priority(&route.source))
+        .max()?;
+    let selected = routes
+        .into_iter()
+        .filter(|route| source_priority(&route.source) == best_priority)
+        .collect::<Vec<_>>();
+
+    if selected.len() == 1 {
+        return selected.first().map(|route| (*route).clone());
+    }
+
+    let mut merged = (*selected.first()?).clone();
+    let mut paths = BTreeMap::<String, PathRoute>::new();
+
+    for route in selected {
+        for path in &route.paths {
+            let entry = paths
+                .entry(path.prefix.clone())
+                .or_insert_with(|| PathRoute {
+                    prefix: path.prefix.clone(),
+                    upstreams: Vec::new(),
+                    middlewares: path.middlewares.clone(),
+                });
+            extend_unique_upstreams(&mut entry.upstreams, &path.upstreams);
+            extend_unique_middlewares(&mut entry.middlewares, &path.middlewares);
+        }
+    }
+
+    merged.paths = paths.into_values().collect();
+    Some(merged)
+}
+
+fn merge_best_route_matches(matches: Vec<RouteMatch>) -> Option<RouteMatch> {
+    let best_prefix_len = matches
+        .iter()
+        .map(|matched| matched.path.prefix.len())
+        .max()?;
+    let best_priority = matches
+        .iter()
+        .filter(|matched| matched.path.prefix.len() == best_prefix_len)
+        .map(|matched| source_priority(&matched.route.source))
+        .max()?;
+    let selected = matches
+        .into_iter()
+        .filter(|matched| {
+            matched.path.prefix.len() == best_prefix_len
+                && source_priority(&matched.route.source) == best_priority
+        })
+        .collect::<Vec<_>>();
+
+    let mut merged = selected.first()?.clone();
+    for matched in selected.iter().skip(1) {
+        extend_unique_upstreams(&mut merged.path.upstreams, &matched.path.upstreams);
+        extend_unique_middlewares(&mut merged.path.middlewares, &matched.path.middlewares);
+    }
+    merged.route.paths = vec![merged.path.clone()];
+
+    Some(merged)
+}
+
+fn extend_unique_upstreams(target: &mut Vec<Upstream>, upstreams: &[Upstream]) {
+    for upstream in upstreams {
+        if !target.iter().any(|existing| existing.url == upstream.url) {
+            target.push(upstream.clone());
+        }
+    }
+}
+
+fn extend_unique_middlewares(target: &mut Vec<String>, middlewares: &[String]) {
+    for middleware in middlewares {
+        if !target.iter().any(|existing| existing == middleware) {
+            target.push(middleware.clone());
+        }
     }
 }
 
@@ -321,16 +401,14 @@ fn nonzero_u64(value: u64) -> Option<u64> {
 }
 
 fn refresh_route_metrics(routes: &RouteRegistry, metrics: &PxxlMetrics) {
-    let mut counts: HashMap<&'static str, i64> = HashMap::from([
-        ("static", 0),
-        ("docker", 0),
-        ("api", 0),
-    ]);
+    let mut counts: HashMap<&'static str, i64> =
+        HashMap::from([("static", 0), ("docker", 0), ("podman", 0), ("api", 0)]);
 
     for route in routes.snapshot() {
         let key = match route.source {
             RouteSource::Static => "static",
             RouteSource::Docker => "docker",
+            RouteSource::Podman => "podman",
             RouteSource::Api => "api",
         };
         *counts.entry(key).or_default() += 1;
@@ -381,7 +459,10 @@ mod tests {
     fn registry_prefers_api_route_for_same_domain() {
         let static_route = Route::new(
             "app.pxxlhost",
-            vec![PathRoute::new("/", vec![Upstream::new("http://static:3000")])],
+            vec![PathRoute::new(
+                "/",
+                vec![Upstream::new("http://static:3000")],
+            )],
             RouteSource::Static,
         );
         let api_route = Route::new(
@@ -422,5 +503,32 @@ mod tests {
         assert!(routes.iter().any(|route| route.domain == "app.pxxlhost"));
         assert!(routes.iter().any(|route| route.domain == "new.pxxlhost"));
         assert!(!routes.iter().any(|route| route.domain == "old.pxxlhost"));
+    }
+
+    #[test]
+    fn registry_merges_equal_priority_container_routes() {
+        let docker_route = Route::new(
+            "app.pxxlhost",
+            vec![PathRoute::new("/", vec![Upstream::new("http://docker:80")])],
+            RouteSource::Docker,
+        );
+        let podman_route = Route::new(
+            "app.pxxlhost",
+            vec![PathRoute::new("/", vec![Upstream::new("http://podman:80")])],
+            RouteSource::Podman,
+        );
+        let registry = RouteRegistry::new(vec![docker_route, podman_route]);
+
+        let matched = registry.find("app.pxxlhost", "/").unwrap();
+
+        assert_eq!(
+            matched
+                .path
+                .upstreams
+                .iter()
+                .map(|upstream| upstream.url.as_str())
+                .collect::<Vec<_>>(),
+            vec!["http://docker:80", "http://podman:80"]
+        );
     }
 }

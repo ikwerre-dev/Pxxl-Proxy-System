@@ -18,7 +18,8 @@ use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt, EnvFilte
 async fn main() -> Result<()> {
     init_tracing();
 
-    let config_path = std::env::var("PXXL_CONFIG").unwrap_or_else(|_| "config/pxxl.toml".to_string());
+    let config_path =
+        std::env::var("PXXL_CONFIG").unwrap_or_else(|_| "config/pxxl.toml".to_string());
     let mut config = if Path::new(&config_path).exists() {
         PxxlConfig::load(&config_path)
             .await
@@ -107,6 +108,22 @@ async fn main() -> Result<()> {
     if config.docker.enabled {
         let discovery = DockerDiscovery::new(config.docker.socket_path.clone());
         let poll_interval = config.docker.poll_interval();
+        let state = state.clone();
+        let shutdown_rx = shutdown_rx.clone();
+        tasks.push(tokio::spawn(async move {
+            run_docker_polling(discovery, state, poll_interval, shutdown_rx.clone()).await;
+            Ok(())
+        }));
+    }
+
+    if config.podman.enabled {
+        let discovery = DockerDiscovery::podman(
+            config.podman.socket_path.clone(),
+            config.podman.published_host.clone(),
+        );
+        let poll_interval = config.podman.poll_interval();
+        let state = state.clone();
+        let shutdown_rx = shutdown_rx.clone();
         tasks.push(tokio::spawn(async move {
             run_docker_polling(discovery, state, poll_interval, shutdown_rx.clone()).await;
             Ok(())

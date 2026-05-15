@@ -18,6 +18,7 @@ services:
       - ./config:/app/config:ro
       - ./data:/data
       - /var/run/docker.sock:/var/run/docker.sock:ro
+      - ${PODMAN_SOCKET_PATH:-/var/run/podman/podman.sock}:/var/run/podman/podman.sock:ro
     depends_on:
       - redis
       - postgres
