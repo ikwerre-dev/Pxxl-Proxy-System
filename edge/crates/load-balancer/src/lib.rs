@@ -50,7 +50,9 @@ impl LoadBalancer {
             }
             LoadBalancingAlgorithm::LeastConnections => self.least_connections(route_key, &healthy),
             LoadBalancingAlgorithm::P2c => self.power_of_two_choices(route_key, &healthy),
-            LoadBalancingAlgorithm::Hrw => self.highest_random_weight(route_key, &healthy, client_ip),
+            LoadBalancingAlgorithm::Hrw => {
+                self.highest_random_weight(route_key, &healthy, client_ip)
+            }
             LoadBalancingAlgorithm::EwmaLatency | LoadBalancingAlgorithm::LatencyAware => {
                 self.latency_aware(route_key, &healthy)
             }
@@ -68,10 +70,11 @@ impl LoadBalancer {
     pub fn end_request(&self, route_key: &str, upstream: &str, latency_micros: u64) {
         let key = upstream_key(route_key, upstream);
         if let Some(counter) = self.in_flight.get(&key) {
-            counter.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |value| {
-                Some(value.saturating_sub(1))
-            })
-            .ok();
+            counter
+                .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |value| {
+                    Some(value.saturating_sub(1))
+                })
+                .ok();
         }
 
         self.ewma_latency_micros
@@ -173,7 +176,9 @@ impl LoadBalancer {
                 let mut hasher = DefaultHasher::new();
                 identity.hash(&mut hasher);
                 upstream.url.hash(&mut hasher);
-                hasher.finish().saturating_mul(upstream.weight.max(1) as u64)
+                hasher
+                    .finish()
+                    .saturating_mul(upstream.weight.max(1) as u64)
             })
             .cloned()
     }

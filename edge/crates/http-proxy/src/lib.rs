@@ -2,8 +2,8 @@ use anyhow::Context;
 use arc_swap::ArcSwap;
 use base64::Engine;
 use bytes::Bytes;
-use flate2::{write::GzEncoder, Compression};
 use dashmap::DashMap;
+use flate2::{write::GzEncoder, Compression};
 use http::{
     header::{
         HeaderMap, HeaderName, HeaderValue, ACCEPT_ENCODING, ACCESS_CONTROL_REQUEST_METHOD,
@@ -21,12 +21,11 @@ use hyper_util::{
 };
 use parking_lot::Mutex;
 use pxxl_common::{
-    normalize_domain, BasicAuthConfig, BufferingConfig, CircuitBreakerConfig, CompressionConfig,
-    ContentTypeAutoDetectConfig, DigestAuthConfig, DomainRateLimit, DomainRules,
-    ForwardAuthConfig, GeoLocation, InFlightLimitConfig, InFlightLimitScope, MiddlewareDefinition,
-    PassiveHealthConfig, PxxlError, RateLimitScope, RetryConfig, RouteMatch,
-    StickySessionConfig, TrafficMirrorConfig, TrafficSplitRule, Upstream,
-    ClientCertForwardingConfig,
+    normalize_domain, BasicAuthConfig, BufferingConfig, CircuitBreakerConfig,
+    ClientCertForwardingConfig, CompressionConfig, ContentTypeAutoDetectConfig, DigestAuthConfig,
+    DomainRateLimit, DomainRules, ForwardAuthConfig, GeoLocation, InFlightLimitConfig,
+    InFlightLimitScope, MiddlewareDefinition, PassiveHealthConfig, PxxlError, RateLimitScope,
+    RetryConfig, RouteMatch, StickySessionConfig, TrafficMirrorConfig, TrafficSplitRule, Upstream,
 };
 use pxxl_core::{EdgeState, RequestObservation};
 use pxxl_ddos::SecurityDecision;
@@ -50,8 +49,8 @@ use tokio::{
     net::{TcpListener, TcpStream},
     sync::watch,
 };
-use tokio_rustls::TlsAcceptor;
 use tokio_rustls::server::TlsStream;
+use tokio_rustls::TlsAcceptor;
 use tracing::{debug, error, info, warn};
 
 type BoxError = Box<dyn std::error::Error + Send + Sync>;
@@ -289,6 +288,27 @@ struct EffectiveMiddleware {
     basic_auth: Option<BasicAuthConfig>,
     digest_auth: Option<DigestAuthConfig>,
     forward_auth: Option<ForwardAuthConfig>,
+}
+
+struct ForwardContext<'a> {
+    matched: &'a RouteMatch,
+    upstream: &'a Upstream,
+    remote_ip: Option<IpAddr>,
+    scheme: RequestScheme,
+    middleware: &'a EffectiveMiddleware,
+    domain: &'a str,
+    client_cert_pem: Option<&'a str>,
+}
+
+struct CircuitRecord<'a> {
+    config: &'a CircuitBreakerConfig,
+    domain: &'a str,
+    route_id: &'a str,
+    path_prefix: &'a str,
+    upstream: &'a str,
+    status: StatusCode,
+    error: bool,
+    state: &'a EdgeState,
 }
 
 impl EffectiveMiddleware {
@@ -787,12 +807,7 @@ impl PolicyEnforcer {
                 return Err(scope);
             }
             if counter
-                .compare_exchange_weak(
-                    current,
-                    current + 1,
-                    Ordering::Relaxed,
-                    Ordering::Relaxed,
-                )
+                .compare_exchange_weak(current, current + 1, Ordering::Relaxed, Ordering::Relaxed)
                 .is_ok()
             {
                 return Ok(Some(key));
@@ -869,36 +884,27 @@ impl PolicyEnforcer {
         }
     }
 
-    fn record_circuit_result(
-        &self,
-        config: &CircuitBreakerConfig,
-        domain: &str,
-        route_id: &str,
-        path_prefix: &str,
-        upstream: &str,
-        status: StatusCode,
-        error: bool,
-        state: &EdgeState,
-    ) {
-        if !config.enabled {
+    fn record_circuit_result(&self, record: CircuitRecord<'_>) {
+        if !record.config.enabled {
             return;
         }
-        let key = circuit_key(route_id, path_prefix, upstream);
+        let key = circuit_key(record.route_id, record.path_prefix, record.upstream);
         let entry = self
             .circuit_breakers
             .entry(key)
             .or_insert_with(|| Mutex::new(CircuitBreakerState::default()));
         let mut breaker = entry.lock();
 
-        if error || status.is_server_error() {
+        if record.error || record.status.is_server_error() {
             breaker.failures = breaker.failures.saturating_add(1);
-            if breaker.failures >= config.failure_threshold.max(1) {
+            if breaker.failures >= record.config.failure_threshold.max(1) {
                 breaker.open_until =
-                    Some(Instant::now() + Duration::from_secs(config.open_seconds.max(1)));
-                state
+                    Some(Instant::now() + Duration::from_secs(record.config.open_seconds.max(1)));
+                record
+                    .state
                     .metrics
                     .circuit_breaker_open_total
-                    .with_label_values(&[domain, upstream])
+                    .with_label_values(&[record.domain, record.upstream])
                     .inc();
             }
         } else {
@@ -1171,7 +1177,8 @@ impl ProxyServer {
             return response;
         }
 
-        let middleware = EffectiveMiddleware::from_rules(&matched.route.rules, &matched.path.middlewares);
+        let middleware =
+            EffectiveMiddleware::from_rules(&matched.route.rules, &matched.path.middlewares);
 
         if let Some(basic_auth) = &middleware.basic_auth {
             if let Some(response) = self.evaluate_basic_auth(&req, basic_auth, &domain, &path) {
@@ -1360,13 +1367,15 @@ impl ProxyServer {
         match self
             .forward_with_retry(
                 buffered_request,
-                &matched,
-                &upstream,
-                remote_ip,
-                scheme,
-                &middleware,
-                &domain,
-                client_cert_pem.as_deref(),
+                ForwardContext {
+                    matched: &matched,
+                    upstream: &upstream,
+                    remote_ip,
+                    scheme,
+                    middleware: &middleware,
+                    domain: &domain,
+                    client_cert_pem: client_cert_pem.as_deref(),
+                },
             )
             .await
         {
@@ -1396,16 +1405,16 @@ impl ProxyServer {
                     status,
                     None,
                 );
-                self.policy.record_circuit_result(
-                    &middleware.circuit_breaker,
-                    &domain,
-                    &matched.route.id,
-                    &matched.path.prefix,
-                    &upstream.url,
+                self.policy.record_circuit_result(CircuitRecord {
+                    config: &middleware.circuit_breaker,
+                    domain: &domain,
+                    route_id: &matched.route.id,
+                    path_prefix: &matched.path.prefix,
+                    upstream: &upstream.url,
                     status,
-                    false,
-                    &self.state,
-                );
+                    error: false,
+                    state: &self.state,
+                });
                 self.policy.apply_response_rules(
                     &mut response.headers,
                     &matched.route.rules,
@@ -1416,7 +1425,11 @@ impl ProxyServer {
                     &middleware,
                     accepts_gzip(request_accept_encoding.as_ref()),
                 );
-                apply_sticky_cookie(&mut response.headers, &middleware.sticky_sessions, &upstream);
+                apply_sticky_cookie(
+                    &mut response.headers,
+                    &middleware.sticky_sessions,
+                    &upstream,
+                );
                 self.observe_request(&context, status, started, Some(&upstream.url));
                 self.state
                     .metrics
@@ -1471,16 +1484,16 @@ impl ProxyServer {
                     StatusCode::BAD_GATEWAY,
                     Some(&error),
                 );
-                self.policy.record_circuit_result(
-                    &middleware.circuit_breaker,
-                    &domain,
-                    &matched.route.id,
-                    &matched.path.prefix,
-                    &upstream.url,
-                    StatusCode::BAD_GATEWAY,
-                    true,
-                    &self.state,
-                );
+                self.policy.record_circuit_result(CircuitRecord {
+                    config: &middleware.circuit_breaker,
+                    domain: &domain,
+                    route_id: &matched.route.id,
+                    path_prefix: &matched.path.prefix,
+                    upstream: &upstream.url,
+                    status: StatusCode::BAD_GATEWAY,
+                    error: true,
+                    state: &self.state,
+                });
                 self.observe_request(
                     &context,
                     StatusCode::BAD_GATEWAY,
@@ -1500,43 +1513,28 @@ impl ProxyServer {
     async fn forward_with_retry(
         &self,
         request: BufferedRequest,
-        matched: &RouteMatch,
-        upstream: &Upstream,
-        remote_ip: Option<IpAddr>,
-        scheme: RequestScheme,
-        middleware: &EffectiveMiddleware,
-        domain: &str,
-        client_cert_pem: Option<&str>,
+        context: ForwardContext<'_>,
     ) -> Result<BufferedResponse, PxxlError> {
-        let attempts = if middleware.retry.enabled {
-            middleware.retry.attempts.max(1)
+        let attempts = if context.middleware.retry.enabled {
+            context.middleware.retry.attempts.max(1)
         } else {
             1
         };
         let mut last_error = None;
 
         for attempt in 1..=attempts {
-            match self
-                .forward_buffered(
-                    &request,
-                    matched,
-                    upstream,
-                    remote_ip,
-                    scheme,
-                    middleware,
-                    client_cert_pem,
-                )
-                .await
-            {
+            match self.forward_buffered(&request, &context).await {
                 Ok(response)
-                    if attempt < attempts && retryable_status(response.status, &middleware.retry) =>
+                    if attempt < attempts
+                        && retryable_status(response.status, &context.middleware.retry) =>
                 {
                     self.state
                         .metrics
                         .retries_total
-                        .with_label_values(&[domain, &upstream.url, "status"])
+                        .with_label_values(&[context.domain, &context.upstream.url, "status"])
                         .inc();
-                    tokio::time::sleep(Duration::from_millis(middleware.retry.backoff_ms)).await;
+                    tokio::time::sleep(Duration::from_millis(context.middleware.retry.backoff_ms))
+                        .await;
                     continue;
                 }
                 Ok(response) => return Ok(response),
@@ -1544,56 +1542,59 @@ impl ProxyServer {
                     self.state
                         .metrics
                         .retries_total
-                        .with_label_values(&[domain, &upstream.url, "error"])
+                        .with_label_values(&[context.domain, &context.upstream.url, "error"])
                         .inc();
                     last_error = Some(error);
-                    tokio::time::sleep(Duration::from_millis(middleware.retry.backoff_ms)).await;
+                    tokio::time::sleep(Duration::from_millis(context.middleware.retry.backoff_ms))
+                        .await;
                 }
                 Err(error) => return Err(error),
             }
         }
 
-        Err(last_error.unwrap_or_else(|| PxxlError::InvalidUpstream(upstream.url.clone())))
+        Err(last_error.unwrap_or_else(|| PxxlError::InvalidUpstream(context.upstream.url.clone())))
     }
 
     async fn forward_buffered(
         &self,
         request: &BufferedRequest,
-        matched: &RouteMatch,
-        upstream: &Upstream,
-        remote_ip: Option<IpAddr>,
-        scheme: RequestScheme,
-        middleware: &EffectiveMiddleware,
-        client_cert_pem: Option<&str>,
+        context: &ForwardContext<'_>,
     ) -> Result<BufferedResponse, PxxlError> {
-        let mut req = request.to_request(upstream)?;
+        let mut req = request.to_request(context.upstream)?;
 
-        if !matched.route.rules.preserve_host_header {
-            let authority = upstream.authority()?;
+        if !context.matched.route.rules.preserve_host_header {
+            let authority = context.upstream.authority()?;
             req.headers_mut().insert(
                 HOST,
                 HeaderValue::from_str(&authority)
-                    .map_err(|_| PxxlError::InvalidUpstream(upstream.url.clone()))?,
+                    .map_err(|_| PxxlError::InvalidUpstream(context.upstream.url.clone()))?,
             );
         }
         req.headers_mut().insert(
             HeaderName::from_static("x-forwarded-host"),
-            HeaderValue::from_str(&matched.route.domain).map_err(|_| PxxlError::InvalidHost)?,
+            HeaderValue::from_str(&context.matched.route.domain)
+                .map_err(|_| PxxlError::InvalidHost)?,
         );
         req.headers_mut().insert(
             HeaderName::from_static("x-forwarded-proto"),
-            HeaderValue::from_static(scheme.as_str()),
+            HeaderValue::from_static(context.scheme.as_str()),
         );
-        if let Some(ip) = remote_ip {
+        if let Some(ip) = context.remote_ip {
             if let Ok(value) = HeaderValue::from_str(&ip.to_string()) {
                 req.headers_mut()
                     .insert(HeaderName::from_static("x-forwarded-for"), value);
             }
         }
-        if middleware.client_cert_forwarding.enabled {
+        if context.middleware.client_cert_forwarding.enabled {
             if let (Some(cert), Ok(name)) = (
-                client_cert_pem,
-                HeaderName::from_bytes(middleware.client_cert_forwarding.header_name.as_bytes()),
+                context.client_cert_pem,
+                HeaderName::from_bytes(
+                    context
+                        .middleware
+                        .client_cert_forwarding
+                        .header_name
+                        .as_bytes(),
+                ),
             ) {
                 if let Ok(value) = HeaderValue::from_str(cert) {
                     req.headers_mut().insert(name, value);
@@ -1605,10 +1606,13 @@ impl ProxyServer {
             .client
             .request(req)
             .await
-            .map_err(|_| PxxlError::InvalidUpstream(upstream.url.clone()))?;
-        BufferedResponse::from_response(response, middleware.response_buffering.max_response_bytes)
-            .await
-            .map_err(|_| PxxlError::InvalidUpstream(upstream.url.clone()))
+            .map_err(|_| PxxlError::InvalidUpstream(context.upstream.url.clone()))?;
+        BufferedResponse::from_response(
+            response,
+            context.middleware.response_buffering.max_response_bytes,
+        )
+        .await
+        .map_err(|_| PxxlError::InvalidUpstream(context.upstream.url.clone()))
     }
 
     fn error_response(
@@ -1692,9 +1696,11 @@ impl ProxyServer {
     ) -> Option<Upstream> {
         if let Some(upstream) = sticky_upstream(headers, upstreams, &middleware.sticky_sessions) {
             if upstream.healthy
-                && !self
-                    .policy
-                    .circuit_is_open(&matched.route.id, &matched.path.prefix, &upstream.url)
+                && !self.policy.circuit_is_open(
+                    &matched.route.id,
+                    &matched.path.prefix,
+                    &upstream.url,
+                )
             {
                 return Some(upstream);
             }
@@ -1713,11 +1719,12 @@ impl ProxyServer {
             })
             .cloned()
             .collect::<Vec<_>>();
-        if let Some(upstream) =
-            self.state
-                .load_balancer
-                .select(route_key, &matched.route.algorithm, &primary, remote_ip)
-        {
+        if let Some(upstream) = self.state.load_balancer.select(
+            route_key,
+            &matched.route.algorithm,
+            &primary,
+            remote_ip,
+        ) {
             return Some(upstream);
         }
 
@@ -1760,14 +1767,28 @@ impl ProxyServer {
                     .ok()
             })
             .and_then(|decoded| String::from_utf8(decoded).ok())
-            .and_then(|decoded| decoded.split_once(':').map(|(user, pass)| (user.to_string(), pass.to_string())))
-            .is_some_and(|(user, pass)| config.users.get(&user).is_some_and(|expected| expected == &pass));
+            .and_then(|decoded| {
+                decoded
+                    .split_once(':')
+                    .map(|(user, pass)| (user.to_string(), pass.to_string()))
+            })
+            .is_some_and(|(user, pass)| {
+                config
+                    .users
+                    .get(&user)
+                    .is_some_and(|expected| expected == &pass)
+            });
 
         if authorized {
             return None;
         }
 
-        let mut response = self.error_response(StatusCode::UNAUTHORIZED, "authentication required", domain, path);
+        let mut response = self.error_response(
+            StatusCode::UNAUTHORIZED,
+            "authentication required",
+            domain,
+            path,
+        );
         if let Ok(value) = HeaderValue::from_str(&format!("Basic realm=\"{}\"", config.realm)) {
             response.headers_mut().insert(WWW_AUTHENTICATE, value);
         }
@@ -1790,7 +1811,9 @@ impl ProxyServer {
             .and_then(|value| value.to_str().ok())
             .and_then(|value| value.strip_prefix("Digest "))
             .map(parse_digest_authorization)
-            .is_some_and(|params| digest_authorized(req.method(), &config.realm, &config.users, &params));
+            .is_some_and(|params| {
+                digest_authorized(req.method(), &config.realm, &config.users, &params)
+            });
 
         if authorized {
             return None;
@@ -1859,17 +1882,17 @@ impl ProxyServer {
             let upstream = upstream.clone();
             let domain = domain.to_string();
             tokio::spawn(async move {
-                let result = server
-                    .forward_buffered(
-                        &request,
-                        &matched,
-                        &upstream,
-                        None,
-                        RequestScheme::Http,
-                        &EffectiveMiddleware::from_rules(&matched.route.rules, &[]),
-                        None,
-                    )
-                    .await;
+                let middleware = EffectiveMiddleware::from_rules(&matched.route.rules, &[]);
+                let context = ForwardContext {
+                    matched: &matched,
+                    upstream: &upstream,
+                    remote_ip: None,
+                    scheme: RequestScheme::Http,
+                    middleware: &middleware,
+                    domain: &domain,
+                    client_cert_pem: None,
+                };
+                let result = server.forward_buffered(&request, &context).await;
                 let label = if result.is_ok() { "ok" } else { "error" };
                 server
                     .state
@@ -1938,9 +1961,7 @@ impl BufferedResponse {
     }
 
     fn into_response(self) -> Response<BoxBody> {
-        let body = Full::new(self.body)
-            .map_err(|never| match never {})
-            .boxed();
+        let body = Full::new(self.body).map_err(|never| match never {}).boxed();
         let mut response = Response::new(body);
         *response.status_mut() = self.status;
         *response.headers_mut() = self.headers;
@@ -2273,8 +2294,7 @@ async fn serve_stream<S>(
     server: ProxyServer,
     scheme: RequestScheme,
     client_cert_pem: Option<String>,
-)
-where
+) where
     S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
 {
     let state = server.state.clone();
@@ -2560,11 +2580,7 @@ fn retryable_status(status: StatusCode, retry: &RetryConfig) -> bool {
                 .any(|code| *code == status.as_u16()))
 }
 
-fn apply_request_content_type_detection(
-    headers: &mut HeaderMap,
-    uri: &Uri,
-    body: Option<&Bytes>,
-) {
+fn apply_request_content_type_detection(headers: &mut HeaderMap, uri: &Uri, body: Option<&Bytes>) {
     if headers.contains_key(CONTENT_TYPE) {
         return;
     }
@@ -2661,12 +2677,17 @@ fn apply_response_middleware(
             .headers
             .insert(CONTENT_ENCODING, HeaderValue::from_static("gzip"));
         response.headers.remove(CONTENT_LENGTH);
-        response.headers.insert(VARY, HeaderValue::from_static("accept-encoding"));
+        response
+            .headers
+            .insert(VARY, HeaderValue::from_static("accept-encoding"));
     }
 }
 
 fn response_is_compressible(headers: &HeaderMap, compression: &CompressionConfig) -> bool {
-    let Some(content_type) = headers.get(CONTENT_TYPE).and_then(|value| value.to_str().ok()) else {
+    let Some(content_type) = headers
+        .get(CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok())
+    else {
         return true;
     };
     if !compression.content_types.is_empty() {
@@ -2733,11 +2754,7 @@ fn digest_authorized(
 
     let ha1 = sha256_hex(&format!("{username}:{realm}:{password}"));
     let ha2 = sha256_hex(&format!("{}:{uri}", method.as_str()));
-    let expected = match (
-        params.get("qop"),
-        params.get("nc"),
-        params.get("cnonce"),
-    ) {
+    let expected = match (params.get("qop"), params.get("nc"), params.get("cnonce")) {
         (Some(qop), Some(nc), Some(cnonce)) => {
             sha256_hex(&format!("{ha1}:{nonce}:{nc}:{cnonce}:{qop}:{ha2}"))
         }
@@ -2777,11 +2794,7 @@ fn sticky_upstream(
         .cloned()
 }
 
-fn apply_sticky_cookie(
-    headers: &mut HeaderMap,
-    sticky: &StickySessionConfig,
-    upstream: &Upstream,
-) {
+fn apply_sticky_cookie(headers: &mut HeaderMap, sticky: &StickySessionConfig, upstream: &Upstream) {
     if !sticky.enabled {
         return;
     }
@@ -2853,7 +2866,10 @@ fn in_flight_key(
     match limit.scope {
         InFlightLimitScope::Domain => (matched.route.domain.clone(), "domain"),
         InFlightLimitScope::Upstream => (
-            format!("{}:{}:{}", matched.route.id, matched.path.prefix, upstream.url),
+            format!(
+                "{}:{}:{}",
+                matched.route.id, matched.path.prefix, upstream.url
+            ),
             "upstream",
         ),
         InFlightLimitScope::Route => (

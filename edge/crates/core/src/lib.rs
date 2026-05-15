@@ -565,7 +565,9 @@ fn matching_routes(
         .get(domain)
         .into_iter()
         .flatten()
-        .filter(|route| !require_www_alias || route_allows_www_alias(&route.domain, route.rules.www_alias))
+        .filter(|route| {
+            !require_www_alias || route_allows_www_alias(&route.domain, route.rules.www_alias)
+        })
         .filter_map(|route| {
             route.best_path(path).map(|path_route| RouteMatch {
                 route: route.clone(),

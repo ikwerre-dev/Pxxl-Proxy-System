@@ -160,6 +160,23 @@
           }
         },
         {
+          "name": "Create Domain With Middleware Stack",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"domain\": \"middleware.pxxlhost\",\n  \"tls\": true,\n  \"algorithm\": \"p2c\",\n  \"paths\": [\n    {\n      \"prefix\": \"/\",\n      \"middlewares\": [\"secure-chain\"],\n      \"upstreams\": [\n        { \"url\": \"{{upstreamUrl}}\", \"weight\": 9 },\n        { \"url\": \"http://host.docker.internal:3005\", \"weight\": 1 },\n        { \"url\": \"http://host.docker.internal:3006\", \"backup\": true }\n      ]\n    }\n  ],\n  \"rules\": {\n    \"middleware_chains\": {\n      \"secure-chain\": [\"auth\", \"retry\", \"compress\"]\n    },\n    \"middlewares\": {\n      \"auth\": {\n        \"basic_auth\": {\n          \"enabled\": true,\n          \"realm\": \"Pxxl\",\n          \"users\": { \"demo\": \"secret\" }\n        }\n      },\n      \"retry\": {\n        \"retry\": {\n          \"enabled\": true,\n          \"attempts\": 3,\n          \"backoff_ms\": 100,\n          \"retry_statuses\": [502, 503, 504]\n        },\n        \"circuit_breaker\": {\n          \"enabled\": true,\n          \"failure_threshold\": 5,\n          \"open_seconds\": 30\n        },\n        \"in_flight_limit\": {\n          \"enabled\": true,\n          \"max\": 100,\n          \"scope\": \"route\"\n        }\n      },\n      \"compress\": {\n        \"compression\": { \"enabled\": true, \"min_bytes\": 1024 },\n        \"content_type_autodetect\": { \"enabled\": true }\n      }\n    },\n    \"sticky_sessions\": {\n      \"enabled\": true,\n      \"cookie_name\": \"pxxl_upstream\"\n    },\n    \"passive_health\": {\n      \"enabled\": true,\n      \"failure_threshold\": 3,\n      \"recovery_seconds\": 30,\n      \"failure_statuses\": [500, 502, 503, 504]\n    },\n    \"traffic_mirroring\": {\n      \"enabled\": true,\n      \"percent\": 10,\n      \"upstreams\": [\n        { \"url\": \"http://host.docker.internal:3007\" }\n      ]\n    }\n  }\n}"
+            },
+            "url": "{{baseUrl}}/v1/domains"
+          }
+        },
+        {
           "name": "List Domains",
           "request": {
             "method": "GET",
