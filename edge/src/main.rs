@@ -6,8 +6,8 @@ use hyper_util::{
     client::legacy::{connect::HttpConnector, Client},
     rt::TokioExecutor,
 };
-use pxxl_api::{run_admin_api, run_metrics_server, AdminApiAuth};
-use pxxl_common::{parse_ip_net, Route};
+use pxxl_api::{run_admin_api, run_metrics_server, AdminApiAuth, MetricsAuth};
+use pxxl_common::{ip_allowed_for_upstream, parse_ip_net, Route, RouteSource};
 use pxxl_config::{HealthCheckConfig, PxxlConfig};
 use pxxl_core::{route_allows_www_alias, EdgeState, RouteRegistry};
 use pxxl_ddos::{BlacklistEngine, RateLimitConfig, RateLimiter, SecurityEngine};
@@ -25,7 +25,7 @@ use pxxl_storage::run_clickhouse_writer;
 use pxxl_tls::LocalCertificateStore;
 use std::{
     collections::{BTreeSet, HashMap},
-    net::SocketAddr,
+    net::{IpAddr, SocketAddr},
     os::unix::fs::FileTypeExt,
     path::Path,
     sync::Arc,
@@ -141,6 +141,7 @@ async fn main() -> Result<()> {
     let admin_auth = AdminApiAuth::new(
         config.admin.auth_enabled,
         config.admin.bootstrap_token.clone(),
+        config.admin.bootstrap_token_permanent,
         config.admin.ip_allowlist.clone(),
         Some(token_store),
     );
@@ -175,6 +176,13 @@ async fn main() -> Result<()> {
         tokio::spawn(run_metrics_server(
             metrics_addr,
             metrics.clone(),
+            MetricsAuth::new(
+                config
+                    .metrics
+                    .bearer_token
+                    .clone()
+                    .filter(|token| !token.trim().is_empty()),
+            ),
             shutdown_rx.clone(),
         )),
     ];
@@ -284,11 +292,11 @@ async fn run_health_checks(
     loop {
         tokio::select! {
             _ = interval.tick() => {
-                let upstreams = collect_upstream_urls(&state.routes.snapshot());
+                let upstreams = collect_upstream_checks(&state.routes.snapshot());
                 let mut health = HashMap::new();
                 for upstream in upstreams {
                     let healthy = check_upstream(&client, &upstream, &config.path, timeout).await;
-                    health.insert(upstream, healthy);
+                    health.insert(upstream.url.clone(), healthy);
                 }
                 state.set_upstream_health(&health);
             }
@@ -305,11 +313,15 @@ async fn run_health_checks(
 
 async fn check_upstream(
     client: &Client<HttpConnector, Empty<Bytes>>,
-    upstream: &str,
+    upstream: &UpstreamCheck,
     health_path: &str,
     timeout: Duration,
 ) -> bool {
-    let Some(uri) = build_health_uri(upstream, health_path) else {
+    if upstream.source == RouteSource::Api && !dynamic_upstream_network_allowed(&upstream.url).await
+    {
+        return false;
+    }
+    let Some(uri) = build_health_uri(&upstream.url, health_path) else {
         return false;
     };
     let request = match Request::builder()
@@ -338,22 +350,71 @@ fn build_health_uri(upstream: &str, health_path: &str) -> Option<Uri> {
         .ok()
 }
 
-fn collect_upstream_urls(routes: &[Route]) -> BTreeSet<String> {
+async fn dynamic_upstream_network_allowed(raw: &str) -> bool {
+    let Ok(parsed) = url::Url::parse(raw) else {
+        return false;
+    };
+    let Some(host) = parsed.host_str() else {
+        return false;
+    };
+    let host = host.trim_end_matches('.').to_ascii_lowercase();
+    if reserved_host_gateway(&host) {
+        return false;
+    }
+    if let Ok(ip) = host.parse::<IpAddr>() {
+        return ip_allowed_for_upstream(ip);
+    }
+    let Some(port) = parsed.port_or_known_default() else {
+        return false;
+    };
+    let lookup = time::timeout(
+        Duration::from_secs(2),
+        tokio::net::lookup_host((host.as_str(), port)),
+    )
+    .await;
+    match lookup {
+        Ok(Ok(addresses)) => addresses
+            .into_iter()
+            .all(|address| ip_allowed_for_upstream(address.ip())),
+        Ok(Err(_)) | Err(_) => true,
+    }
+}
+
+fn reserved_host_gateway(host: &str) -> bool {
+    matches!(host, "host.docker.internal" | "gateway.docker.internal")
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+struct UpstreamCheck {
+    source: RouteSource,
+    url: String,
+}
+
+fn collect_upstream_checks(routes: &[Route]) -> BTreeSet<UpstreamCheck> {
     let mut upstreams = BTreeSet::new();
     for route in routes {
         for path in &route.paths {
-            upstreams.extend(path.upstreams.iter().map(|upstream| upstream.url.clone()));
+            upstreams.extend(path.upstreams.iter().map(|upstream| UpstreamCheck {
+                source: route.source.clone(),
+                url: upstream.url.clone(),
+            }));
         }
         for location_route in &route.rules.location_routes {
             upstreams.extend(
                 location_route
                     .upstreams
                     .iter()
-                    .map(|upstream| upstream.url.clone()),
+                    .map(|upstream| UpstreamCheck {
+                        source: route.source.clone(),
+                        url: upstream.url.clone(),
+                    }),
             );
         }
         for split in &route.rules.traffic_splits {
-            upstreams.extend(split.upstreams.iter().map(|upstream| upstream.url.clone()));
+            upstreams.extend(split.upstreams.iter().map(|upstream| UpstreamCheck {
+                source: route.source.clone(),
+                url: upstream.url.clone(),
+            }));
         }
     }
     upstreams
@@ -492,6 +553,9 @@ fn apply_env_overrides(config: &mut PxxlConfig) {
     if let Ok(value) = std::env::var("PXXL_ADMIN_BOOTSTRAP_TOKEN") {
         config.admin.bootstrap_token = (!value.trim().is_empty()).then_some(value);
     }
+    if let Ok(value) = std::env::var("PXXL_ADMIN_BOOTSTRAP_TOKEN_PERMANENT") {
+        config.admin.bootstrap_token_permanent = parse_bool(&value);
+    }
     if let Ok(value) = std::env::var("PXXL_REDIS_URL") {
         config.redis.url = value;
     }
@@ -511,6 +575,9 @@ fn apply_env_overrides(config: &mut PxxlConfig) {
     }
     if let Ok(value) = std::env::var("PXXL_CLICKHOUSE_URL") {
         config.storage.clickhouse_url = value;
+    }
+    if let Ok(value) = std::env::var("PXXL_METRICS_BEARER_TOKEN") {
+        config.metrics.bearer_token = (!value.trim().is_empty()).then_some(value);
     }
     if let Ok(value) = std::env::var("PXXL_ANALYTICS_ENABLED") {
         config.storage.analytics_enabled = parse_bool(&value);

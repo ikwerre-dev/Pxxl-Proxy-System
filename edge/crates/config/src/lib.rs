@@ -43,6 +43,8 @@ pub struct PxxlConfig {
     #[serde(default)]
     pub admin: AdminConfig,
     #[serde(default)]
+    pub metrics: MetricsConfig,
+    #[serde(default)]
     pub health_checks: HealthCheckConfig,
     #[serde(default)]
     pub security: SecurityConfig,
@@ -197,6 +199,8 @@ pub struct AdminConfig {
     pub auth_enabled: bool,
     #[serde(default)]
     pub bootstrap_token: Option<String>,
+    #[serde(default)]
+    pub bootstrap_token_permanent: bool,
     #[serde(default = "default_admin_token_store_key")]
     pub token_store_key: String,
     #[serde(default, deserialize_with = "deserialize_ip_nets")]
@@ -208,10 +212,17 @@ impl Default for AdminConfig {
         Self {
             auth_enabled: true,
             bootstrap_token: None,
+            bootstrap_token_permanent: false,
             token_store_key: default_admin_token_store_key(),
             ip_allowlist: Vec::new(),
         }
     }
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct MetricsConfig {
+    #[serde(default)]
+    pub bearer_token: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

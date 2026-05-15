@@ -16,17 +16,17 @@ use http_body_util::{BodyExt, Full, Limited};
 use hyper::{body::Incoming, service::service_fn};
 use hyper_util::{
     client::legacy::{connect::HttpConnector, Client},
-    rt::{TokioExecutor, TokioIo},
+    rt::{TokioExecutor, TokioIo, TokioTimer},
     server::conn::auto::Builder as AutoBuilder,
 };
 use parking_lot::Mutex;
 use pxxl_common::{
-    canonicalize_request_path, normalize_domain, BasicAuthConfig, BufferingConfig,
-    CircuitBreakerConfig, ClientCertForwardingConfig, CompressionConfig,
+    canonicalize_request_path, ip_allowed_for_upstream, normalize_domain, BasicAuthConfig,
+    BufferingConfig, CircuitBreakerConfig, ClientCertForwardingConfig, CompressionConfig,
     ContentTypeAutoDetectConfig, DigestAuthConfig, DomainRateLimit, DomainRules, ForwardAuthConfig,
     GeoLocation, InFlightLimitConfig, InFlightLimitScope, MiddlewareDefinition,
-    PassiveHealthConfig, PxxlError, RateLimitScope, RetryConfig, RouteMatch, StickySessionConfig,
-    TrafficMirrorConfig, TrafficSplitRule, Upstream,
+    PassiveHealthConfig, PxxlError, RateLimitScope, RetryConfig, RouteMatch, RouteSource,
+    StickySessionConfig, TrafficMirrorConfig, TrafficSplitRule, Upstream,
 };
 use pxxl_core::{EdgeState, RequestObservation};
 use pxxl_ddos::SecurityDecision;
@@ -1263,6 +1263,7 @@ impl ProxyServer {
 
         let middleware =
             EffectiveMiddleware::from_rules(&matched.route.rules, &matched.path.middlewares);
+        let mut edge_authorization_consumed = false;
 
         if let Some(basic_auth) = &middleware.basic_auth {
             if let Some(response) = self.evaluate_basic_auth(&req, basic_auth, &domain, &path) {
@@ -1279,6 +1280,7 @@ impl ProxyServer {
                 .middleware_executions_total
                 .with_label_values(&[&domain, "basic_auth", "allowed"])
                 .inc();
+            edge_authorization_consumed |= basic_auth.enabled;
         }
 
         if let Some(digest_auth) = &middleware.digest_auth {
@@ -1296,10 +1298,14 @@ impl ProxyServer {
                 .middleware_executions_total
                 .with_label_values(&[&domain, "digest_auth", "allowed"])
                 .inc();
+            edge_authorization_consumed |= digest_auth.enabled;
         }
 
         if let Some(forward_auth) = &middleware.forward_auth {
-            match self.run_forward_auth(&req, forward_auth).await {
+            match self
+                .run_forward_auth(&req, forward_auth, &matched.route.source)
+                .await
+            {
                 Ok(true) => self
                     .state
                     .metrics
@@ -1339,6 +1345,9 @@ impl ProxyServer {
         }
 
         let mut req = req;
+        if edge_authorization_consumed {
+            req.headers_mut().remove(AUTHORIZATION);
+        }
         if let Ok(uri) = canonical_forward_uri(req.uri(), &path, original_query.as_deref()) {
             *req.uri_mut() = uri;
         }
@@ -1349,7 +1358,8 @@ impl ProxyServer {
             apply_request_content_type_detection(req.headers_mut(), &uri, None);
         }
 
-        if !requires_buffered_forwarding(&middleware) {
+        if !requires_buffered_forwarding(&middleware, matched.route.rules.max_body_bytes.is_some())
+        {
             ensure_trace_headers(req.headers_mut(), &request_id);
             let base_route_key = format!("{}:{}", matched.route.id, matched.path.prefix);
             let (route_key_suffix, upstreams) =
@@ -1855,6 +1865,8 @@ impl ProxyServer {
         request: &BufferedRequest,
         context: &ForwardContext<'_>,
     ) -> Result<BufferedResponse, PxxlError> {
+        ensure_runtime_upstream_allowed(&context.matched.route.source, &context.upstream.url)
+            .await?;
         let mut req = request.to_request(context.upstream)?;
 
         if !context.matched.route.rules.preserve_host_header {
@@ -1916,6 +1928,8 @@ impl ProxyServer {
         context: &ForwardContext<'_>,
         max_request_bytes: u64,
     ) -> Result<Response<BoxBody>, PxxlError> {
+        ensure_runtime_upstream_allowed(&context.matched.route.source, &context.upstream.url)
+            .await?;
         let (parts, body) = req.into_parts();
         let limited_body = Limited::new(body, limit_to_usize(max_request_bytes)).boxed();
         let mut req = Request::from_parts(parts, limited_body);
@@ -2213,10 +2227,12 @@ impl ProxyServer {
         &self,
         req: &Request<Incoming>,
         config: &ForwardAuthConfig,
+        source: &RouteSource,
     ) -> Result<bool, PxxlError> {
         if !config.enabled {
             return Ok(true);
         }
+        ensure_runtime_upstream_allowed(source, &config.url).await?;
         let mut builder = Request::builder().method(Method::GET).uri(&config.url);
         for header in &config.request_headers {
             if let Ok(name) = HeaderName::from_bytes(header.as_bytes()) {
@@ -2360,6 +2376,51 @@ pub fn build_upstream_uri(upstream: &Upstream, original: &Uri) -> Result<Uri, Px
     target
         .parse::<Uri>()
         .map_err(|_| PxxlError::InvalidUpstream(upstream.url.clone()))
+}
+
+async fn ensure_runtime_upstream_allowed(source: &RouteSource, raw: &str) -> Result<(), PxxlError> {
+    if *source != RouteSource::Api {
+        return Ok(());
+    }
+    if runtime_upstream_network_allowed(raw).await {
+        Ok(())
+    } else {
+        Err(PxxlError::InvalidUpstream(raw.to_string()))
+    }
+}
+
+async fn runtime_upstream_network_allowed(raw: &str) -> bool {
+    let Ok(parsed) = url::Url::parse(raw) else {
+        return false;
+    };
+    let Some(host) = parsed.host_str() else {
+        return false;
+    };
+    let host = host.trim_end_matches('.').to_ascii_lowercase();
+    if reserved_host_gateway(&host) {
+        return false;
+    }
+    if let Ok(ip) = host.parse::<IpAddr>() {
+        return ip_allowed_for_upstream(ip);
+    }
+    let Some(port) = parsed.port_or_known_default() else {
+        return false;
+    };
+    let lookup = time::timeout(
+        Duration::from_secs(2),
+        tokio::net::lookup_host((host.as_str(), port)),
+    )
+    .await;
+    match lookup {
+        Ok(Ok(addresses)) => addresses
+            .into_iter()
+            .all(|address| ip_allowed_for_upstream(address.ip())),
+        Ok(Err(_)) | Err(_) => true,
+    }
+}
+
+fn reserved_host_gateway(host: &str) -> bool {
+    matches!(host, "host.docker.internal" | "gateway.docker.internal")
 }
 
 fn canonical_forward_uri(
@@ -2785,7 +2846,7 @@ async fn serve_stream<S>(
         }
     });
     let io = TokioIo::new(stream);
-    let builder = AutoBuilder::new(TokioExecutor::new());
+    let builder = hardened_auto_builder();
 
     match time::timeout(
         Duration::from_secs(EDGE_CONNECTION_TIMEOUT_SECONDS),
@@ -2799,6 +2860,28 @@ async fn serve_stream<S>(
     }
 
     state.metrics.active_connections.dec();
+}
+
+fn hardened_auto_builder() -> AutoBuilder<TokioExecutor> {
+    let mut builder = AutoBuilder::new(TokioExecutor::new());
+    builder
+        .http1()
+        .timer(TokioTimer::new())
+        .header_read_timeout(Some(Duration::from_secs(10)))
+        .max_headers(100)
+        .max_buf_size(64 * 1024);
+    builder
+        .http2()
+        .timer(TokioTimer::new())
+        .max_concurrent_streams(Some(64))
+        .max_pending_accept_reset_streams(Some(32))
+        .max_local_error_reset_streams(Some(64))
+        .max_header_list_size(64 * 1024)
+        .max_frame_size(Some(16 * 1024))
+        .keep_alive_interval(Some(Duration::from_secs(30)))
+        .keep_alive_timeout(Duration::from_secs(10))
+        .max_send_buf_size(128 * 1024);
+    builder
 }
 
 fn policy_rejection(
@@ -3078,8 +3161,9 @@ fn request_body_limit(rules: &DomainRules, middleware: &EffectiveMiddleware) -> 
         .min(middleware.request_buffering.max_request_bytes)
 }
 
-fn requires_buffered_forwarding(middleware: &EffectiveMiddleware) -> bool {
-    middleware.request_buffering.enabled
+fn requires_buffered_forwarding(middleware: &EffectiveMiddleware, strict_body_limit: bool) -> bool {
+    strict_body_limit
+        || middleware.request_buffering.enabled
         || middleware.response_buffering.enabled
         || middleware.retry.enabled
         || middleware.compression.enabled

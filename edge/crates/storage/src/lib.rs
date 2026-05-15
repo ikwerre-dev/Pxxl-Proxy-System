@@ -20,6 +20,7 @@ pub enum StorageError {
 }
 
 const CLICKHOUSE_ERROR_BODY_LIMIT_BYTES: u64 = 16 * 1024;
+const CLICKHOUSE_REQUEST_TIMEOUT_SECONDS: u64 = 5;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct StorageEndpoints {
@@ -152,7 +153,12 @@ ORDER BY (domain, timestamp_unix_ms, request_id)
             builder = builder.header(AUTHORIZATION, value);
         }
         let request = builder.body(Full::new(Bytes::from(sql.to_string())))?;
-        let response = self.client.request(request).await?;
+        let response = tokio::time::timeout(
+            std::time::Duration::from_secs(CLICKHOUSE_REQUEST_TIMEOUT_SECONDS),
+            self.client.request(request),
+        )
+        .await
+        .map_err(|_| anyhow::anyhow!("ClickHouse request timed out"))??;
         let status = response.status();
         let body =
             collect_body_limited(response.into_body(), CLICKHOUSE_ERROR_BODY_LIMIT_BYTES).await?;

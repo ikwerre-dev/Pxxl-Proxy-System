@@ -36,6 +36,8 @@ pub struct AdminTokenRecord {
     pub id: String,
     pub name: String,
     pub token_hash: String,
+    #[serde(default = "default_admin_scopes")]
+    pub scopes: Vec<String>,
     pub created_at_unix_ms: u64,
     pub last_used_unix_ms: Option<u64>,
     pub enabled: bool,
@@ -45,6 +47,7 @@ pub struct AdminTokenRecord {
 pub struct AdminTokenView {
     pub id: String,
     pub name: String,
+    pub scopes: Vec<String>,
     pub created_at_unix_ms: u64,
     pub last_used_unix_ms: Option<u64>,
     pub enabled: bool,
@@ -127,12 +130,22 @@ impl RedisTokenStore {
     }
 
     pub async fn create_token(&self, name: impl Into<String>) -> Result<CreatedAdminToken> {
+        self.create_token_with_scopes(name, default_admin_scopes())
+            .await
+    }
+
+    pub async fn create_token_with_scopes(
+        &self,
+        name: impl Into<String>,
+        scopes: Vec<String>,
+    ) -> Result<CreatedAdminToken> {
         let id = Uuid::new_v4().to_string();
         let token = format!("pxxl_{}_{}", Uuid::new_v4(), Uuid::new_v4());
         let record = AdminTokenRecord {
             id: id.clone(),
             name: name.into(),
             token_hash: hash_token(&token),
+            scopes: normalize_scopes(scopes),
             created_at_unix_ms: now_unix_ms(),
             last_used_unix_ms: None,
             enabled: true,
@@ -182,18 +195,18 @@ impl RedisTokenStore {
         Ok(removed > 0)
     }
 
-    pub async fn verify_token(&self, token: &str) -> Result<bool> {
+    pub async fn verify_token(&self, token: &str) -> Result<Option<AdminTokenView>> {
         let token_hash = hash_token(token);
         let client = redis::Client::open(self.url.as_str())?;
         let mut connection = client.get_multiplexed_async_connection().await?;
         let id: Option<String> = connection.hget(&self.hash_index_key, &token_hash).await?;
         let Some(id) = id else {
-            return Ok(false);
+            return Ok(None);
         };
         let value: Option<String> = connection.hget(&self.key, &id).await?;
         let Some(value) = value else {
             let _: usize = connection.hdel(&self.hash_index_key, token_hash).await?;
-            return Ok(false);
+            return Ok(None);
         };
         let mut record: AdminTokenRecord = serde_json::from_str(&value)?;
         if record.enabled && constant_time_eq(record.token_hash.as_bytes(), token_hash.as_bytes()) {
@@ -202,10 +215,10 @@ impl RedisTokenStore {
             let _: usize = connection
                 .hset(&self.key, record.id.clone(), payload)
                 .await?;
-            return Ok(true);
+            return Ok(Some(record.into()));
         }
 
-        Ok(false)
+        Ok(None)
     }
 }
 
@@ -214,6 +227,7 @@ impl From<AdminTokenRecord> for AdminTokenView {
         Self {
             id: record.id,
             name: record.name,
+            scopes: normalize_scopes(record.scopes),
             created_at_unix_ms: record.created_at_unix_ms,
             last_used_unix_ms: record.last_used_unix_ms,
             enabled: record.enabled,
@@ -258,6 +272,25 @@ fn hash_token(token: &str) -> String {
     let mut hasher = Sha256::new();
     hasher.update(token.as_bytes());
     to_hex(&hasher.finalize())
+}
+
+fn default_admin_scopes() -> Vec<String> {
+    vec!["admin".to_string()]
+}
+
+fn normalize_scopes(scopes: Vec<String>) -> Vec<String> {
+    let mut scopes = scopes
+        .into_iter()
+        .map(|scope| scope.trim().to_ascii_lowercase())
+        .filter(|scope| !scope.is_empty())
+        .collect::<Vec<_>>();
+    scopes.sort();
+    scopes.dedup();
+    if scopes.is_empty() {
+        default_admin_scopes()
+    } else {
+        scopes
+    }
 }
 
 fn to_hex(bytes: &[u8]) -> String {

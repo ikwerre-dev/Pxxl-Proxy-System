@@ -33,6 +33,9 @@ auth_enabled = true
 token_store_key = "pxxl:admin_tokens"
 ip_allowlist = ["127.0.0.1", "::1"]
 
+[metrics]
+# Optional bearer token required by /metrics when set.
+
 [health_checks]
 enabled = true
 interval_seconds = 10

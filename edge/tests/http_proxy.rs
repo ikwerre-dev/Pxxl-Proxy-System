@@ -603,6 +603,53 @@ async fn executes_basic_auth_middleware_by_path() {
 }
 
 #[tokio::test]
+async fn basic_auth_strips_consumed_authorization_before_upstream() {
+    let upstream_addr = spawn_authorization_echo_upstream().await;
+    let proxy_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let proxy_addr = proxy_listener.local_addr().unwrap();
+    let (shutdown_tx, shutdown_rx) = watch::channel(false);
+
+    let mut path = PathRoute::new("/", vec![Upstream::new(format!("http://{upstream_addr}"))]);
+    path.middlewares = vec!["auth".to_string()];
+    let mut route = Route::new("auth-strip.pxxlhost", vec![path], RouteSource::Static);
+    route.rules.middlewares.insert(
+        "auth".to_string(),
+        MiddlewareDefinition {
+            basic_auth: Some(BasicAuthConfig {
+                users: HashMap::from([("robin".to_string(), "pxxl".to_string())]),
+                ..BasicAuthConfig::default()
+            }),
+            ..MiddlewareDefinition::default()
+        },
+    );
+    let state = test_state(vec![route]);
+    let server = tokio::spawn(run_http_proxy_on_listener(
+        proxy_listener,
+        state,
+        shutdown_rx,
+    ));
+    let client: Client<HttpConnector, Empty<Bytes>> =
+        Client::builder(TokioExecutor::new()).build_http();
+
+    let request = Request::builder()
+        .method("GET")
+        .uri(format!("http://{proxy_addr}/"))
+        .header("host", "auth-strip.pxxlhost")
+        .header("authorization", "Basic cm9iaW46cHh4bA==")
+        .body(Empty::<Bytes>::new())
+        .unwrap();
+    let response = client.request(request).await.unwrap();
+    let status = response.status();
+    let body = response.into_body().collect().await.unwrap().to_bytes();
+
+    shutdown_tx.send(true).unwrap();
+    server.await.unwrap().unwrap();
+
+    assert_eq!(status, StatusCode::OK);
+    assert!(body.is_empty(), "upstream saw authorization header");
+}
+
+#[tokio::test]
 async fn digest_auth_rejects_uri_mismatch_and_replay() {
     let upstream_addr = spawn_upstream("secret").await;
     let proxy_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -685,6 +732,50 @@ async fn digest_auth_rejects_uri_mismatch_and_replay() {
     assert_eq!(mismatch_status, StatusCode::UNAUTHORIZED);
     assert_eq!(authorized_status, StatusCode::OK);
     assert_eq!(replay_status, StatusCode::UNAUTHORIZED);
+}
+
+#[tokio::test]
+async fn strict_max_body_bytes_rejects_before_upstream_forwarding() {
+    let hits = Arc::new(AtomicUsize::new(0));
+    let upstream_addr = spawn_counting_upstream(hits.clone()).await;
+    let proxy_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let proxy_addr = proxy_listener.local_addr().unwrap();
+    let (shutdown_tx, shutdown_rx) = watch::channel(false);
+
+    let mut route = Route::new(
+        "body-limit.pxxlhost",
+        vec![PathRoute::new(
+            "/",
+            vec![Upstream::new(format!("http://{upstream_addr}"))],
+        )],
+        RouteSource::Static,
+    );
+    route.rules = DomainRules {
+        max_body_bytes: Some(4),
+        ..DomainRules::default()
+    };
+    let state = test_state(vec![route]);
+    let server = tokio::spawn(run_http_proxy_on_listener(
+        proxy_listener,
+        state,
+        shutdown_rx,
+    ));
+    let client: Client<HttpConnector, Full<Bytes>> =
+        Client::builder(TokioExecutor::new()).build_http();
+
+    let request = Request::builder()
+        .method("POST")
+        .uri(format!("http://{proxy_addr}/upload"))
+        .header("host", "body-limit.pxxlhost")
+        .body(Full::new(Bytes::from_static(b"too-large")))
+        .unwrap();
+    let status = client.request(request).await.unwrap().status();
+
+    shutdown_tx.send(true).unwrap();
+    server.await.unwrap().unwrap();
+
+    assert_eq!(status, StatusCode::PAYLOAD_TOO_LARGE);
+    assert_eq!(hits.load(Ordering::Relaxed), 0);
 }
 
 #[tokio::test]
@@ -903,6 +994,59 @@ async fn spawn_request_id_echo_upstream() -> SocketAddr {
                         .unwrap_or("")
                         .to_string();
                     Ok::<_, Infallible>(Response::new(Full::new(Bytes::from(request_id))))
+                });
+                let io = TokioIo::new(stream);
+                let builder = AutoBuilder::new(TokioExecutor::new());
+                let _ = builder.serve_connection_with_upgrades(io, service).await;
+            });
+        }
+    });
+
+    addr
+}
+
+async fn spawn_authorization_echo_upstream() -> SocketAddr {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+
+    tokio::spawn(async move {
+        loop {
+            let (stream, _) = listener.accept().await.unwrap();
+            tokio::spawn(async move {
+                let service = service_fn(move |req: Request<hyper::body::Incoming>| async move {
+                    let authorization = req
+                        .headers()
+                        .get("authorization")
+                        .and_then(|value| value.to_str().ok())
+                        .unwrap_or("")
+                        .to_string();
+                    Ok::<_, Infallible>(Response::new(Full::new(Bytes::from(authorization))))
+                });
+                let io = TokioIo::new(stream);
+                let builder = AutoBuilder::new(TokioExecutor::new());
+                let _ = builder.serve_connection_with_upgrades(io, service).await;
+            });
+        }
+    });
+
+    addr
+}
+
+async fn spawn_counting_upstream(hits: Arc<AtomicUsize>) -> SocketAddr {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+
+    tokio::spawn(async move {
+        loop {
+            let (stream, _) = listener.accept().await.unwrap();
+            let hits = hits.clone();
+            tokio::spawn(async move {
+                let service = service_fn(move |_req| {
+                    let hits = hits.clone();
+                    async move {
+                        hits.fetch_add(1, Ordering::Relaxed);
+                        Ok::<_, Infallible>(Response::new(Full::new(Bytes::from_static(b"ok"))))
+                    }
                 });
                 let io = TokioIo::new(stream);
                 let builder = AutoBuilder::new(TokioExecutor::new());

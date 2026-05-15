@@ -70,13 +70,13 @@ curl http://127.0.0.1:8081/readyz
 curl http://127.0.0.1:9090/metrics
 ```
 
-There is no checked-in default admin token. Set `PXXL_ADMIN_BOOTSTRAP_TOKEN` for first-run local access, use it to create a Redis-backed token, then remove the bootstrap token from your environment:
+There is no checked-in default admin token. Set `PXXL_ADMIN_BOOTSTRAP_TOKEN` for first-run local access, use it to create the first Redis-backed token, then remove the bootstrap token from your environment. By default the bootstrap token is one-shot: once at least one Redis token exists, it no longer authenticates unless `PXXL_ADMIN_BOOTSTRAP_TOKEN_PERMANENT=true` is explicitly set.
 
 ```sh
 curl -H "Authorization: Bearer $PXXL_ADMIN_BOOTSTRAP_TOKEN" http://127.0.0.1:8081/v1/routes
 ```
 
-Compose binds admin, metrics, Prometheus, and Grafana to `127.0.0.1` by default and keeps Redis, Postgres, ClickHouse, and Loki off host ports. Grafana uses `admin` plus the `GRAFANA_ADMIN_PASSWORD` you provide.
+Compose binds admin, metrics, Prometheus, and Grafana to `127.0.0.1` by default and keeps Redis, Postgres, ClickHouse, and Loki off host ports. Grafana uses `admin` plus the `GRAFANA_ADMIN_PASSWORD` you provide. The metrics endpoint can also require `Authorization: Bearer <token>` when `PXXL_METRICS_BEARER_TOKEN` or `[metrics].bearer_token` is set.
 
 ## Local Persistence
 
@@ -212,10 +212,12 @@ POST /v1/auth/tokens
 Authorization: Bearer <bootstrap-or-admin-token>
 Content-Type: application/json
 
-{"name":"postman"}
+{"name":"postman", "scopes":["routes:read","routes:write","analytics:read"]}
 ```
 
-The raw token is returned once. Token metadata and SHA-256 token hashes are stored in Redis with a hash index so verification does not scan every token. Set `ip_allowlist` to bare IPs or CIDRs to restrict which clients can use the admin API. In Docker Compose, `PXXL_ADMIN_IP_ALLOWLIST` defaults to empty because host connections can appear as the Docker bridge address; set it explicitly for stricter environments.
+The raw token is returned once. Token metadata, scopes, and SHA-256 token hashes are stored in Redis with a hash index so verification does not scan every token. If `scopes` is empty, the token receives the `admin` scope. Supported scopes are `admin`, `routes:read`, `routes:write`, `tokens:read`, `tokens:write`, and `analytics:read`. Set `ip_allowlist` to bare IPs or CIDRs to restrict which clients can use the admin API. In Docker Compose, `PXXL_ADMIN_IP_ALLOWLIST` defaults to empty because host connections can appear as the Docker bridge address; set it explicitly for stricter environments.
+
+Route-list responses redact configured auth passwords and added request-header values. Edge Basic/Digest middleware also strips the consumed `Authorization` header before proxying so upstream apps do not receive edge credentials.
 
 ## Persistent Analytics
 

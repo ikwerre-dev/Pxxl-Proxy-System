@@ -3,6 +3,7 @@
 Date: 2026-05-15
 Source audit: `docs/security-audit.md`
 Latest CVE pass: `docs/cve-findings.md`
+Latest Codex security pass: `docs/codex-security-findings.md`
 
 This tracks the remediation pass against each PXSA finding. "Fixed" means code/config/docs were changed in this pass. "Mitigated" means the dangerous default or active exploit path is closed, while larger product work remains tracked.
 
@@ -30,6 +31,18 @@ This tracks the remediation pass against each PXSA finding. "Fixed" means code/c
 | CVE-FIND-2026-005: Docker/Podman Socket Mounts Are Privileged Trust Boundaries | Fixed by default | Removed default runtime socket mounts from Compose, disabled discovery by default, added explicit discovery override compose file and env toggles. |
 | CVE-FIND-2026-006: CORS Preflight Bypasses Domain Rate Limits | Fixed | Moved per-domain rate-limit enforcement before successful CORS preflight responses and added a regression test. |
 | CVE-FIND-2026-007: Route and Upstream Counts Have No Quotas | Fixed | Added route/path/upstream/mirror quotas for API, Redis, and Docker/Podman label sources. |
+| PXSA-2026-101: Edge Basic/Digest Credentials Are Forwarded To Upstreams | Fixed | Basic/Digest middleware now removes consumed edge `Authorization` before upstream forwarding, with regression coverage proving the upstream no longer receives it. |
+| PXSA-2026-102: DNS-Based SSRF And Host-Gateway SSRF Remain Possible For Dynamic Routes | Mitigated | API-created routes now reject host-gateway upstreams and resolve DNS names to reject private/loopback/link-local/metadata targets; API routes are also checked again at request and health-check time. Docker/Podman label routes remain a trusted discovery boundary. |
+| PXSA-2026-103: Streaming Body Limits Are Enforced After Partial Forwarding | Fixed | Routes that set `max_body_bytes` now use strict buffered validation before upstream forwarding and return `413` before the upstream is contacted. |
+| PXSA-2026-104: HTTP/2 Is Enabled Without Explicit Protocol-Level DoS Tuning | Mitigated | Edge/admin/metrics Hyper auto builders now set HTTP/1 header read limits and HTTP/2 stream, reset, frame, header-list, send-buffer, and keepalive limits. |
+| PXSA-2026-105: Metrics Endpoint Has No Application-Layer Authentication | Fixed | Added optional metrics bearer authentication through `[metrics].bearer_token` or `PXXL_METRICS_BEARER_TOKEN`; Compose still binds metrics to loopback by default. |
+| PXSA-2026-106: Bootstrap Admin Token Is Permanent While Environment Variable Remains Set | Fixed | Bootstrap tokens are one-shot by default and stop authenticating once Redis contains any admin token; permanent bootstrap now requires `PXXL_ADMIN_BOOTSTRAP_TOKEN_PERMANENT=true`. |
+| PXSA-2026-107: Route Snapshots Expose Embedded Basic/Digest Passwords To Any Admin Token | Mitigated | Admin route-list/domain responses now redact Basic/Digest password values and added request-header values. Runtime route auth still accepts existing plaintext route config, so hashed route-secret storage remains product work. |
+| PXSA-2026-108: ForwardAuth `response_headers` Configuration Is Ignored | Fixed | Non-empty `forward_auth.response_headers` is now rejected during route validation until trusted response-header propagation is implemented safely. |
+| PXSA-2026-109: Admin API Has No RBAC Or Tenant Ownership Model | Mitigated | Added token scopes for route read/write, token read/write, and analytics read endpoints. Domain ownership/tenant isolation remains product work. |
+| PXSA-2026-110: ClickHouse Analytics Requests Have No Request Timeout Or Circuit Breaker | Mitigated | ClickHouse writes now have a bounded request timeout. Backoff/circuit metrics remain product hardening. |
+| PXSA-2026-111: Runtime Discovery Socket Mounts Remain A High-Trust Boundary | Mitigated | Discovery remains opt-in, labels still pass route validation, and docs keep the socket boundary explicit. A least-privilege socket proxy/container allowlist remains product work. |
+| PXSA-2026-112: Supply-Chain And Installer Hardening Gaps | Mitigated | `install.sh` and `update.sh` can now enforce signed git commits with `PXXL_VERIFY_GIT_SIGNATURE=1`. Digest-pinned images/SBOM/signing remain release hardening. |
 
 ## Additional Hardening Completed
 
@@ -37,13 +50,18 @@ This tracks the remediation pass against each PXSA finding. "Fixed" means code/c
 - Compose adds `read_only`, `/tmp` tmpfs, `cap_drop: ALL`, `cap_add: NET_BIND_SERVICE`, `no-new-privileges`, CPU/memory limits, and persistent Grafana/Prometheus/Loki/Redis/Postgres/ClickHouse data directories.
 - Kubernetes example no longer exposes admin/metrics through the public Service and adds non-root, read-only filesystem, capability, and resource settings.
 - Postman environment no longer stores a default bearer token.
+- Admin tokens now support scopes: `admin`, `routes:read`, `routes:write`, `tokens:read`, `tokens:write`, and `analytics:read`.
+- Optional metrics bearer auth is available for deployments that expose `/metrics` beyond loopback/private scrape networks.
 
 ## Still Tracked For Product Work
 
-- Add configurable dynamic-upstream allowlists for environments that intentionally route to internal private networks.
+- Add configurable dynamic-upstream allowlists for API routes in environments that intentionally route to internal private networks.
+- Store Basic/Digest route credentials as password hashes or digest HA1 hashes rather than plaintext route config.
+- Add route/domain ownership in addition to token scopes for true multi-tenant admin isolation.
 - Add per-IP connection limits and more granular slow-header, slow-body, idle, and upstream response deadlines.
 - Add production ACME/Let's Encrypt issuance with account-key protection, challenge isolation, renewal failure handling, DNS provider secret isolation, and audit logs.
 - Add SNI-specific certificate selection and listener mTLS before enabling per-router client-auth settings.
 - Implement HTTPS upstream transport with rustls verification before accepting custom CA roots, SNI overrides, insecure-skip, or upstream mTLS settings.
 - Build a least-privilege Docker/Podman discovery sidecar or container allowlist model for multi-tenant environments.
+- Pin production image references by digest, publish signed release tags, generate SBOMs, and enforce image/dependency vulnerability scanning in CI.
 - Add fuzz/integration matrices for encoded paths, duplicate headers, request smuggling cases, slow clients, and SSRF route creation.

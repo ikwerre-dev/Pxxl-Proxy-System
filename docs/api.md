@@ -8,7 +8,7 @@ Most `/v1/*` endpoints require:
 Authorization: Bearer <bootstrap-or-admin-token>
 ```
 
-`/healthz` and `/readyz` are public. There is no checked-in default admin token. For first-run local access, set `PXXL_ADMIN_BOOTSTRAP_TOKEN` to a high-entropy value, create a Redis-backed token, then remove the bootstrap token from the environment.
+`/healthz` and `/readyz` are public. There is no checked-in default admin token. For first-run local access, set `PXXL_ADMIN_BOOTSTRAP_TOKEN` to a high-entropy value, create the first Redis-backed token, then remove the bootstrap token from the environment. By default the bootstrap token is one-shot and stops authenticating once Redis contains an admin token.
 
 ## Auth
 
@@ -19,7 +19,15 @@ Content-Type: application/json
 {"name":"postman"}
 ```
 
-Returns the raw token once plus token metadata. Token hashes are stored in Redis.
+Returns the raw token once plus token metadata. Token hashes and token scopes are stored in Redis.
+
+Optional token scopes:
+
+```json
+{"name":"ops", "scopes":["routes:read","routes:write","analytics:read"]}
+```
+
+Supported scopes are `admin`, `routes:read`, `routes:write`, `tokens:read`, `tokens:write`, and `analytics:read`. Empty scopes default to `admin`.
 
 Token names are capped at 128 bytes. Admin JSON request bodies are capped at 1 MiB and return `413 Payload Too Large` above that limit.
 
@@ -210,7 +218,7 @@ Available fields:
 | `required_headers` | array | Requires headers by name, optionally with an exact value: `{ "name": "x-api-version", "value": "2026-05" }`. |
 | `strip_request_headers` | string array | Removes headers before forwarding upstream. |
 | `add_request_headers` | object | Adds or overwrites headers before forwarding upstream. |
-| `response_headers` | object | Adds or overwrites headers on upstream and generated policy responses. |
+| `response_headers` | object | Adds or overwrites headers on upstream and generated policy responses. Sensitive response headers such as `set-cookie` are redacted from route-list API responses. |
 | `ip_allowlist` | string array | Allows only these IPs/CIDRs. Bare IPs are treated as `/32` or `/128`. |
 | `ip_blocklist` | string array | Blocks these IPs/CIDRs. Aliases: `blacklist_ips`, `blocked_ips`. |
 | `country_allowlist` | string array | Allows only requests whose offline GeoIP country code matches. Aliases: `allowed_countries`. |
@@ -221,7 +229,7 @@ Available fields:
 | `traffic_splits` | array | Weighted upstream pools for canary routing. Matching country/continent constraints are optional. |
 | `waf` | object | Lightweight WAF checks for traversal, SQLi/XSS markers, scanner user agents, and custom substring patterns. |
 | `rate_limit` | object | Per-domain token bucket. Supports `requests_per_second`, `requests_per_minute`, `burst`, `scope`, `status_code`, and `retry_after_seconds`. |
-| `max_body_bytes` | number | Rejects requests whose `Content-Length` exceeds this value and also caps collected streaming/chunked bodies with `413`. Slow-body read deadlines are handled by the connection timeout, not a separate per-byte timeout. |
+| `max_body_bytes` | number | Strict request body limit. When set, Pxxl buffers and validates the request body before upstream forwarding and returns `413` if the body is too large. Slow-body read deadlines are handled by the connection timeout, not a separate per-byte timeout. |
 | `max_uri_length` | number | Rejects long URLs with `414`. |
 | `allowed_content_types` | string array | Allows only these content types on body-bearing methods. |
 | `maintenance_mode` | boolean | Returns `503` before upstream selection. |
@@ -333,6 +341,10 @@ Middleware definition shape:
   }
 }
 ```
+
+`forward_auth.response_headers` is reserved for future trusted identity propagation. Non-empty values are rejected until that copying path can safely strip client-supplied identity headers and add only trusted auth-service headers.
+
+When Basic or Digest middleware authenticates a request, Pxxl removes that consumed edge `Authorization` header before forwarding to the upstream. Origin applications that need their own `Authorization` header should use a separate route without edge Basic/Digest auth or an explicit future pass-through setting.
 
 Supported load-balancing algorithms:
 

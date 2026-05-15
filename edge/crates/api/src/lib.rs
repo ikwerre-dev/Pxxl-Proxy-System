@@ -3,13 +3,14 @@ use http::{header::AUTHORIZATION, Method, Request, Response, StatusCode};
 use http_body_util::{BodyExt, Full};
 use hyper::{body::Incoming, service::service_fn};
 use hyper_util::{
-    rt::{TokioExecutor, TokioIo},
+    rt::{TokioExecutor, TokioIo, TokioTimer},
     server::conn::auto::Builder as AutoBuilder,
 };
 use ipnet::IpNet;
 use pxxl_common::{
-    normalize_domain, normalize_path_prefix, DomainRules, LoadBalancingAlgorithm, PathRoute, Route,
-    RouteSource, Upstream, UpstreamTransport, MAX_ROUTES_PER_SOURCE,
+    ip_allowed_for_upstream, normalize_domain, normalize_path_prefix, DomainRules,
+    LoadBalancingAlgorithm, MiddlewareDefinition, PathRoute, Route, RouteSource, Upstream,
+    UpstreamTransport, MAX_ROUTES_PER_SOURCE,
 };
 use pxxl_core::EdgeState;
 use pxxl_metrics::PxxlMetrics;
@@ -35,6 +36,12 @@ const ADMIN_BODY_LIMIT_BYTES: u64 = 1024 * 1024;
 const ADMIN_TOKEN_NAME_MAX_BYTES: usize = 128;
 const API_CONNECTION_TIMEOUT_SECONDS: u64 = 120;
 const API_MAX_CONNECTIONS: usize = 2048;
+const SCOPE_ADMIN: &str = "admin";
+const SCOPE_ROUTES_READ: &str = "routes:read";
+const SCOPE_ROUTES_WRITE: &str = "routes:write";
+const SCOPE_TOKENS_READ: &str = "tokens:read";
+const SCOPE_TOKENS_WRITE: &str = "tokens:write";
+const SCOPE_ANALYTICS_READ: &str = "analytics:read";
 
 #[derive(Clone)]
 struct ApiServer {
@@ -53,13 +60,26 @@ struct BlacklistBody {
 pub struct AdminApiAuth {
     enabled: bool,
     bootstrap_token: Option<String>,
+    bootstrap_token_permanent: bool,
     ip_allowlist: Vec<IpNet>,
     token_store: Option<RedisTokenStore>,
+}
+
+#[derive(Clone, Debug)]
+struct AdminPrincipal {
+    scopes: Vec<String>,
+}
+
+#[derive(Clone, Debug, Default)]
+pub struct MetricsAuth {
+    bearer_token: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
 struct TokenCreateBody {
     name: String,
+    #[serde(default)]
+    scopes: Vec<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -134,11 +154,12 @@ pub async fn run_admin_api(
 pub async fn run_metrics_server(
     addr: SocketAddr,
     metrics: Arc<PxxlMetrics>,
+    auth: MetricsAuth,
     shutdown: watch::Receiver<bool>,
 ) -> anyhow::Result<()> {
     let listener = TcpListener::bind(addr).await?;
     info!(%addr, "metrics endpoint listening");
-    run_metrics_listener(listener, metrics, shutdown).await
+    run_metrics_listener(listener, metrics, auth, shutdown).await
 }
 
 impl AdminApiAuth {
@@ -146,6 +167,7 @@ impl AdminApiAuth {
         Self {
             enabled: false,
             bootstrap_token: None,
+            bootstrap_token_permanent: false,
             ip_allowlist: Vec::new(),
             token_store: None,
         }
@@ -154,12 +176,14 @@ impl AdminApiAuth {
     pub fn new(
         enabled: bool,
         bootstrap_token: Option<String>,
+        bootstrap_token_permanent: bool,
         ip_allowlist: Vec<IpNet>,
         token_store: Option<RedisTokenStore>,
     ) -> Self {
         Self {
             enabled,
             bootstrap_token,
+            bootstrap_token_permanent,
             ip_allowlist,
             token_store,
         }
@@ -169,25 +193,25 @@ impl AdminApiAuth {
         &self,
         req: &Request<Incoming>,
         remote_ip: IpAddr,
-    ) -> Option<Response<BoxBody>> {
+    ) -> std::result::Result<AdminPrincipal, Response<BoxBody>> {
         if !self.ip_allowlist.is_empty()
             && !self
                 .ip_allowlist
                 .iter()
                 .any(|network| network.contains(&remote_ip))
         {
-            return Some(json_response(
+            return Err(json_response(
                 StatusCode::FORBIDDEN,
                 json!({"error": "admin api ip is not allowed"}),
             ));
         }
 
         if !self.enabled || is_public_admin_path(req.method(), req.uri().path()) {
-            return None;
+            return Ok(AdminPrincipal::admin());
         }
 
         let Some(token) = bearer_token(req) else {
-            return Some(json_response(
+            return Err(json_response(
                 StatusCode::UNAUTHORIZED,
                 json!({"error": "missing bearer token"}),
             ));
@@ -198,28 +222,95 @@ impl AdminApiAuth {
             .as_deref()
             .is_some_and(|bootstrap| constant_time_eq(bootstrap.as_bytes(), token.as_bytes()))
         {
-            return None;
+            if self.bootstrap_token_permanent {
+                return Ok(AdminPrincipal::admin());
+            }
+            let Some(store) = &self.token_store else {
+                return Err(json_response(
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    json!({"error": "admin token store is not configured"}),
+                ));
+            };
+            return match store.list_tokens().await {
+                Ok(tokens) if tokens.is_empty() => Ok(AdminPrincipal::admin()),
+                Ok(_) => Err(json_response(
+                    StatusCode::UNAUTHORIZED,
+                    json!({"error": "bootstrap token expired after first admin token"}),
+                )),
+                Err(error) => {
+                    debug!(%error, "failed to verify bootstrap token lifecycle");
+                    Err(json_response(
+                        StatusCode::BAD_GATEWAY,
+                        json!({"error": "authentication backend unavailable"}),
+                    ))
+                }
+            };
         }
 
         match &self.token_store {
             Some(store) => match store.verify_token(token).await {
-                Ok(true) => None,
-                Ok(false) => Some(json_response(
+                Ok(Some(token)) => Ok(AdminPrincipal::new(token.scopes)),
+                Ok(None) => Err(json_response(
                     StatusCode::UNAUTHORIZED,
                     json!({"error": "invalid bearer token"}),
                 )),
                 Err(error) => {
                     debug!(%error, "failed to verify bearer token");
-                    Some(json_response(
+                    Err(json_response(
                         StatusCode::BAD_GATEWAY,
                         json!({"error": "authentication backend unavailable"}),
                     ))
                 }
             },
-            None => Some(json_response(
+            None => Err(json_response(
                 StatusCode::SERVICE_UNAVAILABLE,
                 json!({"error": "admin token store is not configured"}),
             )),
+        }
+    }
+}
+
+impl AdminPrincipal {
+    fn admin() -> Self {
+        Self {
+            scopes: vec![SCOPE_ADMIN.to_string()],
+        }
+    }
+
+    fn new(scopes: Vec<String>) -> Self {
+        let scopes = normalize_scopes(scopes);
+        Self { scopes }
+    }
+
+    fn has_scope(&self, scope: &str) -> bool {
+        self.scopes
+            .iter()
+            .any(|value| value == SCOPE_ADMIN || value == scope)
+    }
+}
+
+impl MetricsAuth {
+    pub fn new(bearer_token: Option<String>) -> Self {
+        Self { bearer_token }
+    }
+
+    fn authorize(&self, req: &Request<Incoming>) -> Option<Response<BoxBody>> {
+        let expected = self.bearer_token.as_deref()?;
+        let Some(token) = bearer_token(req) else {
+            return Some(text_response(
+                StatusCode::UNAUTHORIZED,
+                "text/plain",
+                "missing bearer token",
+            ));
+        };
+        if constant_time_eq(expected.as_bytes(), token.as_bytes()) {
+            None
+        } else {
+            Some(text_response(
+                StatusCode::UNAUTHORIZED,
+                "text/plain",
+                "invalid bearer token",
+            ))
         }
     }
 }
@@ -246,7 +337,7 @@ async fn run_api_listener(
                         async move { Ok::<_, Infallible>(server.handle(req, peer.ip()).await) }
                     });
                     let io = TokioIo::new(stream);
-                    let builder = AutoBuilder::new(TokioExecutor::new());
+                    let builder = hardened_auto_builder();
                     match time::timeout(
                         Duration::from_secs(API_CONNECTION_TIMEOUT_SECONDS),
                         builder.serve_connection_with_upgrades(io, service),
@@ -274,6 +365,7 @@ async fn run_api_listener(
 async fn run_metrics_listener(
     listener: TcpListener,
     metrics: Arc<PxxlMetrics>,
+    auth: MetricsAuth,
     mut shutdown: watch::Receiver<bool>,
 ) -> anyhow::Result<()> {
     let limiter = Arc::new(Semaphore::new(API_MAX_CONNECTIONS));
@@ -286,11 +378,16 @@ async fn run_metrics_listener(
                     continue;
                 };
                 let metrics = metrics.clone();
+                let auth = auth.clone();
                 tokio::spawn(async move {
                     let _permit = permit;
-                    let service = service_fn(move |_req| {
+                    let service = service_fn(move |req| {
                         let metrics = metrics.clone();
+                        let auth = auth.clone();
                         async move {
+                            if let Some(response) = auth.authorize(&req) {
+                                return Ok::<_, Infallible>(response);
+                            }
                             let response = match metrics.gather() {
                                 Ok(body) => text_response(StatusCode::OK, "text/plain; version=0.0.4", body),
                                 Err(error) => text_response(StatusCode::INTERNAL_SERVER_ERROR, "text/plain", error.to_string()),
@@ -299,7 +396,7 @@ async fn run_metrics_listener(
                         }
                     });
                     let io = TokioIo::new(stream);
-                    let builder = AutoBuilder::new(TokioExecutor::new());
+                    let builder = hardened_auto_builder();
                     match time::timeout(
                         Duration::from_secs(API_CONNECTION_TIMEOUT_SECONDS),
                         builder.serve_connection_with_upgrades(io, service),
@@ -330,9 +427,10 @@ impl ApiServer {
         let path = req.uri().path().to_string();
         let query = req.uri().query().unwrap_or("").to_string();
 
-        if let Some(response) = self.auth.authorize(&req, remote_ip).await {
-            return response;
-        }
+        let principal = match self.auth.authorize(&req, remote_ip).await {
+            Ok(principal) => principal,
+            Err(response) => return response,
+        };
 
         match (method, path.as_str()) {
             (Method::GET, "/healthz") => json_response(StatusCode::OK, json!({"status": "ok"})),
@@ -346,29 +444,70 @@ impl ApiServer {
                     }),
                 )
             }
-            (Method::GET, "/v1/routes") => json_response(
-                StatusCode::OK,
-                json!({ "routes": self.state.routes.snapshot() }),
-            ),
-            (Method::GET, "/v1/domains") => json_response(
-                StatusCode::OK,
-                json!({ "domains": self.state.routes.snapshot() }),
-            ),
-            (Method::POST, "/v1/domains") => self.create_domain(req).await,
-            (Method::POST, "/v1/auth/tokens") => self.create_auth_token(req).await,
-            (Method::GET, "/v1/auth/tokens") => self.list_auth_tokens().await,
+            (Method::GET, "/v1/routes") => {
+                if let Some(response) = require_scope(&principal, SCOPE_ROUTES_READ) {
+                    return response;
+                }
+                json_response(
+                    StatusCode::OK,
+                    json!({ "routes": redact_routes(self.state.routes.snapshot()) }),
+                )
+            }
+            (Method::GET, "/v1/domains") => {
+                if let Some(response) = require_scope(&principal, SCOPE_ROUTES_READ) {
+                    return response;
+                }
+                json_response(
+                    StatusCode::OK,
+                    json!({ "domains": redact_routes(self.state.routes.snapshot()) }),
+                )
+            }
+            (Method::POST, "/v1/domains") => {
+                if let Some(response) = require_scope(&principal, SCOPE_ROUTES_WRITE) {
+                    return response;
+                }
+                self.create_domain(req).await
+            }
+            (Method::POST, "/v1/auth/tokens") => {
+                if let Some(response) = require_scope(&principal, SCOPE_TOKENS_WRITE) {
+                    return response;
+                }
+                self.create_auth_token(req).await
+            }
+            (Method::GET, "/v1/auth/tokens") => {
+                if let Some(response) = require_scope(&principal, SCOPE_TOKENS_READ) {
+                    return response;
+                }
+                self.list_auth_tokens().await
+            }
             (Method::DELETE, path) if path.starts_with("/v1/auth/tokens/") => {
+                if let Some(response) = require_scope(&principal, SCOPE_TOKENS_WRITE) {
+                    return response;
+                }
                 self.revoke_auth_token(path).await
             }
-            (Method::GET, "/v1/stats/domains") => json_response(
-                StatusCode::OK,
-                json!({ "domains": self.state.stats.snapshots() }),
-            ),
-            (Method::GET, "/v1/analytics/routes") => json_response(
-                StatusCode::OK,
-                json!({ "routes": self.state.stats.snapshots() }),
-            ),
+            (Method::GET, "/v1/stats/domains") => {
+                if let Some(response) = require_scope(&principal, SCOPE_ANALYTICS_READ) {
+                    return response;
+                }
+                json_response(
+                    StatusCode::OK,
+                    json!({ "domains": self.state.stats.snapshots() }),
+                )
+            }
+            (Method::GET, "/v1/analytics/routes") => {
+                if let Some(response) = require_scope(&principal, SCOPE_ANALYTICS_READ) {
+                    return response;
+                }
+                json_response(
+                    StatusCode::OK,
+                    json!({ "routes": self.state.stats.snapshots() }),
+                )
+            }
             (Method::GET, "/v1/analytics/visits") => {
+                if let Some(response) = require_scope(&principal, SCOPE_ANALYTICS_READ) {
+                    return response;
+                }
                 let limit = query_limit(&query, 50, 200);
                 json_response(
                     StatusCode::OK,
@@ -376,6 +515,9 @@ impl ApiServer {
                 )
             }
             (Method::GET, "/v1/analytics/logs") => {
+                if let Some(response) = require_scope(&principal, SCOPE_ANALYTICS_READ) {
+                    return response;
+                }
                 let limit = query_limit(&query, 50, 200);
                 let request_id = query_value(&query, "request_id");
                 let logs = request_id
@@ -395,6 +537,9 @@ impl ApiServer {
                 )
             }
             (Method::GET, path) if path.starts_with("/v1/domains/") && path.ends_with("/stats") => {
+                if let Some(response) = require_scope(&principal, SCOPE_ANALYTICS_READ) {
+                    return response;
+                }
                 let domain = path
                     .trim_start_matches("/v1/domains/")
                     .trim_end_matches("/stats")
@@ -433,6 +578,9 @@ impl ApiServer {
             (Method::GET, path)
                 if path.starts_with("/v1/domains/") && path.ends_with("/visits") =>
             {
+                if let Some(response) = require_scope(&principal, SCOPE_ANALYTICS_READ) {
+                    return response;
+                }
                 let domain = path
                     .trim_start_matches("/v1/domains/")
                     .trim_end_matches("/visits")
@@ -454,6 +602,9 @@ impl ApiServer {
                 )
             }
             (Method::GET, path) if path.starts_with("/v1/domains/") && path.ends_with("/logs") => {
+                if let Some(response) = require_scope(&principal, SCOPE_ANALYTICS_READ) {
+                    return response;
+                }
                 let domain = path
                     .trim_start_matches("/v1/domains/")
                     .trim_end_matches("/logs")
@@ -487,6 +638,9 @@ impl ApiServer {
                 )
             }
             (Method::GET, path) if path.starts_with("/v1/domains/") => {
+                if let Some(response) = require_scope(&principal, SCOPE_ROUTES_READ) {
+                    return response;
+                }
                 let domain = path.trim_start_matches("/v1/domains/").trim_matches('/');
                 if domain.is_empty() {
                     return json_response(
@@ -495,13 +649,18 @@ impl ApiServer {
                     );
                 }
                 match self.state.routes.find_domain(&normalize_domain(domain)) {
-                    Some(route) => json_response(StatusCode::OK, json!({ "domain": route })),
+                    Some(route) => {
+                        json_response(StatusCode::OK, json!({ "domain": redact_route(route) }))
+                    }
                     None => {
                         json_response(StatusCode::NOT_FOUND, json!({"error": "domain not found"}))
                     }
                 }
             }
             (Method::DELETE, path) if path.starts_with("/v1/domains/") => {
+                if let Some(response) = require_scope(&principal, SCOPE_ROUTES_WRITE) {
+                    return response;
+                }
                 let domain =
                     normalize_domain(path.trim_start_matches("/v1/domains/").trim_matches('/'));
                 if domain.is_empty() {
@@ -534,6 +693,9 @@ impl ApiServer {
                 )
             }
             (Method::GET, "/v1/upstreams") => {
+                if let Some(response) = require_scope(&principal, SCOPE_ROUTES_READ) {
+                    return response;
+                }
                 let upstreams = self
                     .state
                     .routes
@@ -567,6 +729,9 @@ impl ApiServer {
                 }),
             ),
             (Method::POST, path) if path.starts_with("/v1/blacklist/") => {
+                if let Some(response) = require_scope(&principal, SCOPE_ROUTES_WRITE) {
+                    return response;
+                }
                 let domain_id = path.trim_start_matches("/v1/blacklist/").trim_matches('/');
                 if domain_id.is_empty() {
                     return json_response(
@@ -599,6 +764,9 @@ impl ApiServer {
                 }
             }
             (Method::DELETE, path) if path.starts_with("/v1/blacklist/") => {
+                if let Some(response) = require_scope(&principal, SCOPE_ROUTES_WRITE) {
+                    return response;
+                }
                 let parts = path
                     .trim_start_matches("/v1/blacklist/")
                     .split('/')
@@ -650,6 +818,9 @@ impl ApiServer {
             Ok(route) => route,
             Err(error) => return json_response(StatusCode::BAD_REQUEST, json!({"error": error})),
         };
+        if let Err(error) = validate_api_route_network_safety(&route).await {
+            return json_response(StatusCode::BAD_REQUEST, json!({"error": error}));
+        }
         let existing_api_routes = self
             .state
             .routes
@@ -681,7 +852,7 @@ impl ApiServer {
             StatusCode::CREATED,
             json!({
                 "status": "created",
-                "domain": route
+                "domain": redact_route(route)
             }),
         )
     }
@@ -719,7 +890,12 @@ impl ApiServer {
             );
         };
 
-        match store.create_token(body.name).await {
+        let scopes = match validate_token_scopes(body.scopes) {
+            Ok(scopes) => scopes,
+            Err(error) => return json_response(StatusCode::BAD_REQUEST, json!({"error": error})),
+        };
+
+        match store.create_token_with_scopes(body.name, scopes).await {
             Ok(created) => json_response(StatusCode::CREATED, json!(created)),
             Err(error) => json_response(
                 StatusCode::BAD_GATEWAY,
@@ -843,6 +1019,187 @@ fn root_path() -> String {
     "/".to_string()
 }
 
+fn require_scope(principal: &AdminPrincipal, scope: &str) -> Option<Response<BoxBody>> {
+    (!principal.has_scope(scope)).then(|| {
+        json_response(
+            StatusCode::FORBIDDEN,
+            json!({"error": format!("missing required scope: {scope}")}),
+        )
+    })
+}
+
+fn validate_token_scopes(scopes: Vec<String>) -> Result<Vec<String>, String> {
+    let scopes = normalize_scopes(scopes);
+    for scope in &scopes {
+        if !matches!(
+            scope.as_str(),
+            SCOPE_ADMIN
+                | SCOPE_ROUTES_READ
+                | SCOPE_ROUTES_WRITE
+                | SCOPE_TOKENS_READ
+                | SCOPE_TOKENS_WRITE
+                | SCOPE_ANALYTICS_READ
+        ) {
+            return Err(format!("unsupported token scope: {scope}"));
+        }
+    }
+    Ok(scopes)
+}
+
+fn normalize_scopes(scopes: Vec<String>) -> Vec<String> {
+    let mut scopes = scopes
+        .into_iter()
+        .map(|scope| scope.trim().to_ascii_lowercase())
+        .filter(|scope| !scope.is_empty())
+        .collect::<Vec<_>>();
+    scopes.sort();
+    scopes.dedup();
+    if scopes.is_empty() {
+        vec![SCOPE_ADMIN.to_string()]
+    } else {
+        scopes
+    }
+}
+
+fn redact_routes(routes: Vec<Route>) -> Vec<Route> {
+    routes.into_iter().map(redact_route).collect()
+}
+
+fn redact_route(mut route: Route) -> Route {
+    redact_rules(&mut route.rules);
+    route
+}
+
+fn redact_rules(rules: &mut DomainRules) {
+    for value in rules.add_request_headers.values_mut() {
+        *value = "[redacted]".to_string();
+    }
+    for (name, value) in rules.response_headers.iter_mut() {
+        if sensitive_header_name(name) {
+            *value = "[redacted]".to_string();
+        }
+    }
+    for middleware in rules.middlewares.values_mut() {
+        redact_middleware(middleware);
+    }
+}
+
+fn redact_middleware(middleware: &mut MiddlewareDefinition) {
+    if let Some(config) = &mut middleware.basic_auth {
+        for value in config.users.values_mut() {
+            *value = "[redacted]".to_string();
+        }
+    }
+    if let Some(config) = &mut middleware.digest_auth {
+        for value in config.users.values_mut() {
+            *value = "[redacted]".to_string();
+        }
+    }
+}
+
+fn sensitive_header_name(name: &str) -> bool {
+    matches!(
+        name.to_ascii_lowercase().as_str(),
+        "authorization" | "proxy-authorization" | "cookie" | "set-cookie" | "x-api-key"
+    )
+}
+
+async fn validate_api_route_network_safety(route: &Route) -> Result<(), String> {
+    for path in &route.paths {
+        for upstream in &path.upstreams {
+            validate_api_upstream_network_safety(&upstream.url).await?;
+        }
+    }
+    for rule in &route.rules.location_routes {
+        for upstream in &rule.upstreams {
+            validate_api_upstream_network_safety(&upstream.url).await?;
+        }
+    }
+    for split in &route.rules.traffic_splits {
+        for upstream in &split.upstreams {
+            validate_api_upstream_network_safety(&upstream.url).await?;
+        }
+    }
+    for upstream in &route.rules.traffic_mirroring.upstreams {
+        validate_api_upstream_network_safety(&upstream.url).await?;
+    }
+    for middleware in route.rules.middlewares.values() {
+        if let Some(forward_auth) = &middleware.forward_auth {
+            if forward_auth.enabled {
+                validate_api_upstream_network_safety(&forward_auth.url).await?;
+            }
+        }
+    }
+    Ok(())
+}
+
+async fn validate_api_upstream_network_safety(raw: &str) -> Result<(), String> {
+    let parsed = url::Url::parse(raw).map_err(|error| format!("invalid upstream URL: {error}"))?;
+    let Some(host) = parsed.host_str() else {
+        return Err("upstream URL needs a host".to_string());
+    };
+    let host = host.trim_end_matches('.').to_ascii_lowercase();
+    if reserved_host_gateway(&host) {
+        return Err(format!(
+            "reserved host-gateway upstream is not allowed: {host}"
+        ));
+    }
+    if let Ok(ip) = host.parse::<IpAddr>() {
+        if !ip_allowed_for_upstream(ip) {
+            return Err("unsafe upstream IP is not allowed".to_string());
+        }
+        return Ok(());
+    }
+    let Some(port) = parsed.port_or_known_default() else {
+        return Err("upstream URL needs a port or known scheme default".to_string());
+    };
+    let lookup = time::timeout(
+        Duration::from_secs(2),
+        tokio::net::lookup_host((host.as_str(), port)),
+    )
+    .await;
+    match lookup {
+        Ok(Ok(addresses)) => {
+            for address in addresses {
+                if !ip_allowed_for_upstream(address.ip()) {
+                    return Err(format!(
+                        "upstream host resolves to unsafe IP: {}",
+                        address.ip()
+                    ));
+                }
+            }
+            Ok(())
+        }
+        Ok(Err(_)) | Err(_) => Ok(()),
+    }
+}
+
+fn reserved_host_gateway(host: &str) -> bool {
+    matches!(host, "host.docker.internal" | "gateway.docker.internal")
+}
+
+fn hardened_auto_builder() -> AutoBuilder<TokioExecutor> {
+    let mut builder = AutoBuilder::new(TokioExecutor::new());
+    builder
+        .http1()
+        .timer(TokioTimer::new())
+        .header_read_timeout(Some(Duration::from_secs(10)))
+        .max_headers(100)
+        .max_buf_size(64 * 1024);
+    builder
+        .http2()
+        .timer(TokioTimer::new())
+        .max_concurrent_streams(Some(64))
+        .max_pending_accept_reset_streams(Some(32))
+        .max_local_error_reset_streams(Some(64))
+        .max_header_list_size(64 * 1024)
+        .max_frame_size(Some(16 * 1024))
+        .keep_alive_interval(Some(Duration::from_secs(30)))
+        .keep_alive_timeout(Duration::from_secs(10))
+        .max_send_buf_size(128 * 1024);
+    builder
+}
+
 fn query_limit(query: &str, default: usize, max: usize) -> usize {
     query
         .split('&')
@@ -933,4 +1290,78 @@ fn text_response(
                 .boxed(),
         )
         .unwrap()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use pxxl_common::{BasicAuthConfig, MiddlewareDefinition};
+    use std::collections::HashMap;
+
+    #[tokio::test]
+    async fn api_network_safety_rejects_host_gateway_upstream() {
+        let error = validate_api_upstream_network_safety("http://host.docker.internal:8080")
+            .await
+            .unwrap_err();
+
+        assert!(error.contains("host-gateway"));
+    }
+
+    #[test]
+    fn route_redaction_removes_middleware_passwords_and_added_headers() {
+        let mut route = Route::new(
+            "redact.example.com",
+            vec![PathRoute::new(
+                "/",
+                vec![Upstream::new("http://example.com")],
+            )],
+            RouteSource::Api,
+        );
+        route
+            .rules
+            .add_request_headers
+            .insert("authorization".to_string(), "Bearer secret".to_string());
+        route.rules.middlewares.insert(
+            "auth".to_string(),
+            MiddlewareDefinition {
+                basic_auth: Some(BasicAuthConfig {
+                    users: HashMap::from([("robin".to_string(), "pxxl".to_string())]),
+                    ..BasicAuthConfig::default()
+                }),
+                ..MiddlewareDefinition::default()
+            },
+        );
+
+        let redacted = redact_route(route);
+        let middleware = redacted.rules.middlewares.get("auth").unwrap();
+
+        assert_eq!(
+            redacted
+                .rules
+                .add_request_headers
+                .get("authorization")
+                .map(String::as_str),
+            Some("[redacted]")
+        );
+        assert_eq!(
+            middleware
+                .basic_auth
+                .as_ref()
+                .and_then(|config| config.users.get("robin"))
+                .map(String::as_str),
+            Some("[redacted]")
+        );
+    }
+
+    #[test]
+    fn validates_token_scopes() {
+        let scopes = validate_token_scopes(vec![
+            "routes:read".to_string(),
+            "analytics:read".to_string(),
+        ])
+        .unwrap();
+
+        assert_eq!(scopes, vec!["analytics:read", "routes:read"]);
+        assert!(validate_token_scopes(vec!["root".to_string()]).is_err());
+    }
 }

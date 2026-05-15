@@ -19,7 +19,7 @@ GRAFANA_ADMIN_PASSWORD="$(openssl rand -hex 24)" \
 docker compose up --build
 ```
 
-After you create a Redis-backed admin token through `POST /v1/auth/tokens`, remove `PXXL_ADMIN_BOOTSTRAP_TOKEN` for normal restarts. Compose binds admin, metrics, Prometheus, and Grafana to `127.0.0.1` and does not publish Redis, Postgres, ClickHouse, or Loki host ports.
+After you create a Redis-backed admin token through `POST /v1/auth/tokens`, remove `PXXL_ADMIN_BOOTSTRAP_TOKEN` for normal restarts. The bootstrap token is one-shot by default and stops authenticating once Redis contains an admin token. Compose binds admin, metrics, Prometheus, and Grafana to `127.0.0.1` and does not publish Redis, Postgres, ClickHouse, or Loki host ports. Set `PXXL_METRICS_BEARER_TOKEN` if you want the metrics endpoint itself to require a bearer token.
 
 Add hosts:
 

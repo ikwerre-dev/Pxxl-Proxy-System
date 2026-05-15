@@ -6,6 +6,7 @@ BRANCH="${PXXL_BRANCH:-main}"
 INSTALL_DIR="${PXXL_INSTALL_DIR:-$HOME/pxxl-proxy-system}"
 NO_START="${PXXL_NO_START:-0}"
 ALLOW_DIRTY="${PXXL_ALLOW_DIRTY:-0}"
+VERIFY_GIT_SIGNATURE="${PXXL_VERIFY_GIT_SIGNATURE:-0}"
 
 banner() {
   cat <<'ART'
@@ -57,6 +58,13 @@ compose() {
   else
     fail "Docker Compose is required. Install Docker Desktop or the docker compose plugin."
   fi
+}
+
+verify_checkout_signature() {
+  [ "$VERIFY_GIT_SIGNATURE" = "1" ] || return 0
+  info "verifying git commit signature"
+  git -C "$APP_DIR" verify-commit HEAD >/dev/null 2>&1 \
+    || fail "HEAD is not signed by a trusted key. Disable only for local testing with PXXL_VERIFY_GIT_SIGNATURE=0."
 }
 
 random_hex() {
@@ -111,6 +119,7 @@ prepare_repo() {
     current_branch="$BRANCH"
   fi
   git -C "$APP_DIR" pull --ff-only origin "$current_branch"
+  verify_checkout_signature
 }
 
 check_requirements() {

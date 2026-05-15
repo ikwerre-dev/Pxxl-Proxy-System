@@ -47,7 +47,7 @@ impl Default for ListenerConfig {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord)]
 #[serde(rename_all = "snake_case")]
 pub enum RouteSource {
     Static,
@@ -1160,7 +1160,7 @@ fn validate_upstream_host(host: &str) -> std::result::Result<(), String> {
     Ok(())
 }
 
-fn ip_allowed_for_upstream(ip: IpAddr) -> bool {
+pub fn ip_allowed_for_upstream(ip: IpAddr) -> bool {
     match ip {
         IpAddr::V4(ip) => {
             !(ip.is_private()
@@ -1234,6 +1234,9 @@ fn validate_rules_for_runtime(rules: &DomainRules) -> std::result::Result<(), St
     for middleware in rules.middlewares.values() {
         if let Some(forward_auth) = &middleware.forward_auth {
             if forward_auth.enabled {
+                if !forward_auth.response_headers.is_empty() {
+                    return Err("forward_auth response_headers are not enforced yet".to_string());
+                }
                 validate_upstream_url(&forward_auth.url)?;
             }
         }
@@ -1429,6 +1432,33 @@ mod tests {
         );
 
         assert!(route.validate_for_dynamic_control_plane().is_err());
+    }
+
+    #[test]
+    fn route_validation_rejects_unsupported_forward_auth_response_headers() {
+        let mut route = Route::new(
+            "auth.example.com",
+            vec![PathRoute::new(
+                "/",
+                vec![Upstream::new("http://app.example.com")],
+            )],
+            RouteSource::Api,
+        );
+        route.rules.middlewares.insert(
+            "authz".to_string(),
+            MiddlewareDefinition {
+                forward_auth: Some(ForwardAuthConfig {
+                    enabled: true,
+                    url: "http://auth.example.com/check".to_string(),
+                    request_headers: Vec::new(),
+                    response_headers: vec!["x-user-id".to_string()],
+                }),
+                ..MiddlewareDefinition::default()
+            },
+        );
+
+        let error = route.validate_for_dynamic_control_plane().unwrap_err();
+        assert!(error.contains("forward_auth response_headers"));
     }
 
     #[test]
