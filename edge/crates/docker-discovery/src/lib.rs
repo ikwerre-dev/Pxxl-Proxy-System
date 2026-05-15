@@ -1,5 +1,7 @@
 use anyhow::{bail, Context, Result};
-use pxxl_common::{normalize_domain, normalize_path_prefix, PathRoute, Route, RouteSource, Upstream};
+use pxxl_common::{
+    normalize_domain, normalize_path_prefix, PathRoute, Route, RouteSource, Upstream,
+};
 use pxxl_core::EdgeState;
 use serde::Deserialize;
 use std::{
@@ -28,10 +30,12 @@ impl DockerDiscovery {
     }
 
     pub async fn discover_once(&self) -> Result<Vec<Route>> {
-        let body = self
-            .docker_get("/containers/json")
-            .await
-            .with_context(|| format!("failed to query Docker socket {}", self.socket_path.display()))?;
+        let body = self.docker_get("/containers/json").await.with_context(|| {
+            format!(
+                "failed to query Docker socket {}",
+                self.socket_path.display()
+            )
+        })?;
         let containers: Vec<DockerContainerSummary> =
             serde_json::from_slice(&body).context("failed to parse Docker containers JSON")?;
 
@@ -121,7 +125,10 @@ pub fn route_from_labels(labels: &HashMap<String, String>, container_name: &str)
     route_target_from_labels(labels, container_name).map(route_from_target)
 }
 
-fn route_target_from_labels(labels: &HashMap<String, String>, container_name: &str) -> Option<DockerRouteTarget> {
+fn route_target_from_labels(
+    labels: &HashMap<String, String>,
+    container_name: &str,
+) -> Option<DockerRouteTarget> {
     let enabled = labels
         .get("pxxl.enable")
         .is_some_and(|value| value.eq_ignore_ascii_case("true"));
@@ -131,10 +138,7 @@ fn route_target_from_labels(labels: &HashMap<String, String>, container_name: &s
 
     let domain = labels.get("pxxl.domain")?;
     let port = labels.get("pxxl.port")?.parse::<u16>().ok()?;
-    let path = labels
-        .get("pxxl.path")
-        .map(String::as_str)
-        .unwrap_or("/");
+    let path = labels.get("pxxl.path").map(String::as_str).unwrap_or("/");
     let scheme = labels
         .get("pxxl.scheme")
         .map(String::as_str)
@@ -171,7 +175,10 @@ fn routes_from_targets(targets: impl IntoIterator<Item = DockerRouteTarget>) -> 
             .entry(target.path)
             .or_default();
 
-        if !upstreams.iter().any(|upstream| upstream.url == target.upstream.url) {
+        if !upstreams
+            .iter()
+            .any(|upstream| upstream.url == target.upstream.url)
+        {
             upstreams.push(target.upstream);
         }
     }
@@ -187,7 +194,8 @@ fn routes_from_targets(targets: impl IntoIterator<Item = DockerRouteTarget>) -> 
                 })
                 .collect::<Vec<_>>();
 
-            Route::new(domain.clone(), paths, RouteSource::Docker).with_id(docker_route_id(&domain, None))
+            Route::new(domain.clone(), paths, RouteSource::Docker)
+                .with_id(docker_route_id(&domain, None))
         })
         .collect()
 }
@@ -205,7 +213,8 @@ fn parse_http_response_body(response: &[u8]) -> Result<Vec<u8>> {
         .windows(separator.len())
         .position(|window| window == separator)
         .context("missing HTTP header separator")?;
-    let headers = std::str::from_utf8(&response[..split]).context("Docker response headers were not UTF-8")?;
+    let headers = std::str::from_utf8(&response[..split])
+        .context("Docker response headers were not UTF-8")?;
     let body = &response[split + separator.len()..];
 
     let status_line = headers.lines().next().unwrap_or_default();
@@ -237,7 +246,9 @@ fn decode_chunked_body(body: &[u8]) -> Result<Vec<u8>> {
     let mut cursor = 0;
 
     loop {
-        let line_end = find_crlf(&body[cursor..]).context("invalid chunked body: missing chunk size")? + cursor;
+        let line_end = find_crlf(&body[cursor..])
+            .context("invalid chunked body: missing chunk size")?
+            + cursor;
         let size_line = std::str::from_utf8(&body[cursor..line_end])
             .context("invalid chunked body: chunk size was not UTF-8")?;
         let size_hex = size_line.split(';').next().unwrap_or_default().trim();
@@ -261,9 +272,7 @@ fn decode_chunked_body(body: &[u8]) -> Result<Vec<u8>> {
 }
 
 fn find_crlf(bytes: &[u8]) -> Option<usize> {
-    bytes
-        .windows(2)
-        .position(|window| window == b"\r\n")
+    bytes.windows(2).position(|window| window == b"\r\n")
 }
 
 #[cfg(test)]
