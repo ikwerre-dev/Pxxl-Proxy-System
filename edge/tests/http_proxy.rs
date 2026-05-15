@@ -9,7 +9,7 @@ use hyper_util::{
 };
 use pxxl_common::{
     BasicAuthConfig, CompressionConfig, DomainRateLimit, DomainRules, DomainWafRules,
-    MiddlewareDefinition, LocationRouteRule, PathRoute, RetryConfig, Route, RouteSource,
+    LocationRouteRule, MiddlewareDefinition, PathRoute, RetryConfig, Route, RouteSource,
     StickySessionConfig, TrafficSplitRule, Upstream,
 };
 use pxxl_core::{EdgeState, RouteRegistry};
@@ -395,10 +395,7 @@ async fn executes_basic_auth_middleware_by_path() {
     let proxy_addr = proxy_listener.local_addr().unwrap();
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
 
-    let mut path = PathRoute::new(
-        "/",
-        vec![Upstream::new(format!("http://{upstream_addr}"))],
-    );
+    let mut path = PathRoute::new("/", vec![Upstream::new(format!("http://{upstream_addr}"))]);
     path.middlewares = vec!["auth".to_string()];
     let mut route = Route::new("auth.pxxlhost", vec![path], RouteSource::Static);
     route.rules.middlewares.insert(
@@ -541,7 +538,12 @@ async fn sticky_session_cookie_keeps_same_upstream() {
         .next()
         .unwrap()
         .to_string();
-    let first_body = first_response.into_body().collect().await.unwrap().to_bytes();
+    let first_body = first_response
+        .into_body()
+        .collect()
+        .await
+        .unwrap()
+        .to_bytes();
     let second = Request::builder()
         .method("GET")
         .uri(format!("http://{proxy_addr}/"))
@@ -567,11 +569,8 @@ async fn sticky_session_cookie_keeps_same_upstream() {
 
 #[tokio::test]
 async fn compression_middleware_gzips_text_response() {
-    let upstream_addr = spawn_upstream_with_content_type(
-        "text/plain",
-        "hello ".repeat(300).leak(),
-    )
-    .await;
+    let upstream_addr =
+        spawn_upstream_with_content_type("text/plain", "hello ".repeat(300).leak()).await;
     let proxy_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let proxy_addr = proxy_listener.local_addr().unwrap();
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
@@ -612,7 +611,10 @@ async fn compression_middleware_gzips_text_response() {
     shutdown_tx.send(true).unwrap();
     server.await.unwrap().unwrap();
 
-    assert_eq!(encoding.as_ref().and_then(|value| value.to_str().ok()), Some("gzip"));
+    assert_eq!(
+        encoding.as_ref().and_then(|value| value.to_str().ok()),
+        Some("gzip")
+    );
     assert_eq!(&body[..2], &[0x1f, 0x8b]);
 }
 
@@ -628,6 +630,73 @@ async fn spawn_upstream(body: &'static str) -> SocketAddr {
                     Ok::<_, Infallible>(Response::new(Full::new(Bytes::from_static(
                         body.as_bytes(),
                     ))))
+                });
+                let io = TokioIo::new(stream);
+                let builder = AutoBuilder::new(TokioExecutor::new());
+                let _ = builder.serve_connection_with_upgrades(io, service).await;
+            });
+        }
+    });
+
+    addr
+}
+
+async fn spawn_upstream_with_content_type(
+    content_type: &'static str,
+    body: &'static str,
+) -> SocketAddr {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+
+    tokio::spawn(async move {
+        loop {
+            let (stream, _) = listener.accept().await.unwrap();
+            tokio::spawn(async move {
+                let service = service_fn(move |_req| async move {
+                    Ok::<_, Infallible>(
+                        Response::builder()
+                            .header("content-type", content_type)
+                            .body(Full::new(Bytes::from_static(body.as_bytes())))
+                            .unwrap(),
+                    )
+                });
+                let io = TokioIo::new(stream);
+                let builder = AutoBuilder::new(TokioExecutor::new());
+                let _ = builder.serve_connection_with_upgrades(io, service).await;
+            });
+        }
+    });
+
+    addr
+}
+
+async fn spawn_flaky_upstream() -> SocketAddr {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let count = Arc::new(AtomicUsize::new(0));
+
+    tokio::spawn(async move {
+        loop {
+            let (stream, _) = listener.accept().await.unwrap();
+            let count = count.clone();
+            tokio::spawn(async move {
+                let service = service_fn(move |_req| {
+                    let count = count.clone();
+                    async move {
+                        let attempt = count.fetch_add(1, Ordering::Relaxed);
+                        if attempt == 0 {
+                            Ok::<_, Infallible>(
+                                Response::builder()
+                                    .status(StatusCode::SERVICE_UNAVAILABLE)
+                                    .body(Full::new(Bytes::from_static(b"try again")))
+                                    .unwrap(),
+                            )
+                        } else {
+                            Ok::<_, Infallible>(Response::new(Full::new(Bytes::from_static(
+                                b"recovered",
+                            ))))
+                        }
+                    }
                 });
                 let io = TokioIo::new(stream);
                 let builder = AutoBuilder::new(TokioExecutor::new());

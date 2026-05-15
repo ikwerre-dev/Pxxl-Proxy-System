@@ -1340,6 +1340,7 @@ dependencies = [
  "pxxl-metrics",
  "pxxl-tls",
  "rustls",
+ "sha2",
  "tokio",
  "tokio-rustls",
  "tracing",

@@ -22,15 +22,17 @@ use hyper_util::{
 use parking_lot::Mutex;
 use pxxl_common::{
     normalize_domain, BasicAuthConfig, BufferingConfig, CircuitBreakerConfig, CompressionConfig,
-    ContentTypeAutoDetectConfig, DomainRateLimit, DomainRules, ForwardAuthConfig, GeoLocation,
-    InFlightLimitConfig, InFlightLimitScope, MiddlewareDefinition, PassiveHealthConfig, PxxlError,
-    RateLimitScope, RetryConfig, RouteMatch, StickySessionConfig, TrafficMirrorConfig,
-    TrafficSplitRule, Upstream, ClientCertForwardingConfig,
+    ContentTypeAutoDetectConfig, DigestAuthConfig, DomainRateLimit, DomainRules,
+    ForwardAuthConfig, GeoLocation, InFlightLimitConfig, InFlightLimitScope, MiddlewareDefinition,
+    PassiveHealthConfig, PxxlError, RateLimitScope, RetryConfig, RouteMatch,
+    StickySessionConfig, TrafficMirrorConfig, TrafficSplitRule, Upstream,
+    ClientCertForwardingConfig,
 };
 use pxxl_core::{EdgeState, RequestObservation};
 use pxxl_ddos::SecurityDecision;
 use pxxl_geo::GeoIpResolver;
 use rustls::ServerConfig;
+use sha2::{Digest, Sha256};
 use std::{
     collections::HashMap,
     convert::Infallible,
@@ -49,6 +51,7 @@ use tokio::{
     sync::watch,
 };
 use tokio_rustls::TlsAcceptor;
+use tokio_rustls::server::TlsStream;
 use tracing::{debug, error, info, warn};
 
 type BoxError = Box<dyn std::error::Error + Send + Sync>;
@@ -284,6 +287,7 @@ struct EffectiveMiddleware {
     traffic_mirroring: TrafficMirrorConfig,
     client_cert_forwarding: ClientCertForwardingConfig,
     basic_auth: Option<BasicAuthConfig>,
+    digest_auth: Option<DigestAuthConfig>,
     forward_auth: Option<ForwardAuthConfig>,
 }
 
@@ -302,6 +306,7 @@ impl EffectiveMiddleware {
             traffic_mirroring: rules.traffic_mirroring.clone(),
             client_cert_forwarding: rules.client_cert_forwarding.clone(),
             basic_auth: None,
+            digest_auth: None,
             forward_auth: None,
         };
         let mut expanded = Vec::new();
@@ -320,6 +325,9 @@ impl EffectiveMiddleware {
         }
         if let Some(value) = &middleware.forward_auth {
             self.forward_auth = Some(value.clone());
+        }
+        if let Some(value) = &middleware.digest_auth {
+            self.digest_auth = Some(value.clone());
         }
         if let Some(value) = &middleware.request_buffering {
             self.request_buffering = value.clone();
@@ -1029,6 +1037,7 @@ impl ProxyServer {
         req: Request<Incoming>,
         remote_ip: Option<IpAddr>,
         scheme: RequestScheme,
+        client_cert_pem: Option<String>,
     ) -> Response<BoxBody> {
         let started = Instant::now();
         let method = req.method().clone();
@@ -1178,6 +1187,23 @@ impl ProxyServer {
                 .metrics
                 .middleware_executions_total
                 .with_label_values(&[&domain, "basic_auth", "allowed"])
+                .inc();
+        }
+
+        if let Some(digest_auth) = &middleware.digest_auth {
+            if let Some(response) = self.evaluate_digest_auth(&req, digest_auth, &domain, &path) {
+                self.state
+                    .metrics
+                    .middleware_executions_total
+                    .with_label_values(&[&domain, "digest_auth", "rejected"])
+                    .inc();
+                self.observe_request(&context, response.status(), started, None);
+                return response;
+            }
+            self.state
+                .metrics
+                .middleware_executions_total
+                .with_label_values(&[&domain, "digest_auth", "allowed"])
                 .inc();
         }
 
@@ -1340,6 +1366,7 @@ impl ProxyServer {
                 scheme,
                 &middleware,
                 &domain,
+                client_cert_pem.as_deref(),
             )
             .await
         {
@@ -1479,6 +1506,7 @@ impl ProxyServer {
         scheme: RequestScheme,
         middleware: &EffectiveMiddleware,
         domain: &str,
+        client_cert_pem: Option<&str>,
     ) -> Result<BufferedResponse, PxxlError> {
         let attempts = if middleware.retry.enabled {
             middleware.retry.attempts.max(1)
@@ -1489,7 +1517,15 @@ impl ProxyServer {
 
         for attempt in 1..=attempts {
             match self
-                .forward_buffered(&request, matched, upstream, remote_ip, scheme, middleware)
+                .forward_buffered(
+                    &request,
+                    matched,
+                    upstream,
+                    remote_ip,
+                    scheme,
+                    middleware,
+                    client_cert_pem,
+                )
                 .await
             {
                 Ok(response)
@@ -1528,6 +1564,7 @@ impl ProxyServer {
         remote_ip: Option<IpAddr>,
         scheme: RequestScheme,
         middleware: &EffectiveMiddleware,
+        client_cert_pem: Option<&str>,
     ) -> Result<BufferedResponse, PxxlError> {
         let mut req = request.to_request(upstream)?;
 
@@ -1554,12 +1591,13 @@ impl ProxyServer {
             }
         }
         if middleware.client_cert_forwarding.enabled {
-            if let Ok(name) =
-                HeaderName::from_bytes(middleware.client_cert_forwarding.header_name.as_bytes())
-            {
-                req.headers_mut()
-                    .entry(name)
-                    .or_insert(HeaderValue::from_static(""));
+            if let (Some(cert), Ok(name)) = (
+                client_cert_pem,
+                HeaderName::from_bytes(middleware.client_cert_forwarding.header_name.as_bytes()),
+            ) {
+                if let Ok(value) = HeaderValue::from_str(cert) {
+                    req.headers_mut().insert(name, value);
+                }
             }
         }
 
@@ -1736,6 +1774,44 @@ impl ProxyServer {
         Some(response)
     }
 
+    fn evaluate_digest_auth(
+        &self,
+        req: &Request<Incoming>,
+        config: &DigestAuthConfig,
+        domain: &str,
+        path: &str,
+    ) -> Option<Response<BoxBody>> {
+        if !config.enabled {
+            return None;
+        }
+        let authorized = req
+            .headers()
+            .get(AUTHORIZATION)
+            .and_then(|value| value.to_str().ok())
+            .and_then(|value| value.strip_prefix("Digest "))
+            .map(parse_digest_authorization)
+            .is_some_and(|params| digest_authorized(req.method(), &config.realm, &config.users, &params));
+
+        if authorized {
+            return None;
+        }
+
+        let nonce = format!("{:x}", now_unix_ms());
+        let mut response = self.error_response(
+            StatusCode::UNAUTHORIZED,
+            "digest authentication required",
+            domain,
+            path,
+        );
+        if let Ok(value) = HeaderValue::from_str(&format!(
+            "Digest realm=\"{}\", qop=\"auth\", algorithm=SHA-256, nonce=\"{}\"",
+            config.realm, nonce
+        )) {
+            response.headers_mut().insert(WWW_AUTHENTICATE, value);
+        }
+        Some(response)
+    }
+
     async fn run_forward_auth(
         &self,
         req: &Request<Incoming>,
@@ -1791,6 +1867,7 @@ impl ProxyServer {
                         None,
                         RequestScheme::Http,
                         &EffectiveMiddleware::from_rules(&matched.route.rules, &[]),
+                        None,
                     )
                     .await;
                 let label = if result.is_ok() { "ok" } else { "error" };
@@ -2148,7 +2225,10 @@ async fn run_tls_listener(
                 let server = server.clone();
                 tokio::spawn(async move {
                     match acceptor.accept(stream).await {
-                        Ok(tls_stream) => serve_stream(tls_stream, peer, server, RequestScheme::Https).await,
+                        Ok(tls_stream) => {
+                            let client_cert = peer_certificate_pem(&tls_stream);
+                            serve_stream(tls_stream, peer, server, RequestScheme::Https, client_cert).await
+                        },
                         Err(error) => warn!(%error, "TLS handshake failed"),
                     }
                 });
@@ -2172,11 +2252,28 @@ fn spawn_connection(
     scheme: RequestScheme,
 ) {
     tokio::spawn(async move {
-        serve_stream(stream, peer, server, scheme).await;
+        serve_stream(stream, peer, server, scheme, None).await;
     });
 }
 
-async fn serve_stream<S>(stream: S, peer: SocketAddr, server: ProxyServer, scheme: RequestScheme)
+fn peer_certificate_pem<S>(stream: &TlsStream<S>) -> Option<String>
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+{
+    let cert = stream.get_ref().1.peer_certificates()?.first()?;
+    let encoded = base64::engine::general_purpose::STANDARD.encode(cert.as_ref());
+    Some(format!(
+        "-----BEGIN CERTIFICATE-----\\n{encoded}\\n-----END CERTIFICATE-----"
+    ))
+}
+
+async fn serve_stream<S>(
+    stream: S,
+    peer: SocketAddr,
+    server: ProxyServer,
+    scheme: RequestScheme,
+    client_cert_pem: Option<String>,
+)
 where
     S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
 {
@@ -2186,7 +2283,14 @@ where
     let service_server = server.clone();
     let service = service_fn(move |req| {
         let server = service_server.clone();
-        async move { Ok::<_, Infallible>(server.handle(req, Some(remote_ip), scheme).await) }
+        let client_cert_pem = client_cert_pem.clone();
+        async move {
+            Ok::<_, Infallible>(
+                server
+                    .handle(req, Some(remote_ip), scheme, client_cert_pem)
+                    .await,
+            )
+        }
     });
     let io = TokioIo::new(stream);
     let builder = AutoBuilder::new(TokioExecutor::new());
@@ -2587,6 +2691,74 @@ fn accepts_gzip(value: Option<&HeaderValue>) -> bool {
     value
         .and_then(|value| value.to_str().ok())
         .is_some_and(|value| value.split(',').any(|part| part.trim().starts_with("gzip")))
+}
+
+fn parse_digest_authorization(value: &str) -> HashMap<String, String> {
+    value
+        .split(',')
+        .filter_map(|part| {
+            let (key, value) = part.trim().split_once('=')?;
+            Some((
+                key.trim().to_ascii_lowercase(),
+                value.trim().trim_matches('"').to_string(),
+            ))
+        })
+        .collect()
+}
+
+fn digest_authorized(
+    method: &Method,
+    realm: &str,
+    users: &HashMap<String, String>,
+    params: &HashMap<String, String>,
+) -> bool {
+    let Some(username) = params.get("username") else {
+        return false;
+    };
+    let Some(password) = users.get(username) else {
+        return false;
+    };
+    if params.get("realm").is_some_and(|value| value != realm) {
+        return false;
+    }
+    let Some(nonce) = params.get("nonce") else {
+        return false;
+    };
+    let Some(uri) = params.get("uri") else {
+        return false;
+    };
+    let Some(response) = params.get("response") else {
+        return false;
+    };
+
+    let ha1 = sha256_hex(&format!("{username}:{realm}:{password}"));
+    let ha2 = sha256_hex(&format!("{}:{uri}", method.as_str()));
+    let expected = match (
+        params.get("qop"),
+        params.get("nc"),
+        params.get("cnonce"),
+    ) {
+        (Some(qop), Some(nc), Some(cnonce)) => {
+            sha256_hex(&format!("{ha1}:{nonce}:{nc}:{cnonce}:{qop}:{ha2}"))
+        }
+        _ => sha256_hex(&format!("{ha1}:{nonce}:{ha2}")),
+    };
+    constant_time_str_eq(&expected, response)
+}
+
+fn sha256_hex(value: &str) -> String {
+    let digest = Sha256::digest(value.as_bytes());
+    digest.iter().map(|byte| format!("{byte:02x}")).collect()
+}
+
+fn constant_time_str_eq(left: &str, right: &str) -> bool {
+    if left.len() != right.len() {
+        return false;
+    }
+    left.bytes()
+        .zip(right.bytes())
+        .fold(0_u8, |acc, (left, right)| acc | (left ^ right))
+        == 0
 }
 
 fn sticky_upstream(

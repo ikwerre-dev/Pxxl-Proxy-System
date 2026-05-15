@@ -12,16 +12,18 @@ This repository currently implements the Phase 1 MVP:
 - Local self-signed TLS certificate generation and reload for dynamic domains in `/data/certs`
 - In-memory per-domain IP blacklist and CIDR blocking
 - Per-IP token-bucket request rate limiting
-- Per-domain route rules for `www` aliases, WebSockets, headers, IP/location allow/block lists, CORS, HTTPS enforcement, WAF checks, body limits, and custom rate limits
+- Per-domain route rules for `www` aliases, WebSockets, headers, IP/location allow/block lists, CORS, HTTPS enforcement, WAF checks, body limits, custom rate limits, and reusable middleware chains
 - Offline GeoIP lookups for country/continent analytics, blocking, and location-based upstream routing
 - In-memory route analytics with aggregate counters, recent visit history, access-log APIs, and optional ClickHouse persistence
-- Active upstream health checks that mark unhealthy upstreams out of rotation
-- Round-robin, weighted round-robin, and IP-hash load-balancer selection
+- Active and passive upstream health checks that mark unhealthy upstreams out of rotation
+- Round-robin, weighted round-robin, IP-hash, least-connections, P2C, HRW, EWMA, and latency-aware load-balancer selection
+- Basic auth, SHA-256 digest auth, ForwardAuth, retries, circuit breakers, in-flight request limits, sticky cookie sessions, traffic mirroring, backup upstream failover, response compression, and content-type auto-detection
+- OpenTelemetry-compatible `traceparent` propagation plus richer Prometheus router, service, middleware, upstream, retry, mirror, and health metrics
 - Admin API auth with Redis-backed bearer tokens and optional admin IP allowlists
 - Prometheus metrics endpoint
 - Docker, Docker Compose, CI, docs, examples, and tests
 
-Future phases will add TCP/UDP proxying, production ACME flows, dashboard UI, circuit breakers, cluster sync, and deeper DDoS controls.
+The route schema also carries production TLS, ACME, TCP, UDP, and HTTP/3 options so the control plane can be shaped now while the listener implementations continue to mature.
 
 ## Quick Start
 
@@ -195,6 +197,88 @@ path = "/"
 
 Statuses below `500` are considered healthy. Unhealthy upstreams are marked out of rotation until a later check succeeds.
 
+Passive health can also be enabled per route. It observes real upstream responses/errors, marks an upstream unhealthy after repeated failures, and active health checks can bring that upstream back.
+
+## Middleware, Services, And Advanced Routing
+
+Each path can reference reusable middleware names. A route defines the middleware objects and optional chains under `rules.middlewares` and `rules.middleware_chains`:
+
+```json
+{
+  "domain": "app.pxxlhost",
+  "algorithm": "p2c",
+  "paths": [
+    {
+      "prefix": "/",
+      "middlewares": ["secure-chain"],
+      "upstreams": [
+        { "url": "http://v1.internal:8080", "weight": 9 },
+        { "url": "http://v2.internal:8080", "weight": 1 },
+        { "url": "http://backup.internal:8080", "backup": true }
+      ]
+    }
+  ],
+  "rules": {
+    "middleware_chains": {
+      "secure-chain": ["auth", "retry", "compress"]
+    },
+    "middlewares": {
+      "auth": {
+        "basic_auth": {
+          "enabled": true,
+          "realm": "Pxxl",
+          "users": { "demo": "secret" }
+        }
+      },
+      "retry": {
+        "retry": {
+          "enabled": true,
+          "attempts": 3,
+          "backoff_ms": 100,
+          "retry_statuses": [502, 503, 504]
+        },
+        "circuit_breaker": {
+          "enabled": true,
+          "failure_threshold": 5,
+          "open_seconds": 30
+        },
+        "in_flight_limit": {
+          "enabled": true,
+          "max": 100,
+          "scope": "route"
+        }
+      },
+      "compress": {
+        "compression": { "enabled": true, "min_bytes": 1024 },
+        "content_type_autodetect": { "enabled": true }
+      }
+    },
+    "sticky_sessions": {
+      "enabled": true,
+      "cookie_name": "pxxl_upstream",
+      "http_only": true
+    },
+    "passive_health": {
+      "enabled": true,
+      "failure_threshold": 3,
+      "recovery_seconds": 30,
+      "failure_statuses": [500, 502, 503, 504]
+    },
+    "traffic_mirroring": {
+      "enabled": true,
+      "percent": 10,
+      "upstreams": [
+        { "url": "http://shadow.internal:8080" }
+      ]
+    }
+  }
+}
+```
+
+ForwardAuth uses a configured auth URL and allows the request only when the auth service returns a `2xx`. Digest auth uses SHA-256 digest validation. Retry middleware can retry buffered requests on upstream errors or configured status codes. Circuit breakers stop sending traffic to an upstream for the configured open window. Sticky sessions store a stable upstream id in a cookie and backup upstreams are used only when primary upstreams are unavailable.
+
+`rules.services` supports reusable service definitions and weighted service targets in the API schema. Current HTTP routing still forwards from path, traffic-split, location-route, mirror, and backup upstream lists directly; service composition is represented for control-plane compatibility.
+
 ## Domain Rules
 
 API and TOML routes can include a `rules` object. These rules are enforced before traffic is forwarded upstream:
@@ -294,7 +378,49 @@ API and TOML routes can include a `rules` object. These rules are enforced befor
     "cors_allow_credentials": true,
     "cors_allowed_methods": ["GET", "POST", "OPTIONS"],
     "cors_allowed_headers": ["content-type", "authorization"],
-    "cors_preflight_enabled": true
+    "cors_preflight_enabled": true,
+    "request_buffering": {
+      "enabled": true,
+      "max_request_bytes": 16777216
+    },
+    "response_buffering": {
+      "enabled": true,
+      "max_response_bytes": 33554432
+    },
+    "compression": {
+      "enabled": true,
+      "min_bytes": 1024,
+      "content_types": ["text/plain", "application/json"]
+    },
+    "content_type_autodetect": { "enabled": true },
+    "retry": {
+      "enabled": true,
+      "attempts": 3,
+      "backoff_ms": 100,
+      "retry_statuses": [502, 503, 504]
+    },
+    "circuit_breaker": {
+      "enabled": true,
+      "failure_threshold": 5,
+      "open_seconds": 30
+    },
+    "in_flight_limit": {
+      "enabled": true,
+      "max": 100,
+      "scope": "route"
+    },
+    "sticky_sessions": {
+      "enabled": true,
+      "cookie_name": "pxxl_upstream",
+      "http_only": true
+    },
+    "traffic_mirroring": {
+      "enabled": true,
+      "percent": 5,
+      "upstreams": [
+        { "url": "http://shadow.internal:8080" }
+      ]
+    }
   }
 }
 ```
@@ -306,6 +432,8 @@ Defaults are permissive: if a field is missing, Pxxl keeps current proxy behavio
 Location rules use ISO-style country codes such as `US` or `NG` and continent codes such as `NA`, `AF`, and `EU`. Allow/block checks happen before upstream selection. `traffic_splits` are evaluated first for matching country/continent constraints, then `location_routes`; the selected upstream pool uses the domain's configured load-balancing algorithm.
 
 WAF checks are substring-pattern based and intentionally lightweight: path traversal, common SQLi/XSS markers, known scanner user agents, and custom user-agent/path/query patterns.
+
+Protocol-oriented options are accepted in the route schema under `rules.tls_options`, `rules.acme`, `rules.tcp`, `rules.udp`, and `rules.http3`. Today the production runtime is still HTTP/HTTPS reverse proxying; these fields are present so configs and API clients can be built against the intended Traefik-style shape while ACME, TCP, UDP, and HTTP/3 listeners are completed.
 
 ## Local Wildcard Development
 
