@@ -11,9 +11,11 @@ flowchart LR
   Router --> LB["Load Balancer"]
   LB --> Upstream["Container or Service Upstream"]
   Docker["Docker Socket Poller"] --> Router
-  Admin["Admin API"] --> Router
+  Health["Active Health Checks"] --> Router
+  Admin["Authenticated Admin API"] --> Router
   Admin --> Security
   Edge --> Analytics["In-Memory Route Analytics"]
+  Analytics --> ClickHouse["ClickHouse pxxl_access_logs"]
   Edge --> Metrics["Prometheus Metrics"]
 ```
 
@@ -27,12 +29,13 @@ The request hot path is:
 4. Check in-memory blacklist and rate limiter.
 5. Resolve location from the offline GeoIP CIDR table.
 6. Match route from the atomic route registry.
-7. Enforce domain rules, including IP and location allow/block lists.
-8. Select a healthy upstream, using location-specific upstreams when a rule matches.
-9. Stream the request and response with Hyper.
-10. Emit structured logs, Prometheus metrics, aggregate route stats, and recent visit records.
+7. Enforce domain rules, including IP/location allow/block lists, WAF checks, and rate limits.
+8. Pick a traffic-split or location-specific upstream pool when rules match.
+9. Select a healthy upstream.
+10. Stream the request and response with Hyper.
+11. Emit structured logs, Prometheus metrics, aggregate route stats, recent visit records, and queued ClickHouse analytics events.
 
-No database, internet GeoIP API, Redis lookup, or Docker socket access is required to forward a request.
+No database, internet GeoIP API, Redis lookup, ClickHouse write, health-check probe, or Docker socket access is required to forward a request.
 
 ## Control Plane
 
@@ -40,8 +43,12 @@ No database, internet GeoIP API, Redis lookup, or Docker socket access is requir
 - Docker discovery polls `/var/run/docker.sock` and replaces Docker-sourced routes atomically.
 - Podman discovery can poll a Podman-compatible socket and map labels into the same route model.
 - Admin API mutates in-memory blacklist state and exposes operational views.
+- Admin API can require bearer tokens stored in Redis and optional client IP allowlists.
 - API-created routes are persisted in Redis and loaded into the in-memory registry.
 - Offline GeoIP records load from `config/geoip/geoip.csv` at startup.
+- ClickHouse analytics writer consumes a best-effort queue and creates `pxxl_access_logs`.
+- TLS reloader regenerates the local certificate when route domains change.
+- Health checker periodically updates upstream `healthy` flags from HTTP probes.
 - Redis sync is prepared for blacklist pub/sub propagation across nodes.
 
 ## Crate Boundaries
@@ -58,4 +65,4 @@ No database, internet GeoIP API, Redis lookup, or Docker socket access is requir
 - `metrics`: Prometheus registry
 - `api`: admin and metrics HTTP endpoints
 - `redis-sync`: blacklist pub/sub hooks
-- `storage`: Postgres and ClickHouse boundary types
+- `storage`: ClickHouse analytics writer and storage boundary types
