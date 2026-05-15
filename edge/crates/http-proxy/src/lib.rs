@@ -1225,7 +1225,8 @@ impl ProxyServer {
         self.policy
             .apply_request_rules(req.headers_mut(), &matched.route.rules);
         if middleware.content_type_autodetect.enabled {
-            apply_request_content_type_detection(req.headers_mut(), req.uri(), None);
+            let uri = req.uri().clone();
+            apply_request_content_type_detection(req.headers_mut(), &uri, None);
         }
 
         let max_request_bytes = request_body_limit(&matched.route.rules, &middleware);
