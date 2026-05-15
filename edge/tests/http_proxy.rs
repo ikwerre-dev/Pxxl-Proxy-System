@@ -8,15 +8,16 @@ use hyper_util::{
     server::conn::auto::Builder as AutoBuilder,
 };
 use pxxl_common::{
-    BasicAuthConfig, CompressionConfig, DomainRateLimit, DomainRules, DomainWafRules,
-    LocationRouteRule, MiddlewareDefinition, PathRoute, RetryConfig, Route, RouteSource,
-    StickySessionConfig, TrafficSplitRule, Upstream,
+    BasicAuthConfig, CompressionConfig, DigestAuthConfig, DomainRateLimit, DomainRules,
+    DomainWafRules, LocationRouteRule, MiddlewareDefinition, PathRoute, RetryConfig, Route,
+    RouteSource, StickySessionConfig, TrafficSplitRule, Upstream,
 };
 use pxxl_core::{EdgeState, RouteRegistry};
 use pxxl_ddos::{BlacklistEngine, RateLimitConfig, RateLimiter, SecurityEngine};
 use pxxl_http_proxy::run_http_proxy_on_listener;
 use pxxl_load_balancer::LoadBalancer;
 use pxxl_metrics::PxxlMetrics;
+use sha2::{Digest, Sha256};
 use std::{
     collections::HashMap,
     convert::Infallible,
@@ -129,6 +130,47 @@ async fn assigns_request_id_to_response_upstream_and_analytics() {
 }
 
 #[tokio::test]
+async fn strips_hop_by_hop_response_headers() {
+    let upstream_addr = spawn_hop_by_hop_upstream().await;
+    let proxy_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let proxy_addr = proxy_listener.local_addr().unwrap();
+    let (shutdown_tx, shutdown_rx) = watch::channel(false);
+
+    let route = Route::new(
+        "headers.pxxlhost",
+        vec![PathRoute::new(
+            "/",
+            vec![Upstream::new(format!("http://{upstream_addr}"))],
+        )],
+        RouteSource::Static,
+    );
+    let state = test_state(vec![route]);
+    let server = tokio::spawn(run_http_proxy_on_listener(
+        proxy_listener,
+        state,
+        shutdown_rx,
+    ));
+
+    let client: Client<HttpConnector, Empty<Bytes>> =
+        Client::builder(TokioExecutor::new()).build_http();
+    let req = Request::builder()
+        .method("GET")
+        .uri(format!("http://{proxy_addr}/"))
+        .header("host", "headers.pxxlhost")
+        .body(Empty::<Bytes>::new())
+        .unwrap();
+
+    let response = client.request(req).await.unwrap();
+    let headers = response.headers().clone();
+
+    shutdown_tx.send(true).unwrap();
+    server.await.unwrap().unwrap();
+
+    assert!(headers.get("connection").is_none());
+    assert!(headers.get("x-hop-secret").is_none());
+}
+
+#[tokio::test]
 async fn rejects_websocket_when_domain_rule_disables_it() {
     let upstream_addr = spawn_upstream("should not proxy").await;
     let proxy_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -226,6 +268,67 @@ async fn enforces_domain_rate_limit_rule() {
     server.await.unwrap().unwrap();
 
     assert_eq!(first_status, StatusCode::OK);
+    assert_eq!(second_status, StatusCode::TOO_MANY_REQUESTS);
+}
+
+#[tokio::test]
+async fn domain_rate_limit_applies_to_cors_preflight() {
+    let upstream_addr = spawn_upstream("limited").await;
+    let proxy_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let proxy_addr = proxy_listener.local_addr().unwrap();
+    let (shutdown_tx, shutdown_rx) = watch::channel(false);
+
+    let mut route = Route::new(
+        "cors-limit.pxxlhost",
+        vec![PathRoute::new(
+            "/",
+            vec![Upstream::new(format!("http://{upstream_addr}"))],
+        )],
+        RouteSource::Static,
+    );
+    route.rules = DomainRules {
+        cors_allowed_origins: vec!["https://example.test".to_string()],
+        cors_allowed_methods: vec!["GET".to_string()],
+        rate_limit: Some(DomainRateLimit {
+            requests_per_second: Some(1),
+            burst: 1,
+            ..DomainRateLimit::default()
+        }),
+        ..DomainRules::default()
+    };
+    let state = test_state(vec![route]);
+    let server = tokio::spawn(run_http_proxy_on_listener(
+        proxy_listener,
+        state,
+        shutdown_rx,
+    ));
+
+    let client: Client<HttpConnector, Empty<Bytes>> =
+        Client::builder(TokioExecutor::new()).build_http();
+    let first = Request::builder()
+        .method("OPTIONS")
+        .uri(format!("http://{proxy_addr}/"))
+        .header("host", "cors-limit.pxxlhost")
+        .header("origin", "https://example.test")
+        .header("access-control-request-method", "GET")
+        .body(Empty::<Bytes>::new())
+        .unwrap();
+    let second = Request::builder()
+        .method("OPTIONS")
+        .uri(format!("http://{proxy_addr}/"))
+        .header("host", "cors-limit.pxxlhost")
+        .header("origin", "https://example.test")
+        .header("access-control-request-method", "GET")
+        .body(Empty::<Bytes>::new())
+        .unwrap();
+
+    let first_status = client.request(first).await.unwrap().status();
+    let second_status = client.request(second).await.unwrap().status();
+
+    shutdown_tx.send(true).unwrap();
+    server.await.unwrap().unwrap();
+
+    assert_eq!(first_status, StatusCode::NO_CONTENT);
     assert_eq!(second_status, StatusCode::TOO_MANY_REQUESTS);
 }
 
@@ -500,6 +603,91 @@ async fn executes_basic_auth_middleware_by_path() {
 }
 
 #[tokio::test]
+async fn digest_auth_rejects_uri_mismatch_and_replay() {
+    let upstream_addr = spawn_upstream("secret").await;
+    let proxy_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let proxy_addr = proxy_listener.local_addr().unwrap();
+    let (shutdown_tx, shutdown_rx) = watch::channel(false);
+
+    let mut path = PathRoute::new("/", vec![Upstream::new(format!("http://{upstream_addr}"))]);
+    path.middlewares = vec!["digest".to_string()];
+    let mut route = Route::new("digest.pxxlhost", vec![path], RouteSource::Static);
+    route.rules.middlewares.insert(
+        "digest".to_string(),
+        MiddlewareDefinition {
+            digest_auth: Some(DigestAuthConfig {
+                enabled: true,
+                users: HashMap::from([("robin".to_string(), "pxxl".to_string())]),
+                ..DigestAuthConfig::default()
+            }),
+            ..MiddlewareDefinition::default()
+        },
+    );
+    let state = test_state(vec![route]);
+    let server = tokio::spawn(run_http_proxy_on_listener(
+        proxy_listener,
+        state,
+        shutdown_rx,
+    ));
+    let client: Client<HttpConnector, Empty<Bytes>> =
+        Client::builder(TokioExecutor::new()).build_http();
+
+    let challenge = Request::builder()
+        .method("GET")
+        .uri(format!("http://{proxy_addr}/"))
+        .header("host", "digest.pxxlhost")
+        .body(Empty::<Bytes>::new())
+        .unwrap();
+    let challenge_response = client.request(challenge).await.unwrap();
+    let nonce = digest_nonce_from_header(
+        challenge_response
+            .headers()
+            .get("www-authenticate")
+            .unwrap()
+            .to_str()
+            .unwrap(),
+    );
+
+    let mismatched_authorization =
+        digest_authorization("robin", "pxxl", "Pxxl", &nonce, "/", "abc123", "00000001");
+    let mismatch = Request::builder()
+        .method("GET")
+        .uri(format!("http://{proxy_addr}/other"))
+        .header("host", "digest.pxxlhost")
+        .header("authorization", mismatched_authorization)
+        .body(Empty::<Bytes>::new())
+        .unwrap();
+    let mismatch_status = client.request(mismatch).await.unwrap().status();
+
+    let authorization =
+        digest_authorization("robin", "pxxl", "Pxxl", &nonce, "/", "def456", "00000002");
+    let authorized = Request::builder()
+        .method("GET")
+        .uri(format!("http://{proxy_addr}/"))
+        .header("host", "digest.pxxlhost")
+        .header("authorization", authorization.clone())
+        .body(Empty::<Bytes>::new())
+        .unwrap();
+    let replay = Request::builder()
+        .method("GET")
+        .uri(format!("http://{proxy_addr}/"))
+        .header("host", "digest.pxxlhost")
+        .header("authorization", authorization)
+        .body(Empty::<Bytes>::new())
+        .unwrap();
+
+    let authorized_status = client.request(authorized).await.unwrap().status();
+    let replay_status = client.request(replay).await.unwrap().status();
+
+    shutdown_tx.send(true).unwrap();
+    server.await.unwrap().unwrap();
+
+    assert_eq!(mismatch_status, StatusCode::UNAUTHORIZED);
+    assert_eq!(authorized_status, StatusCode::OK);
+    assert_eq!(replay_status, StatusCode::UNAUTHORIZED);
+}
+
+#[tokio::test]
 async fn retry_middleware_retries_retryable_statuses() {
     let upstream_addr = spawn_flaky_upstream().await;
     let proxy_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -726,6 +914,34 @@ async fn spawn_request_id_echo_upstream() -> SocketAddr {
     addr
 }
 
+async fn spawn_hop_by_hop_upstream() -> SocketAddr {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+
+    tokio::spawn(async move {
+        loop {
+            let (stream, _) = listener.accept().await.unwrap();
+            tokio::spawn(async move {
+                let service = service_fn(move |_req| async move {
+                    Ok::<_, Infallible>(
+                        Response::builder()
+                            .header("connection", "x-hop-secret")
+                            .header("x-hop-secret", "do-not-forward")
+                            .header("transfer-encoding", "chunked")
+                            .body(Full::new(Bytes::from_static(b"headers")))
+                            .unwrap(),
+                    )
+                });
+                let io = TokioIo::new(stream);
+                let builder = AutoBuilder::new(TokioExecutor::new());
+                let _ = builder.serve_connection_with_upgrades(io, service).await;
+            });
+        }
+    });
+
+    addr
+}
+
 async fn spawn_upstream_with_content_type(
     content_type: &'static str,
     body: &'static str,
@@ -753,6 +969,38 @@ async fn spawn_upstream_with_content_type(
     });
 
     addr
+}
+
+fn digest_nonce_from_header(value: &str) -> String {
+    value
+        .split(',')
+        .find_map(|part| {
+            let (name, value) = part.trim().split_once('=')?;
+            (name.trim() == "nonce").then(|| value.trim().trim_matches('"').to_string())
+        })
+        .expect("digest challenge includes nonce")
+}
+
+fn digest_authorization(
+    username: &str,
+    password: &str,
+    realm: &str,
+    nonce: &str,
+    uri: &str,
+    cnonce: &str,
+    nc: &str,
+) -> String {
+    let ha1 = sha256_hex(&format!("{username}:{realm}:{password}"));
+    let ha2 = sha256_hex(&format!("GET:{uri}"));
+    let response = sha256_hex(&format!("{ha1}:{nonce}:{nc}:{cnonce}:auth:{ha2}"));
+    format!(
+        "Digest username=\"{username}\", realm=\"{realm}\", nonce=\"{nonce}\", uri=\"{uri}\", algorithm=SHA-256, qop=auth, nc={nc}, cnonce=\"{cnonce}\", response=\"{response}\""
+    )
+}
+
+fn sha256_hex(value: &str) -> String {
+    let digest = Sha256::digest(value.as_bytes());
+    digest.iter().map(|byte| format!("{byte:02x}")).collect()
 }
 
 async fn spawn_flaky_upstream() -> SocketAddr {

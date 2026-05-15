@@ -1,6 +1,6 @@
 use anyhow::Result;
 use futures_util::StreamExt;
-use pxxl_common::{normalize_domain, Route, RouteSource};
+use pxxl_common::{normalize_domain, Route, RouteSource, MAX_ROUTES_PER_SOURCE};
 use pxxl_ddos::{BlacklistCommand, BlacklistEngine};
 use redis::AsyncCommands;
 use serde::{Deserialize, Serialize};
@@ -9,7 +9,7 @@ use std::{
     sync::Arc,
     time::{SystemTime, UNIX_EPOCH},
 };
-use tracing::info;
+use tracing::{info, warn};
 use uuid::Uuid;
 
 #[derive(Debug, Clone)]
@@ -68,8 +68,16 @@ impl RedisRouteStore {
         let client = redis::Client::open(self.url.as_str())?;
         let mut connection = client.get_multiplexed_async_connection().await?;
         let values: Vec<String> = connection.hvals(&self.key).await?;
+        if values.len() > MAX_ROUTES_PER_SOURCE {
+            warn!(
+                count = values.len(),
+                max = MAX_ROUTES_PER_SOURCE,
+                "persisted Redis routes exceed quota; loading the first quota-sized set"
+            );
+        }
         values
             .into_iter()
+            .take(MAX_ROUTES_PER_SOURCE)
             .map(|value| {
                 let mut route: Route = serde_json::from_str(&value)?;
                 route.source = RouteSource::Api;

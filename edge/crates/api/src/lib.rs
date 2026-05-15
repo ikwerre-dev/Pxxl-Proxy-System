@@ -9,7 +9,7 @@ use hyper_util::{
 use ipnet::IpNet;
 use pxxl_common::{
     normalize_domain, normalize_path_prefix, DomainRules, LoadBalancingAlgorithm, PathRoute, Route,
-    RouteSource, Upstream, UpstreamTransport,
+    RouteSource, Upstream, UpstreamTransport, MAX_ROUTES_PER_SOURCE,
 };
 use pxxl_core::EdgeState;
 use pxxl_metrics::PxxlMetrics;
@@ -650,6 +650,22 @@ impl ApiServer {
             Ok(route) => route,
             Err(error) => return json_response(StatusCode::BAD_REQUEST, json!({"error": error})),
         };
+        let existing_api_routes = self
+            .state
+            .routes
+            .snapshot()
+            .into_iter()
+            .filter(|existing| existing.source == RouteSource::Api)
+            .collect::<Vec<_>>();
+        let route_exists = existing_api_routes
+            .iter()
+            .any(|existing| existing.domain == route.domain);
+        if !route_exists && existing_api_routes.len() >= MAX_ROUTES_PER_SOURCE {
+            return json_response(
+                StatusCode::PAYLOAD_TOO_LARGE,
+                json!({"error": format!("api route quota exceeded: max {MAX_ROUTES_PER_SOURCE}")}),
+            );
+        }
 
         if let Some(store) = &self.route_store {
             if let Err(error) = store.upsert_route(&route).await {

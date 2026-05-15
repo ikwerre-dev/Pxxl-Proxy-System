@@ -27,6 +27,22 @@ The route schema also carries production TLS, ACME, TCP, UDP, and HTTP/3 options
 
 ## Quick Start
 
+Install or update from this repository:
+
+```sh
+./install.sh
+./update.sh
+```
+
+From a fresh machine, the installer can clone the repo for you:
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/ikwerre-dev/Pxxl-Proxy-System/main/install.sh \
+  | PXXL_INSTALL_DIR="$HOME/pxxl-proxy-system" sh
+```
+
+The installer checks for Git, Docker, Docker Compose, OpenSSL, and a reachable Docker daemon. It creates a local `.env`, generates first-run secrets, prepares persistent `data/` folders, and starts the Compose stack.
+
 With Docker:
 
 ```sh
@@ -76,7 +92,13 @@ These folders are intentionally ignored by Git. Normal `docker compose restart`,
 
 ## Container Labels
 
-Pxxl Proxy discovers enabled Docker and Podman containers through their runtime sockets:
+Pxxl Proxy can discover enabled Docker and Podman containers through their runtime sockets. Runtime sockets are privileged, so the default Compose stack does not mount them. Enable label discovery only where that trust boundary is acceptable:
+
+```sh
+docker compose -f docker-compose.yml -f docker-compose.discovery.yml up -d --build
+```
+
+Then add labels to the target containers:
 
 ```yaml
 labels:
@@ -98,13 +120,19 @@ Enable each provider independently in `config/pxxl.toml`:
 
 ```toml
 [docker]
-enabled = true
+enabled = false
 socket_path = "/var/run/docker.sock"
 
 [podman]
-enabled = true
+enabled = false
 socket_path = "/var/run/podman/podman.sock"
 published_host = "host.docker.internal"
+```
+
+For Compose-based runtime discovery, prefer environment overrides instead of editing the base config:
+
+```sh
+PXXL_DOCKER_ENABLED=true docker compose -f docker-compose.yml -f docker-compose.discovery.yml up -d
 ```
 
 Containers with the same `pxxl.domain` and `pxxl.path` are merged into one route with multiple upstreams. Requests are load-balanced across those upstreams, so stopping one replica removes it from the route on the next discovery poll while traffic keeps flowing to the remaining replicas.

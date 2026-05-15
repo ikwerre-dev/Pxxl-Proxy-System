@@ -39,6 +39,7 @@ http = { workspace = true }
 http-body-util = { workspace = true }
 hyper = { workspace = true }
 hyper-util = { workspace = true }
+sha2 = { workspace = true }
 tempfile = { workspace = true }
 
 [[bench]]

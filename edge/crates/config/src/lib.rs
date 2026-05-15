@@ -193,7 +193,7 @@ impl Default for GeoIpConfig {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AdminConfig {
-    #[serde(default)]
+    #[serde(default = "default_true")]
     pub auth_enabled: bool,
     #[serde(default)]
     pub bootstrap_token: Option<String>,
@@ -206,7 +206,7 @@ pub struct AdminConfig {
 impl Default for AdminConfig {
     fn default() -> Self {
         Self {
-            auth_enabled: false,
+            auth_enabled: true,
             bootstrap_token: None,
             token_store_key: default_admin_token_store_key(),
             ip_allowlist: Vec::new(),

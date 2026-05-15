@@ -44,6 +44,14 @@ data/clickhouse
 
 Restarting or recreating containers keeps these folders. To reset local state, stop the stack and remove the specific folder you want to rebuild.
 
+Runtime socket discovery is disabled in the default Compose stack. To test Docker/Podman label discovery locally, opt in to the discovery override:
+
+```sh
+PXXL_DOCKER_ENABLED=true docker compose -f docker-compose.yml -f docker-compose.discovery.yml up -d --build
+```
+
+Only enable that override on machines where mounting Docker/Podman sockets into the edge container is acceptable.
+
 For wildcard DNS, configure dnsmasq:
 
 ```txt

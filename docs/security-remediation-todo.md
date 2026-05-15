@@ -2,6 +2,7 @@
 
 Date: 2026-05-15
 Source audit: `docs/security-audit.md`
+Latest CVE pass: `docs/cve-findings.md`
 
 This tracks the remediation pass against each PXSA finding. "Fixed" means code/config/docs were changed in this pass. "Mitigated" means the dangerous default or active exploit path is closed, while larger product work remains tracked.
 
@@ -22,6 +23,13 @@ This tracks the remediation pass against each PXSA finding. "Fixed" means code/c
 | PXSA-2026-011: Docker/Podman Socket Discovery Expands the Trust Boundary | Mitigated | Docker/Podman route labels now go through dynamic route validation, Docker API socket responses are size-capped, malformed chunked socket responses are bounded, and the runtime container runs with dropped capabilities, no-new-privileges, read-only root filesystem, and resource limits in Compose. A least-privilege discovery sidecar and domain/network allowlists remain future hardening. |
 | PXSA-2026-012: Analytics and ClickHouse Error Handling Need Privacy and Size Hardening | Fixed | ClickHouse error bodies are read with a 16 KiB cap, ClickHouse host ports are no longer published by Compose, and docs now call out access-log privacy. |
 | PXSA-2026-013: Docs Understate Runtime Body Limit Behavior | Fixed | Updated API and dynamic-routing docs to say `max_body_bytes` pre-checks `Content-Length` and also caps collected streaming/chunked bodies. |
+| CVE-FIND-2026-001: Digest Auth Replay and URI Confusion | Fixed | Added signed expiring digest nonces, `qop=auth` enforcement, nonce-count/client-nonce validation, canonical URI binding, replay tracking, and integration tests. |
+| CVE-FIND-2026-002: Upstream Response Hop-by-Hop Headers Are Forwarded | Fixed | Added response-side hop-by-hop and `Connection` nominated header stripping in both buffered and streaming response paths, with regression coverage. |
+| CVE-FIND-2026-003: Request and Response Bodies Are Always Buffered | Fixed | Added bounded streaming forwarding as the default path and kept buffering only for features that need replay or body inspection. |
+| CVE-FIND-2026-004: Missing Config Falls Back to Unsafe Defaults | Fixed | Startup now fails closed on a missing config unless `PXXL_ALLOW_DEFAULT_CONFIG=true`; admin/metrics defaults are loopback-only and admin auth defaults on. |
+| CVE-FIND-2026-005: Docker/Podman Socket Mounts Are Privileged Trust Boundaries | Fixed by default | Removed default runtime socket mounts from Compose, disabled discovery by default, added explicit discovery override compose file and env toggles. |
+| CVE-FIND-2026-006: CORS Preflight Bypasses Domain Rate Limits | Fixed | Moved per-domain rate-limit enforcement before successful CORS preflight responses and added a regression test. |
+| CVE-FIND-2026-007: Route and Upstream Counts Have No Quotas | Fixed | Added route/path/upstream/mirror quotas for API, Redis, and Docker/Podman label sources. |
 
 ## Additional Hardening Completed
 

@@ -1,0 +1,11 @@
+services:
+  edge:
+    environment:
+      PXXL_DOCKER_ENABLED: ${PXXL_DOCKER_ENABLED:-true}
+      PXXL_DOCKER_SOCKET_PATH: /var/run/docker.sock
+      PXXL_PODMAN_ENABLED: ${PXXL_PODMAN_ENABLED:-false}
+      PXXL_PODMAN_SOCKET_PATH: /var/run/podman/podman.sock
+      PXXL_PODMAN_PUBLISHED_HOST: ${PXXL_PODMAN_PUBLISHED_HOST:-host.docker.internal}
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+      - ${PODMAN_SOCKET_PATH:-/var/run/podman/podman.sock}:/var/run/podman/podman.sock:ro

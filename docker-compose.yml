@@ -12,6 +12,8 @@ services:
       PXXL_METRICS_ADDR: 0.0.0.0:9090
       PXXL_ADMIN_BOOTSTRAP_TOKEN: ${PXXL_ADMIN_BOOTSTRAP_TOKEN:-}
       PXXL_ADMIN_IP_ALLOWLIST: ${PXXL_ADMIN_IP_ALLOWLIST:-}
+      PXXL_DOCKER_ENABLED: ${PXXL_DOCKER_ENABLED:-false}
+      PXXL_PODMAN_ENABLED: ${PXXL_PODMAN_ENABLED:-false}
       RUST_LOG: pxxl_edge=info,pxxl=info
     ports:
       - "80:80"
@@ -21,8 +23,6 @@ services:
     volumes:
       - ./config:/app/config:ro
       - ./data:/data
-      - /var/run/docker.sock:/var/run/docker.sock:ro
-      - ${PODMAN_SOCKET_PATH:-/var/run/podman/podman.sock}:/var/run/podman/podman.sock:ro
     read_only: true
     tmpfs:
       - /tmp
@@ -99,6 +99,8 @@ services:
   promtail:
     image: grafana/promtail:3.2.0
     container_name: pxxl-proxy-promtail
+    profiles:
+      - runtime-discovery
     restart: unless-stopped
     command: -config.file=/etc/promtail/config.yml
     volumes:

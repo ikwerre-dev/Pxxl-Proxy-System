@@ -1,6 +1,7 @@
 use anyhow::{bail, Context, Result};
 use pxxl_common::{
     normalize_domain, normalize_path_prefix, PathRoute, Route, RouteSource, Upstream,
+    MAX_PATHS_PER_ROUTE, MAX_ROUTES_PER_SOURCE, MAX_UPSTREAMS_PER_ROUTE,
 };
 use pxxl_core::EdgeState;
 use serde::{Deserialize, Deserializer};
@@ -306,17 +307,45 @@ fn routes_from_targets(
     let mut grouped: BTreeMap<String, BTreeMap<String, Vec<Upstream>>> = BTreeMap::new();
 
     for target in targets {
-        let upstreams = grouped
-            .entry(target.domain)
-            .or_default()
-            .entry(target.path)
-            .or_default();
+        let DockerRouteTarget {
+            domain,
+            path,
+            upstream,
+        } = target;
+        if !grouped.contains_key(&domain) && grouped.len() >= MAX_ROUTES_PER_SOURCE {
+            warn!(
+                provider = provider.label(),
+                max = MAX_ROUTES_PER_SOURCE,
+                "container route domain quota reached; ignoring additional domains"
+            );
+            continue;
+        }
+
+        let paths = grouped.entry(domain).or_default();
+        if !paths.contains_key(&path) && paths.len() >= MAX_PATHS_PER_ROUTE {
+            warn!(
+                provider = provider.label(),
+                max = MAX_PATHS_PER_ROUTE,
+                "container route path quota reached; ignoring additional paths"
+            );
+            continue;
+        }
+
+        let upstreams = paths.entry(path).or_default();
+        if upstreams.len() >= MAX_UPSTREAMS_PER_ROUTE {
+            warn!(
+                provider = provider.label(),
+                max = MAX_UPSTREAMS_PER_ROUTE,
+                "container route upstream quota reached; ignoring additional upstreams"
+            );
+            continue;
+        }
 
         if !upstreams
             .iter()
-            .any(|upstream| upstream.url == target.upstream.url)
+            .any(|existing| existing.url == upstream.url)
         {
-            upstreams.push(target.upstream);
+            upstreams.push(upstream);
         }
     }
 

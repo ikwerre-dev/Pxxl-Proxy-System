@@ -7,6 +7,11 @@ use uuid::Uuid;
 
 pub type DomainId = String;
 
+pub const MAX_ROUTES_PER_SOURCE: usize = 512;
+pub const MAX_PATHS_PER_ROUTE: usize = 64;
+pub const MAX_UPSTREAMS_PER_ROUTE: usize = 128;
+pub const MAX_MIRROR_UPSTREAMS_PER_ROUTE: usize = 16;
+
 #[derive(Debug, thiserror::Error)]
 pub enum PxxlError {
     #[error("route not found for host {host} and path {path}")]
@@ -36,8 +41,8 @@ impl Default for ListenerConfig {
         Self {
             http: "0.0.0.0:80".to_string(),
             https: "0.0.0.0:443".to_string(),
-            admin: "0.0.0.0:8081".to_string(),
-            metrics: "0.0.0.0:9090".to_string(),
+            admin: "127.0.0.1:8081".to_string(),
+            metrics: "127.0.0.1:9090".to_string(),
         }
     }
 }
@@ -859,10 +864,21 @@ impl Route {
         if self.paths.is_empty() {
             return Err("route needs at least one path".to_string());
         }
+        if self.paths.len() > MAX_PATHS_PER_ROUTE {
+            return Err(format!(
+                "route has too many paths: max {MAX_PATHS_PER_ROUTE}"
+            ));
+        }
         for path in &self.paths {
             validate_path_prefix(&path.prefix)?;
             if path.upstreams.is_empty() {
                 return Err(format!("path {} needs at least one upstream", path.prefix));
+            }
+            if path.upstreams.len() > MAX_UPSTREAMS_PER_ROUTE {
+                return Err(format!(
+                    "path {} has too many upstreams: max {MAX_UPSTREAMS_PER_ROUTE}",
+                    path.prefix
+                ));
             }
             for upstream in &path.upstreams {
                 validate_upstream(upstream)?;
@@ -1188,14 +1204,29 @@ fn validate_rules_for_runtime(rules: &DomainRules) -> std::result::Result<(), St
         return Err("HTTP/3 options are not enforced yet".to_string());
     }
     for route in &rules.location_routes {
+        if route.upstreams.len() > MAX_UPSTREAMS_PER_ROUTE {
+            return Err(format!(
+                "location route has too many upstreams: max {MAX_UPSTREAMS_PER_ROUTE}"
+            ));
+        }
         for upstream in &route.upstreams {
             validate_upstream(upstream)?;
         }
     }
     for split in &rules.traffic_splits {
+        if split.upstreams.len() > MAX_UPSTREAMS_PER_ROUTE {
+            return Err(format!(
+                "traffic split has too many upstreams: max {MAX_UPSTREAMS_PER_ROUTE}"
+            ));
+        }
         for upstream in &split.upstreams {
             validate_upstream(upstream)?;
         }
+    }
+    if rules.traffic_mirroring.upstreams.len() > MAX_MIRROR_UPSTREAMS_PER_ROUTE {
+        return Err(format!(
+            "traffic mirroring has too many upstreams: max {MAX_MIRROR_UPSTREAMS_PER_ROUTE}"
+        ));
     }
     for upstream in &rules.traffic_mirroring.upstreams {
         validate_upstream(upstream)?;
@@ -1384,6 +1415,20 @@ mod tests {
         assert!(validate_dynamic_upstream(&metadata).is_err());
         assert!(validate_dynamic_upstream(&redis).is_err());
         assert!(validate_dynamic_upstream(&external).is_ok());
+    }
+
+    #[test]
+    fn route_validation_rejects_excessive_upstream_fanout() {
+        let upstreams = (0..=MAX_UPSTREAMS_PER_ROUTE)
+            .map(|index| Upstream::new(format!("http://upstream-{index}.example.com:3000")))
+            .collect::<Vec<_>>();
+        let route = Route::new(
+            "fanout.example.com",
+            vec![PathRoute::new("/", upstreams)],
+            RouteSource::Api,
+        );
+
+        assert!(route.validate_for_dynamic_control_plane().is_err());
     }
 
     #[test]

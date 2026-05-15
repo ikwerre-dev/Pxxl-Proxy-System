@@ -10,12 +10,12 @@ cert_dir = "/data/certs"
 local_subject_alt_names = ["localhost", "pxxlhost", "*.pxxlhost"]
 
 [docker]
-enabled = true
+enabled = false
 socket_path = "/var/run/docker.sock"
 poll_seconds = 5
 
 [podman]
-enabled = true
+enabled = false
 socket_path = "/var/run/podman/podman.sock"
 published_host = "host.docker.internal"
 poll_seconds = 5

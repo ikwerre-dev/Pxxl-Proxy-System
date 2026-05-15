@@ -49,9 +49,13 @@ async fn main() -> Result<()> {
         PxxlConfig::load(&config_path)
             .await
             .with_context(|| format!("loading config from {config_path}"))?
-    } else {
-        warn!(%config_path, "config file not found, starting with defaults");
+    } else if env_flag("PXXL_ALLOW_DEFAULT_CONFIG") {
+        warn!(%config_path, "config file not found, using defaults because PXXL_ALLOW_DEFAULT_CONFIG is enabled");
         PxxlConfig::default()
+    } else {
+        anyhow::bail!(
+            "config file not found at {config_path}; set PXXL_CONFIG to a valid file or set PXXL_ALLOW_DEFAULT_CONFIG=true for local-only defaults"
+        );
     };
     apply_env_overrides(&mut config);
     ensure_production_safe_config(&config)?;
@@ -452,6 +456,21 @@ fn apply_env_overrides(config: &mut PxxlConfig) {
     if let Ok(value) = std::env::var("PXXL_CERT_DIR") {
         config.tls.cert_dir = value;
     }
+    if let Ok(value) = std::env::var("PXXL_DOCKER_ENABLED") {
+        config.docker.enabled = parse_bool(&value);
+    }
+    if let Ok(value) = std::env::var("PXXL_DOCKER_SOCKET_PATH") {
+        config.docker.socket_path = value;
+    }
+    if let Ok(value) = std::env::var("PXXL_PODMAN_ENABLED") {
+        config.podman.enabled = parse_bool(&value);
+    }
+    if let Ok(value) = std::env::var("PXXL_PODMAN_SOCKET_PATH") {
+        config.podman.socket_path = value;
+    }
+    if let Ok(value) = std::env::var("PXXL_PODMAN_PUBLISHED_HOST") {
+        config.podman.published_host = value;
+    }
     if let Ok(value) = std::env::var("PXXL_ERROR_PAGES_DIR") {
         config.error_pages.dir = value;
     }
@@ -536,6 +555,12 @@ fn parse_bool(value: &str) -> bool {
         value.trim().to_ascii_lowercase().as_str(),
         "1" | "true" | "yes" | "on"
     )
+}
+
+fn env_flag(name: &str) -> bool {
+    std::env::var(name)
+        .map(|value| parse_bool(&value))
+        .unwrap_or(false)
 }
 
 fn parse_addr(name: &str, value: &str) -> Result<SocketAddr> {
