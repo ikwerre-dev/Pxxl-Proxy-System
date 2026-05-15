@@ -12,10 +12,12 @@ pxxl-metrics = { path = "../metrics" }
 pxxl-tls = { path = "../tls" }
 anyhow = { workspace = true }
 bytes = { workspace = true }
+dashmap = { workspace = true }
 http = { workspace = true }
 http-body-util = { workspace = true }
 hyper = { workspace = true }
 hyper-util = { workspace = true }
+parking_lot = { workspace = true }
 rustls = { workspace = true }
 tokio = { workspace = true }
 tokio-rustls = { workspace = true }

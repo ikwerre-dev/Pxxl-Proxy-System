@@ -7,7 +7,7 @@ use hyper_util::{
     rt::{TokioExecutor, TokioIo},
     server::conn::auto::Builder as AutoBuilder,
 };
-use pxxl_common::{PathRoute, Route, RouteSource, Upstream};
+use pxxl_common::{DomainRateLimit, DomainRules, PathRoute, Route, RouteSource, Upstream};
 use pxxl_core::{EdgeState, RouteRegistry};
 use pxxl_ddos::{BlacklistEngine, RateLimitConfig, RateLimiter, SecurityEngine};
 use pxxl_http_proxy::run_http_proxy_on_listener;
@@ -56,6 +56,107 @@ async fn proxies_http_request_by_host() {
 
     assert_eq!(status, StatusCode::OK);
     assert_eq!(&body[..], b"hello from upstream");
+}
+
+#[tokio::test]
+async fn rejects_websocket_when_domain_rule_disables_it() {
+    let upstream_addr = spawn_upstream("should not proxy").await;
+    let proxy_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let proxy_addr = proxy_listener.local_addr().unwrap();
+    let (shutdown_tx, shutdown_rx) = watch::channel(false);
+
+    let mut route = Route::new(
+        "ws.pxxlhost",
+        vec![PathRoute::new(
+            "/",
+            vec![Upstream::new(format!("http://{upstream_addr}"))],
+        )],
+        RouteSource::Static,
+    );
+    route.rules = DomainRules {
+        allow_websocket: false,
+        ..DomainRules::default()
+    };
+    let state = test_state(vec![route]);
+    let server = tokio::spawn(run_http_proxy_on_listener(
+        proxy_listener,
+        state,
+        shutdown_rx,
+    ));
+
+    let client: Client<HttpConnector, Empty<Bytes>> =
+        Client::builder(TokioExecutor::new()).build_http();
+    let req = Request::builder()
+        .method("GET")
+        .uri(format!("http://{proxy_addr}/socket"))
+        .header("host", "ws.pxxlhost")
+        .header("connection", "Upgrade")
+        .header("upgrade", "websocket")
+        .body(Empty::<Bytes>::new())
+        .unwrap();
+
+    let response = client.request(req).await.unwrap();
+    let status = response.status();
+
+    shutdown_tx.send(true).unwrap();
+    server.await.unwrap().unwrap();
+
+    assert_eq!(status, StatusCode::FORBIDDEN);
+}
+
+#[tokio::test]
+async fn enforces_domain_rate_limit_rule() {
+    let upstream_addr = spawn_upstream("limited").await;
+    let proxy_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let proxy_addr = proxy_listener.local_addr().unwrap();
+    let (shutdown_tx, shutdown_rx) = watch::channel(false);
+
+    let mut route = Route::new(
+        "limited.pxxlhost",
+        vec![PathRoute::new(
+            "/",
+            vec![Upstream::new(format!("http://{upstream_addr}"))],
+        )],
+        RouteSource::Static,
+    );
+    route.rules = DomainRules {
+        rate_limit: Some(DomainRateLimit {
+            requests_per_second: Some(1),
+            burst: 1,
+            ..DomainRateLimit::default()
+        }),
+        ..DomainRules::default()
+    };
+    let state = test_state(vec![route]);
+    let server = tokio::spawn(run_http_proxy_on_listener(
+        proxy_listener,
+        state,
+        shutdown_rx,
+    ));
+
+    let client: Client<HttpConnector, Empty<Bytes>> =
+        Client::builder(TokioExecutor::new()).build_http();
+    let first = Request::builder()
+        .method("GET")
+        .uri(format!("http://{proxy_addr}/"))
+        .header("host", "limited.pxxlhost")
+        .body(Empty::<Bytes>::new())
+        .unwrap();
+    let second = Request::builder()
+        .method("GET")
+        .uri(format!("http://{proxy_addr}/"))
+        .header("host", "limited.pxxlhost")
+        .body(Empty::<Bytes>::new())
+        .unwrap();
+
+    let first_status = client.request(first).await.unwrap().status();
+    let second_status = client.request(second).await.unwrap().status();
+
+    shutdown_tx.send(true).unwrap();
+    server.await.unwrap().unwrap();
+
+    assert_eq!(first_status, StatusCode::OK);
+    assert_eq!(second_status, StatusCode::TOO_MANY_REQUESTS);
 }
 
 async fn spawn_upstream(body: &'static str) -> SocketAddr {

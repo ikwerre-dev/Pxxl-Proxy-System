@@ -1,8 +1,12 @@
 use anyhow::Context;
 use bytes::Bytes;
+use dashmap::DashMap;
 use http::{
-    header::{HeaderName, HeaderValue, CACHE_CONTROL, CONTENT_TYPE, HOST},
-    Request, Response, StatusCode, Uri,
+    header::{
+        HeaderMap, HeaderName, HeaderValue, ACCESS_CONTROL_REQUEST_METHOD, CACHE_CONTROL,
+        CONNECTION, CONTENT_LENGTH, CONTENT_TYPE, HOST, LOCATION, ORIGIN, UPGRADE, VARY,
+    },
+    Method, Request, Response, StatusCode, Uri,
 };
 use http_body_util::{BodyExt, Full};
 use hyper::{body::Incoming, service::service_fn};
@@ -11,7 +15,10 @@ use hyper_util::{
     rt::{TokioExecutor, TokioIo},
     server::conn::auto::Builder as AutoBuilder,
 };
-use pxxl_common::{normalize_domain, PxxlError, RouteMatch, Upstream};
+use parking_lot::Mutex;
+use pxxl_common::{
+    normalize_domain, DomainRateLimit, DomainRules, PxxlError, RateLimitScope, RouteMatch, Upstream,
+};
 use pxxl_core::EdgeState;
 use pxxl_ddos::SecurityDecision;
 use rustls::ServerConfig;
@@ -21,7 +28,7 @@ use std::{
     net::{IpAddr, SocketAddr},
     path::{Path, PathBuf},
     sync::Arc,
-    time::Instant,
+    time::{Duration, Instant},
 };
 use tokio::{
     io::{AsyncRead, AsyncWrite},
@@ -156,19 +163,444 @@ impl ErrorPageRenderer {
     }
 }
 
+#[derive(Clone, Debug, Default)]
+pub struct PolicyEnforcer {
+    rate_limiter: Arc<PolicyRateLimiter>,
+}
+
+#[derive(Debug, Default)]
+struct PolicyRateLimiter {
+    buckets: DashMap<PolicyRateKey, Mutex<PolicyRateBucket>>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct PolicyRateKey {
+    domain: String,
+    scope: RateLimitScope,
+    ip: Option<IpAddr>,
+    path: Option<String>,
+}
+
+#[derive(Debug)]
+struct PolicyRateBucket {
+    tokens: f64,
+    last_refill: Instant,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RequestScheme {
+    Http,
+    Https,
+}
+
+impl RequestScheme {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Http => "http",
+            Self::Https => "https",
+        }
+    }
+}
+
+#[derive(Debug)]
+struct PolicyRejection {
+    status: StatusCode,
+    message: &'static str,
+    metric_reason: &'static str,
+    retry_after: Option<Duration>,
+    location: Option<String>,
+}
+
+impl PolicyEnforcer {
+    fn evaluate(
+        &self,
+        req: &Request<Incoming>,
+        rules: &DomainRules,
+        domain: &str,
+        path: &str,
+        remote_ip: Option<IpAddr>,
+        scheme: RequestScheme,
+    ) -> Option<PolicyRejection> {
+        if rules.maintenance_mode {
+            return Some(policy_rejection(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "domain is in maintenance mode",
+                "maintenance_mode",
+            ));
+        }
+
+        if scheme == RequestScheme::Http && rules.redirect_http_to_https {
+            return Some(PolicyRejection {
+                status: StatusCode::PERMANENT_REDIRECT,
+                message: "https required",
+                metric_reason: "https_redirect",
+                retry_after: None,
+                location: Some(format!("https://{domain}{path}")),
+            });
+        }
+
+        if scheme == RequestScheme::Http && rules.require_https {
+            return Some(policy_rejection(
+                StatusCode::UPGRADE_REQUIRED,
+                "https is required for this domain",
+                "https_required",
+            ));
+        }
+
+        if let Some(ip) = remote_ip {
+            if !rules.ip_allowlist.is_empty()
+                && !rules
+                    .ip_allowlist
+                    .iter()
+                    .any(|network| network.contains(&ip))
+            {
+                return Some(policy_rejection(
+                    StatusCode::FORBIDDEN,
+                    "ip is not allowed for this domain",
+                    "ip_not_allowlisted",
+                ));
+            }
+
+            if rules
+                .ip_blocklist
+                .iter()
+                .any(|network| network.contains(&ip))
+            {
+                return Some(policy_rejection(
+                    StatusCode::FORBIDDEN,
+                    "ip is blocked for this domain",
+                    "ip_blocklisted",
+                ));
+            }
+        }
+
+        if rules
+            .blocked_methods
+            .iter()
+            .any(|method| method.eq_ignore_ascii_case(req.method().as_str()))
+        {
+            return Some(policy_rejection(
+                StatusCode::METHOD_NOT_ALLOWED,
+                "method is blocked for this domain",
+                "method_blocked",
+            ));
+        }
+
+        if !rules.allowed_methods.is_empty()
+            && !rules
+                .allowed_methods
+                .iter()
+                .any(|method| method.eq_ignore_ascii_case(req.method().as_str()))
+        {
+            return Some(policy_rejection(
+                StatusCode::METHOD_NOT_ALLOWED,
+                "method is not allowed for this domain",
+                "method_not_allowed",
+            ));
+        }
+
+        if !rules.allow_websocket && is_websocket_upgrade(req.headers()) {
+            return Some(policy_rejection(
+                StatusCode::FORBIDDEN,
+                "websocket upgrades are disabled for this domain",
+                "websocket_disabled",
+            ));
+        }
+
+        if let Some(limit) = rules.max_uri_length {
+            if req.uri().to_string().len() > limit {
+                return Some(policy_rejection(
+                    StatusCode::URI_TOO_LONG,
+                    "request uri is too long",
+                    "uri_too_long",
+                ));
+            }
+        }
+
+        if let Some(limit) = rules.max_body_bytes {
+            if content_length(req.headers()).is_some_and(|length| length > limit) {
+                return Some(policy_rejection(
+                    StatusCode::PAYLOAD_TOO_LARGE,
+                    "request body is too large",
+                    "body_too_large",
+                ));
+            }
+        }
+
+        if !rules.allowed_content_types.is_empty() && request_can_have_body(req.method()) {
+            match req
+                .headers()
+                .get(CONTENT_TYPE)
+                .and_then(|value| value.to_str().ok())
+            {
+                Some(content_type)
+                    if rules
+                        .allowed_content_types
+                        .iter()
+                        .any(|allowed| content_type_matches(content_type, allowed)) => {}
+                _ => {
+                    return Some(policy_rejection(
+                        StatusCode::UNSUPPORTED_MEDIA_TYPE,
+                        "content-type is not allowed for this domain",
+                        "content_type_not_allowed",
+                    ));
+                }
+            }
+        }
+
+        for blocked in &rules.blocked_headers {
+            if header_present(req.headers(), blocked) {
+                return Some(policy_rejection(
+                    StatusCode::FORBIDDEN,
+                    "request contains a blocked header",
+                    "header_blocked",
+                ));
+            }
+        }
+
+        if !rules.allowed_headers.is_empty() {
+            for name in req.headers().keys() {
+                if !rules
+                    .allowed_headers
+                    .iter()
+                    .any(|allowed| allowed.eq_ignore_ascii_case(name.as_str()))
+                {
+                    return Some(policy_rejection(
+                        StatusCode::FORBIDDEN,
+                        "request contains a header that is not allowed",
+                        "header_not_allowed",
+                    ));
+                }
+            }
+        }
+
+        for required in &rules.required_headers {
+            let Some(value) = header_value(req.headers(), &required.name) else {
+                return Some(policy_rejection(
+                    StatusCode::BAD_REQUEST,
+                    "request is missing a required header",
+                    "header_required",
+                ));
+            };
+
+            if required
+                .value
+                .as_ref()
+                .is_some_and(|expected| expected != value)
+            {
+                return Some(policy_rejection(
+                    StatusCode::BAD_REQUEST,
+                    "request header has an invalid value",
+                    "header_required_value",
+                ));
+            }
+        }
+
+        if is_cors_preflight(req, rules) {
+            return Some(PolicyRejection {
+                status: StatusCode::NO_CONTENT,
+                message: "cors preflight accepted",
+                metric_reason: "cors_preflight",
+                retry_after: None,
+                location: None,
+            });
+        }
+
+        if let Some(limit) = rules.rate_limit.as_ref() {
+            if let Some(retry_after) = self
+                .rate_limiter
+                .retry_after(limit, domain, path, remote_ip)
+            {
+                return Some(PolicyRejection {
+                    status: StatusCode::from_u16(limit.status_code)
+                        .unwrap_or(StatusCode::TOO_MANY_REQUESTS),
+                    message: "rate limited by domain rules",
+                    metric_reason: "domain_rate_limited",
+                    retry_after: Some(retry_after),
+                    location: None,
+                });
+            }
+        }
+
+        None
+    }
+
+    fn apply_request_rules(&self, headers: &mut HeaderMap, rules: &DomainRules) {
+        for header in &rules.strip_request_headers {
+            if let Ok(name) = HeaderName::from_bytes(header.as_bytes()) {
+                headers.remove(name);
+            }
+        }
+
+        for (name, value) in &rules.add_request_headers {
+            if let (Ok(name), Ok(value)) = (
+                HeaderName::from_bytes(name.as_bytes()),
+                HeaderValue::from_str(value),
+            ) {
+                headers.insert(name, value);
+            }
+        }
+    }
+
+    fn apply_response_rules(
+        &self,
+        headers: &mut HeaderMap,
+        rules: &DomainRules,
+        request_origin: Option<&HeaderValue>,
+    ) {
+        if rules.add_security_headers {
+            insert_static_header(headers, "x-frame-options", "DENY");
+            insert_static_header(headers, "x-content-type-options", "nosniff");
+            insert_static_header(headers, "referrer-policy", "no-referrer");
+            insert_static_header(
+                headers,
+                "permissions-policy",
+                "camera=(), microphone=(), geolocation=()",
+            );
+        }
+
+        for (name, value) in &rules.response_headers {
+            if let (Ok(name), Ok(value)) = (
+                HeaderName::from_bytes(name.as_bytes()),
+                HeaderValue::from_str(value),
+            ) {
+                headers.insert(name, value);
+            }
+        }
+
+        if let Some(origin) = request_origin {
+            if cors_origin_allowed(origin, &rules.cors_allowed_origins) {
+                headers.insert("access-control-allow-origin", origin.clone());
+                headers.insert(VARY, HeaderValue::from_static("origin"));
+
+                if rules.cors_allow_credentials {
+                    headers.insert(
+                        "access-control-allow-credentials",
+                        HeaderValue::from_static("true"),
+                    );
+                }
+
+                if !rules.cors_allowed_methods.is_empty() {
+                    if let Ok(value) = HeaderValue::from_str(&rules.cors_allowed_methods.join(", "))
+                    {
+                        headers.insert("access-control-allow-methods", value);
+                    }
+                }
+
+                if !rules.cors_allowed_headers.is_empty() {
+                    if let Ok(value) = HeaderValue::from_str(&rules.cors_allowed_headers.join(", "))
+                    {
+                        headers.insert("access-control-allow-headers", value);
+                    }
+                }
+            }
+        } else if rules
+            .cors_allowed_origins
+            .iter()
+            .any(|origin| origin == "*")
+        {
+            headers.insert("access-control-allow-origin", HeaderValue::from_static("*"));
+        }
+    }
+}
+
+impl PolicyRateLimiter {
+    fn retry_after(
+        &self,
+        limit: &DomainRateLimit,
+        domain: &str,
+        path: &str,
+        remote_ip: Option<IpAddr>,
+    ) -> Option<Duration> {
+        if !limit.enabled {
+            return None;
+        }
+
+        let rate = effective_rate_per_second(limit)?;
+        let burst = limit.burst.max(1) as f64;
+        let key = PolicyRateKey::new(domain, path, remote_ip, &limit.scope);
+        let entry = self.buckets.entry(key).or_insert_with(|| {
+            Mutex::new(PolicyRateBucket {
+                tokens: burst,
+                last_refill: Instant::now(),
+            })
+        });
+
+        let mut bucket = entry.lock();
+        let now = Instant::now();
+        let elapsed = now.duration_since(bucket.last_refill).as_secs_f64();
+        let refill = elapsed * rate;
+
+        if refill > 0.0 {
+            bucket.tokens = (bucket.tokens + refill).min(burst);
+            bucket.last_refill = now;
+        }
+
+        if bucket.tokens >= 1.0 {
+            bucket.tokens -= 1.0;
+            None
+        } else {
+            Some(
+                limit
+                    .retry_after_seconds
+                    .map(Duration::from_secs)
+                    .unwrap_or_else(|| Duration::from_secs_f64(1.0 / rate.max(0.001))),
+            )
+        }
+    }
+}
+
+impl PolicyRateKey {
+    fn new(domain: &str, path: &str, remote_ip: Option<IpAddr>, scope: &RateLimitScope) -> Self {
+        match scope {
+            RateLimitScope::PerIp => Self {
+                domain: domain.to_string(),
+                scope: scope.clone(),
+                ip: remote_ip,
+                path: None,
+            },
+            RateLimitScope::PerDomain => Self {
+                domain: domain.to_string(),
+                scope: scope.clone(),
+                ip: None,
+                path: None,
+            },
+            RateLimitScope::PerIpPath => Self {
+                domain: domain.to_string(),
+                scope: scope.clone(),
+                ip: remote_ip,
+                path: Some(path_without_query(path).to_string()),
+            },
+        }
+    }
+}
+
 #[derive(Clone)]
 pub struct ProxyServer {
     state: EdgeState,
     client: Client<HttpConnector, Incoming>,
     error_pages: ErrorPageRenderer,
+    policy: PolicyEnforcer,
 }
 
 impl ProxyServer {
     pub fn new(state: EdgeState) -> Self {
-        Self::with_error_pages(state, ErrorPageRenderer::default())
+        Self::with_error_pages_and_policy(
+            state,
+            ErrorPageRenderer::default(),
+            PolicyEnforcer::default(),
+        )
     }
 
     pub fn with_error_pages(state: EdgeState, error_pages: ErrorPageRenderer) -> Self {
+        Self::with_error_pages_and_policy(state, error_pages, PolicyEnforcer::default())
+    }
+
+    pub fn with_error_pages_and_policy(
+        state: EdgeState,
+        error_pages: ErrorPageRenderer,
+        policy: PolicyEnforcer,
+    ) -> Self {
         let mut connector = HttpConnector::new();
         connector.enforce_http(false);
         let client = Client::builder(TokioExecutor::new()).build(connector);
@@ -176,6 +608,7 @@ impl ProxyServer {
             state,
             client,
             error_pages,
+            policy,
         }
     }
 
@@ -183,6 +616,7 @@ impl ProxyServer {
         &self,
         req: Request<Incoming>,
         remote_ip: Option<IpAddr>,
+        scheme: RequestScheme,
     ) -> Response<BoxBody> {
         let started = Instant::now();
         let method = req.method().clone();
@@ -279,6 +713,58 @@ impl ProxyServer {
             }
         };
 
+        let request_origin = req.headers().get(ORIGIN).cloned();
+        if let Some(rejection) = self.policy.evaluate(
+            &req,
+            &matched.route.rules,
+            &domain,
+            &path,
+            remote_ip,
+            scheme,
+        ) {
+            if rejection.status == StatusCode::TOO_MANY_REQUESTS {
+                self.state
+                    .metrics
+                    .rate_limited_total
+                    .with_label_values(&[&domain])
+                    .inc();
+            } else if rejection.status.is_client_error() || rejection.status.is_server_error() {
+                self.state
+                    .metrics
+                    .blocked_total
+                    .with_label_values(&[&domain, rejection.metric_reason])
+                    .inc();
+            }
+
+            self.observe_request(&domain, method.as_str(), rejection.status, started, None);
+            let mut response = if rejection.status == StatusCode::NO_CONTENT {
+                response_with_body(rejection.status, "text/plain; charset=utf-8", String::new())
+            } else {
+                self.error_response(rejection.status, rejection.message, &domain, &path)
+            };
+            if let Some(location) = rejection.location {
+                if let Ok(value) = HeaderValue::from_str(&location) {
+                    response.headers_mut().insert(LOCATION, value);
+                }
+            }
+            if let Some(retry_after) = rejection.retry_after {
+                if let Ok(value) = HeaderValue::from_str(&retry_after.as_secs().max(1).to_string())
+                {
+                    response.headers_mut().insert("retry-after", value);
+                }
+            }
+            self.policy.apply_response_rules(
+                response.headers_mut(),
+                &matched.route.rules,
+                request_origin.as_ref(),
+            );
+            return response;
+        }
+
+        let mut req = req;
+        self.policy
+            .apply_request_rules(req.headers_mut(), &matched.route.rules);
+
         let route_key = format!("{}:{}", matched.route.id, matched.path.prefix);
         let upstream = match self.state.load_balancer.select(
             &route_key,
@@ -304,9 +790,17 @@ impl ProxyServer {
             }
         };
 
-        match self.forward(req, &matched, &upstream, remote_ip).await {
-            Ok(response) => {
+        match self
+            .forward(req, &matched, &upstream, remote_ip, scheme)
+            .await
+        {
+            Ok(mut response) => {
                 let status = response.status();
+                self.policy.apply_response_rules(
+                    response.headers_mut(),
+                    &matched.route.rules,
+                    request_origin.as_ref(),
+                );
                 self.observe_request(
                     &domain,
                     method.as_str(),
@@ -355,23 +849,26 @@ impl ProxyServer {
         matched: &RouteMatch,
         upstream: &Upstream,
         remote_ip: Option<IpAddr>,
+        scheme: RequestScheme,
     ) -> Result<Response<BoxBody>, PxxlError> {
         let uri = build_upstream_uri(upstream, req.uri())?;
         *req.uri_mut() = uri;
 
-        let authority = upstream.authority()?;
-        req.headers_mut().insert(
-            HOST,
-            HeaderValue::from_str(&authority)
-                .map_err(|_| PxxlError::InvalidUpstream(upstream.url.clone()))?,
-        );
+        if !matched.route.rules.preserve_host_header {
+            let authority = upstream.authority()?;
+            req.headers_mut().insert(
+                HOST,
+                HeaderValue::from_str(&authority)
+                    .map_err(|_| PxxlError::InvalidUpstream(upstream.url.clone()))?,
+            );
+        }
         req.headers_mut().insert(
             HeaderName::from_static("x-forwarded-host"),
             HeaderValue::from_str(&matched.route.domain).map_err(|_| PxxlError::InvalidHost)?,
         );
         req.headers_mut().insert(
             HeaderName::from_static("x-forwarded-proto"),
-            HeaderValue::from_static("http"),
+            HeaderValue::from_static(scheme.as_str()),
         );
         if let Some(ip) = remote_ip {
             if let Ok(value) = HeaderValue::from_str(&ip.to_string()) {
@@ -450,9 +947,26 @@ pub async fn run_http_proxy_with_error_pages(
     error_pages: ErrorPageRenderer,
     shutdown: watch::Receiver<bool>,
 ) -> anyhow::Result<()> {
+    run_http_proxy_with_error_pages_and_policy(
+        addr,
+        state,
+        error_pages,
+        PolicyEnforcer::default(),
+        shutdown,
+    )
+    .await
+}
+
+pub async fn run_http_proxy_with_error_pages_and_policy(
+    addr: SocketAddr,
+    state: EdgeState,
+    error_pages: ErrorPageRenderer,
+    policy: PolicyEnforcer,
+    shutdown: watch::Receiver<bool>,
+) -> anyhow::Result<()> {
     let listener = TcpListener::bind(addr).await?;
     info!(%addr, "HTTP proxy listening");
-    run_plain_listener(listener, state, error_pages, shutdown).await
+    run_plain_listener(listener, state, error_pages, policy, shutdown).await
 }
 
 pub async fn run_http_proxy_on_listener(
@@ -475,8 +989,25 @@ pub async fn run_http_proxy_on_listener_with_error_pages(
     error_pages: ErrorPageRenderer,
     shutdown: watch::Receiver<bool>,
 ) -> anyhow::Result<()> {
+    run_http_proxy_on_listener_with_error_pages_and_policy(
+        listener,
+        state,
+        error_pages,
+        PolicyEnforcer::default(),
+        shutdown,
+    )
+    .await
+}
+
+pub async fn run_http_proxy_on_listener_with_error_pages_and_policy(
+    listener: TcpListener,
+    state: EdgeState,
+    error_pages: ErrorPageRenderer,
+    policy: PolicyEnforcer,
+    shutdown: watch::Receiver<bool>,
+) -> anyhow::Result<()> {
     info!(addr = %listener.local_addr()?, "HTTP proxy listening");
-    run_plain_listener(listener, state, error_pages, shutdown).await
+    run_plain_listener(listener, state, error_pages, policy, shutdown).await
 }
 
 pub async fn run_https_proxy(
@@ -502,25 +1033,45 @@ pub async fn run_https_proxy_with_error_pages(
     error_pages: ErrorPageRenderer,
     shutdown: watch::Receiver<bool>,
 ) -> anyhow::Result<()> {
+    run_https_proxy_with_error_pages_and_policy(
+        addr,
+        state,
+        tls_config,
+        error_pages,
+        PolicyEnforcer::default(),
+        shutdown,
+    )
+    .await
+}
+
+pub async fn run_https_proxy_with_error_pages_and_policy(
+    addr: SocketAddr,
+    state: EdgeState,
+    tls_config: Arc<ServerConfig>,
+    error_pages: ErrorPageRenderer,
+    policy: PolicyEnforcer,
+    shutdown: watch::Receiver<bool>,
+) -> anyhow::Result<()> {
     let listener = TcpListener::bind(addr).await?;
     let acceptor = TlsAcceptor::from(tls_config);
     info!(%addr, "HTTPS proxy listening");
-    run_tls_listener(listener, acceptor, state, error_pages, shutdown).await
+    run_tls_listener(listener, acceptor, state, error_pages, policy, shutdown).await
 }
 
 async fn run_plain_listener(
     listener: TcpListener,
     state: EdgeState,
     error_pages: ErrorPageRenderer,
+    policy: PolicyEnforcer,
     mut shutdown: watch::Receiver<bool>,
 ) -> anyhow::Result<()> {
-    let server = ProxyServer::with_error_pages(state, error_pages);
+    let server = ProxyServer::with_error_pages_and_policy(state, error_pages, policy);
 
     loop {
         tokio::select! {
             accepted = listener.accept() => {
                 let (stream, peer) = accepted?;
-                spawn_connection(stream, peer, server.clone());
+                spawn_connection(stream, peer, server.clone(), RequestScheme::Http);
             }
             changed = shutdown.changed() => {
                 if changed.is_ok() && *shutdown.borrow() {
@@ -539,9 +1090,10 @@ async fn run_tls_listener(
     acceptor: TlsAcceptor,
     state: EdgeState,
     error_pages: ErrorPageRenderer,
+    policy: PolicyEnforcer,
     mut shutdown: watch::Receiver<bool>,
 ) -> anyhow::Result<()> {
-    let server = ProxyServer::with_error_pages(state, error_pages);
+    let server = ProxyServer::with_error_pages_and_policy(state, error_pages, policy);
 
     loop {
         tokio::select! {
@@ -551,7 +1103,7 @@ async fn run_tls_listener(
                 let server = server.clone();
                 tokio::spawn(async move {
                     match acceptor.accept(stream).await {
-                        Ok(tls_stream) => serve_stream(tls_stream, peer, server).await,
+                        Ok(tls_stream) => serve_stream(tls_stream, peer, server, RequestScheme::Https).await,
                         Err(error) => warn!(%error, "TLS handshake failed"),
                     }
                 });
@@ -568,13 +1120,18 @@ async fn run_tls_listener(
     Ok(())
 }
 
-fn spawn_connection(stream: TcpStream, peer: SocketAddr, server: ProxyServer) {
+fn spawn_connection(
+    stream: TcpStream,
+    peer: SocketAddr,
+    server: ProxyServer,
+    scheme: RequestScheme,
+) {
     tokio::spawn(async move {
-        serve_stream(stream, peer, server).await;
+        serve_stream(stream, peer, server, scheme).await;
     });
 }
 
-async fn serve_stream<S>(stream: S, peer: SocketAddr, server: ProxyServer)
+async fn serve_stream<S>(stream: S, peer: SocketAddr, server: ProxyServer, scheme: RequestScheme)
 where
     S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
 {
@@ -584,7 +1141,7 @@ where
     let service_server = server.clone();
     let service = service_fn(move |req| {
         let server = service_server.clone();
-        async move { Ok::<_, Infallible>(server.handle(req, Some(remote_ip)).await) }
+        async move { Ok::<_, Infallible>(server.handle(req, Some(remote_ip), scheme).await) }
     });
     let io = TokioIo::new(stream);
     let builder = AutoBuilder::new(TokioExecutor::new());
@@ -594,6 +1151,116 @@ where
     }
 
     state.metrics.active_connections.dec();
+}
+
+fn policy_rejection(
+    status: StatusCode,
+    message: &'static str,
+    metric_reason: &'static str,
+) -> PolicyRejection {
+    PolicyRejection {
+        status,
+        message,
+        metric_reason,
+        retry_after: None,
+        location: None,
+    }
+}
+
+fn effective_rate_per_second(limit: &DomainRateLimit) -> Option<f64> {
+    if let Some(rate) = limit.requests_per_second {
+        if rate > 0 {
+            return Some(rate as f64);
+        }
+    }
+
+    limit
+        .requests_per_minute
+        .filter(|rate| *rate > 0)
+        .map(|rate| rate as f64 / 60.0)
+        .or(Some(120.0))
+}
+
+fn is_websocket_upgrade(headers: &HeaderMap) -> bool {
+    let has_upgrade_connection = headers
+        .get(CONNECTION)
+        .and_then(|value| value.to_str().ok())
+        .is_some_and(|value| {
+            value
+                .split(',')
+                .any(|part| part.trim().eq_ignore_ascii_case("upgrade"))
+        });
+    let websocket_upgrade = headers
+        .get(UPGRADE)
+        .and_then(|value| value.to_str().ok())
+        .is_some_and(|value| value.eq_ignore_ascii_case("websocket"));
+
+    has_upgrade_connection && websocket_upgrade
+}
+
+fn content_length(headers: &HeaderMap) -> Option<u64> {
+    headers
+        .get(CONTENT_LENGTH)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.parse::<u64>().ok())
+}
+
+fn request_can_have_body(method: &Method) -> bool {
+    matches!(
+        *method,
+        Method::POST | Method::PUT | Method::PATCH | Method::DELETE
+    )
+}
+
+fn content_type_matches(actual: &str, expected: &str) -> bool {
+    actual
+        .split(';')
+        .next()
+        .unwrap_or(actual)
+        .trim()
+        .eq_ignore_ascii_case(expected.trim())
+}
+
+fn header_present(headers: &HeaderMap, name: &str) -> bool {
+    HeaderName::from_bytes(name.as_bytes())
+        .ok()
+        .is_some_and(|name| headers.contains_key(name))
+}
+
+fn header_value<'a>(headers: &'a HeaderMap, name: &str) -> Option<&'a str> {
+    HeaderName::from_bytes(name.as_bytes())
+        .ok()
+        .and_then(|name| headers.get(name))
+        .and_then(|value| value.to_str().ok())
+}
+
+fn is_cors_preflight(req: &Request<Incoming>, rules: &DomainRules) -> bool {
+    rules.cors_preflight_enabled
+        && !rules.cors_allowed_origins.is_empty()
+        && req.method() == Method::OPTIONS
+        && req.headers().contains_key(ORIGIN)
+        && req.headers().contains_key(ACCESS_CONTROL_REQUEST_METHOD)
+}
+
+fn cors_origin_allowed(origin: &HeaderValue, allowed_origins: &[String]) -> bool {
+    let Some(origin) = origin.to_str().ok() else {
+        return false;
+    };
+
+    allowed_origins
+        .iter()
+        .any(|allowed| allowed == "*" || allowed.eq_ignore_ascii_case(origin))
+}
+
+fn insert_static_header(headers: &mut HeaderMap, name: &'static str, value: &'static str) {
+    headers.insert(
+        HeaderName::from_static(name),
+        HeaderValue::from_static(value),
+    );
+}
+
+fn path_without_query(path: &str) -> &str {
+    path.split('?').next().unwrap_or(path)
 }
 
 fn is_html_template(path: &Path) -> bool {

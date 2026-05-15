@@ -7,8 +7,11 @@ license = "MIT"
 [dependencies]
 chrono = { workspace = true }
 http = { workspace = true }
+ipnet = { workspace = true }
 serde = { workspace = true }
 thiserror = { workspace = true }
 url = { workspace = true }
 uuid = { workspace = true }
 
+[dev-dependencies]
+serde_json = { workspace = true }

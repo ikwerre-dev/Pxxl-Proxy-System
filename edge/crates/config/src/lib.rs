@@ -1,7 +1,7 @@
 use ipnet::IpNet;
 use pxxl_common::{
-    normalize_path_prefix, ListenerConfig, LoadBalancingAlgorithm, PathRoute, Route, RouteSource,
-    Upstream,
+    normalize_path_prefix, DomainRules, ListenerConfig, LoadBalancingAlgorithm, PathRoute, Route,
+    RouteSource, Upstream,
 };
 use serde::{Deserialize, Serialize};
 use std::{path::Path, time::Duration};
@@ -269,6 +269,8 @@ pub struct RouteConfig {
     pub upstreams: Vec<UpstreamConfig>,
     #[serde(default)]
     pub paths: Vec<PathConfig>,
+    #[serde(default)]
+    pub rules: DomainRules,
 }
 
 impl RouteConfig {
@@ -320,6 +322,7 @@ impl RouteConfig {
         let mut route = Route::new(self.domain.as_str(), paths, RouteSource::Static);
         route.tls = self.tls.unwrap_or(true);
         route.algorithm = self.algorithm.clone();
+        route.rules = self.rules.clone();
 
         if let Some(id) = &self.id {
             route = route.with_id(id);
@@ -500,5 +503,38 @@ mod tests {
 
         assert!(config.error_pages.enabled);
         assert_eq!(config.error_pages.dir, "/etc/pxxl/errors");
+    }
+
+    #[test]
+    fn parses_route_rules_config() {
+        let allowed_ip: std::net::IpAddr = "203.0.113.10".parse().unwrap();
+        let raw = r#"
+            [[routes]]
+            domain = "secure.pxxlhost"
+            [[routes.upstreams]]
+            url = "http://secure:3000"
+
+            [routes.rules]
+            allow_websocket = false
+            require_https = true
+            allowed_methods = ["GET", "POST"]
+            blocked_headers = ["x-debug-token"]
+            ip_allowlist = ["203.0.113.10"]
+            add_security_headers = true
+
+            [routes.rules.rate_limit]
+            requests_per_minute = 60
+            burst = 10
+            scope = "per_ip_path"
+        "#;
+
+        let config: PxxlConfig = toml::from_str(raw).unwrap();
+        let route = config.static_routes().unwrap().remove(0);
+
+        assert!(!route.rules.allow_websocket);
+        assert!(route.rules.require_https);
+        assert_eq!(route.rules.allowed_methods, vec!["GET", "POST"]);
+        assert!(route.rules.ip_allowlist[0].contains(&allowed_ip));
+        assert!(route.rules.rate_limit.is_some());
     }
 }

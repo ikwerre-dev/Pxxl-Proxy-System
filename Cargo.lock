@@ -1132,7 +1132,9 @@ version = "0.1.0"
 dependencies = [
  "chrono",
  "http",
+ "ipnet",
  "serde",
+ "serde_json",
  "thiserror 2.0.18",
  "url",
  "uuid",
@@ -1224,10 +1226,12 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "bytes",
+ "dashmap",
  "http",
  "http-body-util",
  "hyper",
  "hyper-util",
+ "parking_lot",
  "pxxl-common",
  "pxxl-core",
  "pxxl-ddos",

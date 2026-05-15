@@ -12,6 +12,7 @@ This repository currently implements the Phase 1 MVP:
 - Local self-signed TLS certificate generation in `/data/certs`
 - In-memory per-domain IP blacklist and CIDR blocking
 - Per-IP token-bucket request rate limiting
+- Per-domain route rules for WebSockets, headers, IP allow/block lists, CORS, HTTPS enforcement, body limits, and custom rate limits
 - Round-robin, weighted round-robin, and IP-hash load-balancer selection
 - Admin API for health, routes, upstreams, cert metadata, and blacklist changes
 - Prometheus metrics endpoint
@@ -113,6 +114,64 @@ dir = "config/error-pages"
 ```
 
 You can also override this at runtime with `PXXL_ERROR_PAGES_DIR` or disable custom HTML pages with `PXXL_ERROR_PAGES_ENABLED=false`.
+
+## Domain Rules
+
+API and TOML routes can include a `rules` object. These rules are enforced before traffic is forwarded upstream:
+
+```json
+{
+  "domain": "api.pxxlhost",
+  "path": "/",
+  "tls": true,
+  "algorithm": "round_robin",
+  "upstreams": [
+    { "url": "http://host.docker.internal:8080", "weight": 1 }
+  ],
+  "rules": {
+    "allow_websocket": false,
+    "require_https": true,
+    "redirect_http_to_https": true,
+    "allowed_methods": ["GET", "POST", "OPTIONS"],
+    "blocked_methods": ["TRACE"],
+    "allowed_headers": ["host", "content-type", "authorization", "origin"],
+    "blocked_headers": ["x-debug-token"],
+    "required_headers": [
+      { "name": "x-api-version", "value": "2026-05" }
+    ],
+    "strip_request_headers": ["x-powered-by"],
+    "add_request_headers": {
+      "x-forwarded-by": "pxxl"
+    },
+    "response_headers": {
+      "x-proxy": "pxxl"
+    },
+    "ip_allowlist": ["127.0.0.1", "203.0.113.0/24"],
+    "ip_blocklist": ["198.51.100.10"],
+    "rate_limit": {
+      "enabled": true,
+      "requests_per_minute": 120,
+      "burst": 30,
+      "scope": "per_ip_path",
+      "status_code": 429,
+      "retry_after_seconds": 5
+    },
+    "max_body_bytes": 1048576,
+    "max_uri_length": 2048,
+    "allowed_content_types": ["application/json"],
+    "maintenance_mode": false,
+    "preserve_host_header": false,
+    "add_security_headers": true,
+    "cors_allowed_origins": ["https://app.example.com"],
+    "cors_allow_credentials": true,
+    "cors_allowed_methods": ["GET", "POST", "OPTIONS"],
+    "cors_allowed_headers": ["content-type", "authorization"],
+    "cors_preflight_enabled": true
+  }
+}
+```
+
+Defaults are permissive: if a field is missing, Pxxl keeps current proxy behavior. `allowed_headers` is strict when set, so include normal browser/client headers such as `host`, `content-type`, `authorization`, and `origin` when you use it.
 
 ## Local Wildcard Development
 

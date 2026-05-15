@@ -1,6 +1,7 @@
 FROM rust:1-bookworm AS builder
 WORKDIR /src
 COPY Cargo.toml ./
+COPY Cargo.lock ./
 COPY edge ./edge
 RUN cargo build --release -p pxxl-edge
 

@@ -5,7 +5,8 @@ use pxxl_core::{EdgeState, RouteRegistry};
 use pxxl_ddos::{BlacklistEngine, RateLimitConfig, RateLimiter, SecurityEngine};
 use pxxl_docker_discovery::{run_docker_polling, DockerDiscovery};
 use pxxl_http_proxy::{
-    run_http_proxy_with_error_pages, run_https_proxy_with_error_pages, ErrorPageRenderer,
+    run_http_proxy_with_error_pages_and_policy, run_https_proxy_with_error_pages_and_policy,
+    ErrorPageRenderer, PolicyEnforcer,
 };
 use pxxl_load_balancer::LoadBalancer;
 use pxxl_metrics::PxxlMetrics;
@@ -70,6 +71,7 @@ async fn main() -> Result<()> {
                 ErrorPageRenderer::default()
             }
         };
+    let policy = PolicyEnforcer::default();
 
     let mut cert_domains = config.tls.local_subject_alt_names.clone();
     cert_domains.extend(route_domains);
@@ -92,17 +94,19 @@ async fn main() -> Result<()> {
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
     let mut tasks: Vec<JoinHandle<Result<()>>> = Vec::new();
 
-    tasks.push(tokio::spawn(run_http_proxy_with_error_pages(
+    tasks.push(tokio::spawn(run_http_proxy_with_error_pages_and_policy(
         http_addr,
         state.clone(),
         error_pages.clone(),
+        policy.clone(),
         shutdown_rx.clone(),
     )));
-    tasks.push(tokio::spawn(run_https_proxy_with_error_pages(
+    tasks.push(tokio::spawn(run_https_proxy_with_error_pages_and_policy(
         https_addr,
         state.clone(),
         tls_config,
         error_pages.clone(),
+        policy.clone(),
         shutdown_rx.clone(),
     )));
     tasks.push(tokio::spawn(run_admin_api(

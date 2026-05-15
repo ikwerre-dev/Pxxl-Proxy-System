@@ -7,8 +7,8 @@ use hyper_util::{
     server::conn::auto::Builder as AutoBuilder,
 };
 use pxxl_common::{
-    normalize_domain, normalize_path_prefix, LoadBalancingAlgorithm, PathRoute, Route, RouteSource,
-    Upstream,
+    normalize_domain, normalize_path_prefix, DomainRules, LoadBalancingAlgorithm, PathRoute, Route,
+    RouteSource, Upstream,
 };
 use pxxl_core::EdgeState;
 use pxxl_metrics::PxxlMetrics;
@@ -53,6 +53,8 @@ struct DomainRouteBody {
     upstreams: Vec<UpstreamBody>,
     #[serde(default)]
     paths: Vec<PathBody>,
+    #[serde(default)]
+    rules: DomainRules,
 }
 
 #[derive(Debug, Deserialize)]
@@ -466,6 +468,7 @@ impl DomainRouteBody {
         route.id = self.id.unwrap_or_else(|| format!("api-{domain}"));
         route.tls = self.tls.unwrap_or(true);
         route.algorithm = self.algorithm;
+        route.rules = self.rules;
         Ok(route)
     }
 }

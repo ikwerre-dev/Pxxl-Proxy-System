@@ -40,7 +40,24 @@
             ],
             "body": {
               "mode": "raw",
-              "raw": "{\n  \"domain\": \"{{domain}}\",\n  \"path\": \"/\",\n  \"tls\": true,\n  \"algorithm\": \"round_robin\",\n  \"upstreams\": [\n    {\n      \"url\": \"{{upstreamUrl}}\",\n      \"weight\": 1\n    }\n  ]\n}"
+              "raw": "{\n  \"domain\": \"{{domain}}\",\n  \"path\": \"/\",\n  \"tls\": true,\n  \"algorithm\": \"round_robin\",\n  \"upstreams\": [\n    {\n      \"url\": \"{{upstreamUrl}}\",\n      \"weight\": 1\n    }\n  ],\n  \"rules\": {\n    \"allow_websocket\": true,\n    \"blocked_methods\": [\"TRACE\"],\n    \"blocked_headers\": [\"x-debug-token\"],\n    \"ip_blocklist\": [\"198.51.100.10\"],\n    \"rate_limit\": {\n      \"enabled\": true,\n      \"requests_per_minute\": 120,\n      \"burst\": 30,\n      \"scope\": \"per_ip\",\n      \"status_code\": 429,\n      \"retry_after_seconds\": 5\n    },\n    \"add_security_headers\": true\n  }\n}"
+            },
+            "url": "{{baseUrl}}/v1/domains"
+          }
+        },
+        {
+          "name": "Create Domain With Strict Rules",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"domain\": \"secure.pxxlhost\",\n  \"path\": \"/\",\n  \"tls\": true,\n  \"algorithm\": \"round_robin\",\n  \"upstreams\": [\n    {\n      \"url\": \"{{upstreamUrl}}\",\n      \"weight\": 1\n    }\n  ],\n  \"rules\": {\n    \"allow_websocket\": false,\n    \"require_https\": true,\n    \"redirect_http_to_https\": true,\n    \"allowed_methods\": [\"GET\", \"POST\", \"OPTIONS\"],\n    \"blocked_methods\": [\"TRACE\"],\n    \"allowed_headers\": [\"host\", \"content-type\", \"authorization\", \"origin\", \"user-agent\", \"accept\"],\n    \"blocked_headers\": [\"x-debug-token\", \"x-internal-only\"],\n    \"required_headers\": [\n      { \"name\": \"x-api-version\", \"value\": \"2026-05\" }\n    ],\n    \"strip_request_headers\": [\"x-powered-by\"],\n    \"add_request_headers\": {\n      \"x-forwarded-by\": \"pxxl\"\n    },\n    \"response_headers\": {\n      \"x-proxy\": \"pxxl\"\n    },\n    \"ip_allowlist\": [\"127.0.0.1\", \"203.0.113.0/24\"],\n    \"ip_blocklist\": [\"198.51.100.10\"],\n    \"rate_limit\": {\n      \"enabled\": true,\n      \"requests_per_second\": 10,\n      \"burst\": 20,\n      \"scope\": \"per_ip_path\",\n      \"status_code\": 429,\n      \"retry_after_seconds\": 5\n    },\n    \"max_body_bytes\": 1048576,\n    \"max_uri_length\": 2048,\n    \"allowed_content_types\": [\"application/json\"],\n    \"maintenance_mode\": false,\n    \"preserve_host_header\": false,\n    \"add_security_headers\": true,\n    \"cors_allowed_origins\": [\"https://app.example.com\"],\n    \"cors_allow_credentials\": true,\n    \"cors_allowed_methods\": [\"GET\", \"POST\", \"OPTIONS\"],\n    \"cors_allowed_headers\": [\"content-type\", \"authorization\"],\n    \"cors_preflight_enabled\": true\n  }\n}"
             },
             "url": "{{baseUrl}}/v1/domains"
           }
@@ -168,4 +185,3 @@
     }
   ]
 }
-
