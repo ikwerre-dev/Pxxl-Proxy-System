@@ -200,26 +200,29 @@ impl ApiServer {
                     }),
                 )
             }
-            (Method::GET, "/v1/routes") => {
-                json_response(StatusCode::OK, json!({ "routes": self.state.routes.snapshot() }))
-            }
-            (Method::GET, "/v1/domains") => {
-                json_response(StatusCode::OK, json!({ "domains": self.state.routes.snapshot() }))
-            }
+            (Method::GET, "/v1/routes") => json_response(
+                StatusCode::OK,
+                json!({ "routes": self.state.routes.snapshot() }),
+            ),
+            (Method::GET, "/v1/domains") => json_response(
+                StatusCode::OK,
+                json!({ "domains": self.state.routes.snapshot() }),
+            ),
             (Method::POST, "/v1/domains") => self.create_domain(req).await,
-            (Method::GET, "/v1/stats/domains") => {
-                json_response(
-                    StatusCode::OK,
-                    json!({ "domains": self.state.stats.snapshots() }),
-                )
-            }
+            (Method::GET, "/v1/stats/domains") => json_response(
+                StatusCode::OK,
+                json!({ "domains": self.state.stats.snapshots() }),
+            ),
             (Method::GET, path) if path.starts_with("/v1/domains/") && path.ends_with("/stats") => {
                 let domain = path
                     .trim_start_matches("/v1/domains/")
                     .trim_end_matches("/stats")
                     .trim_matches('/');
                 if domain.is_empty() {
-                    return json_response(StatusCode::BAD_REQUEST, json!({"error": "missing domain"}));
+                    return json_response(
+                        StatusCode::BAD_REQUEST,
+                        json!({"error": "missing domain"}),
+                    );
                 }
                 let normalized = normalize_domain(domain);
                 match self.state.stats.snapshot_domain(&normalized) {
@@ -245,17 +248,26 @@ impl ApiServer {
             (Method::GET, path) if path.starts_with("/v1/domains/") => {
                 let domain = path.trim_start_matches("/v1/domains/").trim_matches('/');
                 if domain.is_empty() {
-                    return json_response(StatusCode::BAD_REQUEST, json!({"error": "missing domain"}));
+                    return json_response(
+                        StatusCode::BAD_REQUEST,
+                        json!({"error": "missing domain"}),
+                    );
                 }
                 match self.state.routes.find_domain(&normalize_domain(domain)) {
                     Some(route) => json_response(StatusCode::OK, json!({ "domain": route })),
-                    None => json_response(StatusCode::NOT_FOUND, json!({"error": "domain not found"})),
+                    None => {
+                        json_response(StatusCode::NOT_FOUND, json!({"error": "domain not found"}))
+                    }
                 }
             }
             (Method::DELETE, path) if path.starts_with("/v1/domains/") => {
-                let domain = normalize_domain(path.trim_start_matches("/v1/domains/").trim_matches('/'));
+                let domain =
+                    normalize_domain(path.trim_start_matches("/v1/domains/").trim_matches('/'));
                 if domain.is_empty() {
-                    return json_response(StatusCode::BAD_REQUEST, json!({"error": "missing domain"}));
+                    return json_response(
+                        StatusCode::BAD_REQUEST,
+                        json!({"error": "missing domain"}),
+                    );
                 }
                 let memory_deleted = self.state.delete_api_domain(&domain);
                 let store_deleted = match &self.route_store {
@@ -291,14 +303,16 @@ impl ApiServer {
                             let route_id = route.id.clone();
                             let domain = route.domain.clone();
                             let prefix = path.prefix.clone();
-                            path.upstreams.into_iter().map(move |upstream| UpstreamView {
-                                route_id: route_id.clone(),
-                                domain: domain.clone(),
-                                path: prefix.clone(),
-                                url: upstream.url,
-                                healthy: upstream.healthy,
-                                weight: upstream.weight,
-                            })
+                            path.upstreams
+                                .into_iter()
+                                .map(move |upstream| UpstreamView {
+                                    route_id: route_id.clone(),
+                                    domain: domain.clone(),
+                                    path: prefix.clone(),
+                                    url: upstream.url,
+                                    healthy: upstream.healthy,
+                                    weight: upstream.weight,
+                                })
                         })
                     })
                     .collect::<Vec<_>>();
@@ -314,18 +328,31 @@ impl ApiServer {
             (Method::POST, path) if path.starts_with("/v1/blacklist/") => {
                 let domain_id = path.trim_start_matches("/v1/blacklist/").trim_matches('/');
                 if domain_id.is_empty() {
-                    return json_response(StatusCode::BAD_REQUEST, json!({"error": "missing domain_id"}));
+                    return json_response(
+                        StatusCode::BAD_REQUEST,
+                        json!({"error": "missing domain_id"}),
+                    );
                 }
 
                 match req.into_body().collect().await {
-                    Ok(collected) => match serde_json::from_slice::<BlacklistBody>(&collected.to_bytes()) {
-                        Ok(body) => {
-                            self.state.security.blacklist().add(domain_id, body.ip);
-                            json_response(StatusCode::OK, json!({"status": "added", "domain_id": domain_id, "ip": body.ip}))
+                    Ok(collected) => {
+                        match serde_json::from_slice::<BlacklistBody>(&collected.to_bytes()) {
+                            Ok(body) => {
+                                self.state.security.blacklist().add(domain_id, body.ip);
+                                json_response(
+                                    StatusCode::OK,
+                                    json!({"status": "added", "domain_id": domain_id, "ip": body.ip}),
+                                )
+                            }
+                            Err(error) => json_response(
+                                StatusCode::BAD_REQUEST,
+                                json!({"error": error.to_string()}),
+                            ),
                         }
-                        Err(error) => json_response(StatusCode::BAD_REQUEST, json!({"error": error.to_string()})),
-                    },
-                    Err(error) => json_response(StatusCode::BAD_REQUEST, json!({"error": error.to_string()})),
+                    }
+                    Err(error) => {
+                        json_response(StatusCode::BAD_REQUEST, json!({"error": error.to_string()}))
+                    }
                 }
             }
             (Method::DELETE, path) if path.starts_with("/v1/blacklist/") => {
@@ -343,9 +370,14 @@ impl ApiServer {
                 match parts[1].parse::<IpAddr>() {
                     Ok(ip) => {
                         self.state.security.blacklist().remove(parts[0], &ip);
-                        json_response(StatusCode::OK, json!({"status": "removed", "domain_id": parts[0], "ip": ip}))
+                        json_response(
+                            StatusCode::OK,
+                            json!({"status": "removed", "domain_id": parts[0], "ip": ip}),
+                        )
                     }
-                    Err(error) => json_response(StatusCode::BAD_REQUEST, json!({"error": error.to_string()})),
+                    Err(error) => {
+                        json_response(StatusCode::BAD_REQUEST, json!({"error": error.to_string()}))
+                    }
                 }
             }
             _ => json_response(StatusCode::NOT_FOUND, json!({"error": "not found"})),

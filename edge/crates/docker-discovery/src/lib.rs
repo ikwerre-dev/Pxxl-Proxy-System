@@ -3,7 +3,7 @@ use pxxl_common::{
     normalize_domain, normalize_path_prefix, PathRoute, Route, RouteSource, Upstream,
 };
 use pxxl_core::EdgeState;
-use serde::Deserialize;
+use serde::{Deserialize, Deserializer};
 use std::{
     collections::{BTreeMap, HashMap},
     path::PathBuf,
@@ -148,7 +148,7 @@ struct DockerContainerSummary {
     names: Vec<String>,
     #[serde(default)]
     labels: HashMap<String, String>,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "null_as_default")]
     ports: Vec<DockerPort>,
 }
 
@@ -393,6 +393,14 @@ fn find_crlf(bytes: &[u8]) -> Option<usize> {
     bytes.windows(2).position(|window| window == b"\r\n")
 }
 
+fn null_as_default<'de, D, T>(deserializer: D) -> std::result::Result<T, D::Error>
+where
+    D: Deserializer<'de>,
+    T: Default + Deserialize<'de>,
+{
+    Ok(Option::<T>::deserialize(deserializer)?.unwrap_or_default())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -548,6 +556,16 @@ mod tests {
         .unwrap();
 
         assert_eq!(target.upstream.url, "http://my-html-site:80");
+    }
+
+    #[test]
+    fn parses_container_with_null_ports_as_empty_ports() {
+        let containers: Vec<DockerContainerSummary> = serde_json::from_str(
+            r#"[{"Names":["/worker"],"Labels":{"pxxl.enable":"true"},"Ports":null}]"#,
+        )
+        .unwrap();
+
+        assert!(containers[0].ports.is_empty());
     }
 
     #[test]

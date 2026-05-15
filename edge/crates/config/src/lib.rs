@@ -35,6 +35,8 @@ pub struct PxxlConfig {
     #[serde(default)]
     pub podman: PodmanConfig,
     #[serde(default)]
+    pub error_pages: ErrorPagesConfig,
+    #[serde(default)]
     pub security: SecurityConfig,
     #[serde(default)]
     pub redis: RedisConfig,
@@ -51,6 +53,7 @@ impl Default for PxxlConfig {
             tls: TlsConfig::default(),
             docker: DockerConfig::default(),
             podman: PodmanConfig::default(),
+            error_pages: ErrorPagesConfig::default(),
             security: SecurityConfig::default(),
             redis: RedisConfig::default(),
             storage: StorageConfig::default(),
@@ -159,6 +162,23 @@ impl Default for PodmanConfig {
 impl PodmanConfig {
     pub fn poll_interval(&self) -> Duration {
         Duration::from_secs(self.poll_seconds.max(1))
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ErrorPagesConfig {
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+    #[serde(default = "default_error_pages_dir")]
+    pub dir: String,
+}
+
+impl Default for ErrorPagesConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            dir: default_error_pages_dir(),
+        }
     }
 }
 
@@ -360,6 +380,10 @@ fn default_docker_poll_seconds() -> u64 {
     5
 }
 
+fn default_error_pages_dir() -> String {
+    "config/error-pages".to_string()
+}
+
 fn default_requests_per_second() -> u32 {
     120
 }
@@ -390,6 +414,10 @@ fn default_weight() -> u32 {
 
 fn default_false() -> bool {
     false
+}
+
+fn default_true() -> bool {
+    true
 }
 
 fn root_path() -> String {
@@ -458,5 +486,19 @@ mod tests {
         assert_eq!(config.podman.socket_path, "/var/run/podman/podman.sock");
         assert_eq!(config.podman.published_host, "host.docker.internal");
         assert_eq!(config.podman.poll_interval(), Duration::from_secs(2));
+    }
+
+    #[test]
+    fn parses_error_pages_config() {
+        let raw = r#"
+            [error_pages]
+            enabled = true
+            dir = "/etc/pxxl/errors"
+        "#;
+
+        let config: PxxlConfig = toml::from_str(raw).unwrap();
+
+        assert!(config.error_pages.enabled);
+        assert_eq!(config.error_pages.dir, "/etc/pxxl/errors");
     }
 }

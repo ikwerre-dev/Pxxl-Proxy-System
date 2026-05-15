@@ -61,5 +61,10 @@ fn load_balancer_selection(c: &mut Criterion) {
     });
 }
 
-criterion_group!(benches, route_lookup, blacklist_lookup, load_balancer_selection);
+criterion_group!(
+    benches,
+    route_lookup,
+    blacklist_lookup,
+    load_balancer_selection
+);
 criterion_main!(benches);

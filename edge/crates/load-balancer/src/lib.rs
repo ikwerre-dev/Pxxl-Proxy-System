@@ -80,18 +80,31 @@ mod tests {
     #[test]
     fn round_robin_rotates_healthy_upstreams() {
         let lb = LoadBalancer::new();
-        let upstreams = vec![Upstream::new("http://a:3000"), Upstream::new("http://b:3000")];
+        let upstreams = vec![
+            Upstream::new("http://a:3000"),
+            Upstream::new("http://b:3000"),
+        ];
 
         assert_eq!(
-            lb.select("route", &LoadBalancingAlgorithm::RoundRobin, &upstreams, None)
-                .unwrap()
-                .url,
+            lb.select(
+                "route",
+                &LoadBalancingAlgorithm::RoundRobin,
+                &upstreams,
+                None
+            )
+            .unwrap()
+            .url,
             "http://a:3000"
         );
         assert_eq!(
-            lb.select("route", &LoadBalancingAlgorithm::RoundRobin, &upstreams, None)
-                .unwrap()
-                .url,
+            lb.select(
+                "route",
+                &LoadBalancingAlgorithm::RoundRobin,
+                &upstreams,
+                None
+            )
+            .unwrap()
+            .url,
             "http://b:3000"
         );
     }

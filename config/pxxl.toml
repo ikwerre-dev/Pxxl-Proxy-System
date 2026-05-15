@@ -20,6 +20,10 @@ socket_path = "/var/run/podman/podman.sock"
 published_host = "host.docker.internal"
 poll_seconds = 5
 
+[error_pages]
+enabled = true
+dir = "config/error-pages"
+
 [security.rate_limits]
 requests_per_second = 120
 burst = 240

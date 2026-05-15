@@ -82,6 +82,36 @@ Containers with the same `pxxl.domain` and `pxxl.path` are merged into one route
 
 When Pxxl itself is running in Docker and the target is a Podman container, Podman container names are usually not resolvable from the Docker network. In that case Pxxl uses Podman's published port mapping and the configured `published_host`. For example, a Podman container labeled `pxxl.port=80` and published as `-p 8080:80` becomes `http://host.docker.internal:8080`.
 
+## Custom Error Pages
+
+Proxy-generated errors use HTML templates from `config/error-pages` by default. Add or edit files named by status code:
+
+```txt
+config/error-pages/404.html
+config/error-pages/502.html
+config/error-pages/default.html
+```
+
+Available template placeholders:
+
+```txt
+{{status_code}}
+{{status_text}}
+{{message}}
+{{domain}}
+{{path}}
+```
+
+Configure the directory in `config/pxxl.toml`:
+
+```toml
+[error_pages]
+enabled = true
+dir = "config/error-pages"
+```
+
+You can also override this at runtime with `PXXL_ERROR_PAGES_DIR` or disable custom HTML pages with `PXXL_ERROR_PAGES_ENABLED=false`.
+
 ## Local Wildcard Development
 
 The default certificate includes:

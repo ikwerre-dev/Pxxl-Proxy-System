@@ -4,7 +4,9 @@ use pxxl_config::PxxlConfig;
 use pxxl_core::{EdgeState, RouteRegistry};
 use pxxl_ddos::{BlacklistEngine, RateLimitConfig, RateLimiter, SecurityEngine};
 use pxxl_docker_discovery::{run_docker_polling, DockerDiscovery};
-use pxxl_http_proxy::{run_http_proxy, run_https_proxy};
+use pxxl_http_proxy::{
+    run_http_proxy_with_error_pages, run_https_proxy_with_error_pages, ErrorPageRenderer,
+};
 use pxxl_load_balancer::LoadBalancer;
 use pxxl_metrics::PxxlMetrics;
 use pxxl_redis_sync::RedisRouteStore;
@@ -59,6 +61,15 @@ async fn main() -> Result<()> {
     let routes = Arc::new(RouteRegistry::new(initial_routes));
     let load_balancer = Arc::new(LoadBalancer::new());
     let state = EdgeState::new(routes, security, load_balancer, metrics.clone());
+    let error_pages =
+        match ErrorPageRenderer::load_from_dir(config.error_pages.enabled, &config.error_pages.dir)
+        {
+            Ok(error_pages) => error_pages,
+            Err(error) => {
+                warn!(%error, "could not load configured error pages; using built-in defaults");
+                ErrorPageRenderer::default()
+            }
+        };
 
     let mut cert_domains = config.tls.local_subject_alt_names.clone();
     cert_domains.extend(route_domains);
@@ -81,15 +92,17 @@ async fn main() -> Result<()> {
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
     let mut tasks: Vec<JoinHandle<Result<()>>> = Vec::new();
 
-    tasks.push(tokio::spawn(run_http_proxy(
+    tasks.push(tokio::spawn(run_http_proxy_with_error_pages(
         http_addr,
         state.clone(),
+        error_pages.clone(),
         shutdown_rx.clone(),
     )));
-    tasks.push(tokio::spawn(run_https_proxy(
+    tasks.push(tokio::spawn(run_https_proxy_with_error_pages(
         https_addr,
         state.clone(),
         tls_config,
+        error_pages.clone(),
         shutdown_rx.clone(),
     )));
     tasks.push(tokio::spawn(run_admin_api(
@@ -182,6 +195,15 @@ fn apply_env_overrides(config: &mut PxxlConfig) {
     }
     if let Ok(value) = std::env::var("PXXL_CERT_DIR") {
         config.tls.cert_dir = value;
+    }
+    if let Ok(value) = std::env::var("PXXL_ERROR_PAGES_DIR") {
+        config.error_pages.dir = value;
+    }
+    if let Ok(value) = std::env::var("PXXL_ERROR_PAGES_ENABLED") {
+        config.error_pages.enabled = matches!(
+            value.trim().to_ascii_lowercase().as_str(),
+            "1" | "true" | "yes" | "on"
+        );
     }
 }
 
