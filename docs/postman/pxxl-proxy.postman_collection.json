@@ -245,10 +245,24 @@
           }
         },
         {
+          "name": "Access Logs By Request ID",
+          "request": {
+            "method": "GET",
+            "url": "{{baseUrl}}/v1/analytics/logs?request_id={{requestId}}"
+          }
+        },
+        {
           "name": "Domain Access Logs",
           "request": {
             "method": "GET",
             "url": "{{baseUrl}}/v1/domains/{{domain}}/logs?limit=50"
+          }
+        },
+        {
+          "name": "Domain Access Logs By Request ID",
+          "request": {
+            "method": "GET",
+            "url": "{{baseUrl}}/v1/domains/{{domain}}/logs?request_id={{requestId}}"
           }
         },
         {

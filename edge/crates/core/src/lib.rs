@@ -324,6 +324,33 @@ impl DomainStatsRegistry {
         visits.truncate(limit);
         visits
     }
+
+    pub fn recent_visits_by_request_id(
+        &self,
+        request_id: &str,
+        limit: usize,
+    ) -> Vec<VisitSnapshot> {
+        let mut visits = self
+            .domains
+            .iter()
+            .flat_map(|entry| entry.value().recent_visits_by_request_id(request_id, limit))
+            .collect::<Vec<_>>();
+        visits.sort_by_key(|visit| std::cmp::Reverse(visit.timestamp_unix_ms));
+        visits.truncate(limit);
+        visits
+    }
+
+    pub fn recent_visits_for_domain_by_request_id(
+        &self,
+        domain: &str,
+        request_id: &str,
+        limit: usize,
+    ) -> Vec<VisitSnapshot> {
+        self.domains
+            .get(domain)
+            .map(|entry| entry.value().recent_visits_by_request_id(request_id, limit))
+            .unwrap_or_default()
+    }
 }
 
 #[derive(Debug, Default)]
@@ -378,6 +405,7 @@ impl DomainStatsCounters {
         );
 
         let visit = VisitSnapshot {
+            request_id: event.request_id,
             domain: event.domain,
             method: event.method,
             path: event.path,
@@ -430,10 +458,21 @@ impl DomainStatsCounters {
             .cloned()
             .collect()
     }
+
+    fn recent_visits_by_request_id(&self, request_id: &str, limit: usize) -> Vec<VisitSnapshot> {
+        self.recent_visits
+            .lock()
+            .iter()
+            .filter(|visit| visit.request_id == request_id)
+            .take(limit)
+            .cloned()
+            .collect()
+    }
 }
 
 #[derive(Debug, Clone, Serialize)]
 pub struct RequestObservation {
+    pub request_id: String,
     pub domain: String,
     pub method: String,
     pub path: String,
@@ -464,6 +503,7 @@ pub struct DomainStatsSnapshot {
 
 #[derive(Debug, Clone, Serialize)]
 pub struct VisitSnapshot {
+    pub request_id: String,
     pub domain: String,
     pub method: String,
     pub path: String,

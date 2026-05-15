@@ -36,6 +36,7 @@ impl StorageEndpoints {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RequestAnalyticsEvent {
+    pub request_id: String,
     pub domain: String,
     pub path: String,
     pub status: u16,
@@ -58,6 +59,7 @@ struct ClickHouseEndpoint {
 
 #[derive(Debug, Serialize)]
 struct ClickHouseAccessLogRow {
+    request_id: String,
     timestamp_unix_ms: u64,
     domain: String,
     method: String,
@@ -88,6 +90,7 @@ impl ClickHouseAnalytics {
         self.post_sql(
             r#"
 CREATE TABLE IF NOT EXISTS pxxl_access_logs (
+  request_id String,
   timestamp_unix_ms UInt64,
   domain String,
   method String,
@@ -104,14 +107,17 @@ CREATE TABLE IF NOT EXISTS pxxl_access_logs (
   city Nullable(String),
   geo_source String
 ) ENGINE = MergeTree
-ORDER BY (domain, timestamp_unix_ms)
+ORDER BY (domain, timestamp_unix_ms, request_id)
 "#,
         )
-        .await
+        .await?;
+        self.post_sql("ALTER TABLE pxxl_access_logs ADD COLUMN IF NOT EXISTS request_id String")
+            .await
     }
 
     pub async fn insert_request(&self, event: RequestObservation) -> Result<()> {
         let row = ClickHouseAccessLogRow {
+            request_id: event.request_id,
             timestamp_unix_ms: event.timestamp_unix_ms,
             domain: event.domain,
             method: event.method,

@@ -20,9 +20,21 @@ Add hosts:
 
 The generated certificate is written to `data/certs` in Docker Compose and `/data/certs` by default inside containers.
 
+Docker Compose persists local service state in ignored repo-local folders:
+
+```txt
+data/grafana
+data/prometheus
+data/loki
+data/redis
+data/postgres
+data/clickhouse
+```
+
+Restarting or recreating containers keeps these folders. To reset local state, stop the stack and remove the specific folder you want to rebuild.
+
 For wildcard DNS, configure dnsmasq:
 
 ```txt
 address=/.pxxlhost/127.0.0.1
 ```
-

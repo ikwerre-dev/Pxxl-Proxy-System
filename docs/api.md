@@ -357,11 +357,15 @@ GET /v1/analytics/visits?limit=50
 GET /v1/domains/{domain}/visits?limit=50
 GET /v1/analytics/logs?limit=50
 GET /v1/domains/{domain}/logs?limit=50
+GET /v1/analytics/logs?request_id={x-request-id}
+GET /v1/domains/{domain}/logs?request_id={x-request-id}
 ```
 
 Stats return in-memory per-domain counters, status buckets, average latency, last status, last-seen timestamp, top countries, top continents, top paths, and top upstreams.
 
-Visits return recent request events with domain, method, path, status, latency, upstream, remote IP, offline GeoIP location, and timestamp. Recent visit history is in memory and capped per domain.
+Every incoming proxy request receives a generated UUID in the `x-request-id` response header. The same ID is sent upstream, written into structured proxy logs, returned in visit/log API records, and stored in ClickHouse analytics. Use `request_id` on log endpoints to find one tracked request exactly.
+
+Visits return recent request events with request ID, domain, method, path, status, latency, upstream, remote IP, offline GeoIP location, and timestamp. Recent visit history is in memory and capped per domain.
 
 When `[storage].analytics_enabled = true`, the same request events are persisted to ClickHouse table `pxxl_access_logs`.
 

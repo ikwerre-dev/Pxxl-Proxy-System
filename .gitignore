@@ -3,6 +3,12 @@
 /data/certs/*
 /data/secrets/*
 /data/*.sock
+/data/clickhouse/
+/data/grafana/
+/data/loki/
+/data/postgres/
+/data/prometheus/
+/data/redis/
 !/data/certs/.gitkeep
 !/data/secrets/.gitkeep
 .env

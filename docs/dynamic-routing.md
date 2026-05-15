@@ -257,9 +257,11 @@ GET /v1/analytics/visits?limit=50
 GET /v1/domains/{domain}/visits?limit=50
 GET /v1/analytics/logs?limit=50
 GET /v1/domains/{domain}/logs?limit=50
+GET /v1/analytics/logs?request_id={x-request-id}
+GET /v1/domains/{domain}/logs?request_id={x-request-id}
 DELETE /v1/domains/{domain}
 ```
 
-The analytics endpoints are in-memory. Route stats include top countries, continents, paths, and upstreams. Visit/log endpoints return the most recent request events, including the resolved location and upstream. When ClickHouse analytics are enabled, the same events are persisted to `pxxl_access_logs`.
+The analytics endpoints are in-memory. Route stats include top countries, continents, paths, and upstreams. Visit/log endpoints return the most recent request events, including the generated `x-request-id`, resolved location, and upstream. When ClickHouse analytics are enabled, the same events are persisted to `pxxl_access_logs`.
 
 Import the Postman collection from `docs/postman/pxxl-proxy.postman_collection.json` and the environment from `docs/postman/pxxl-proxy.postman_environment.json`.

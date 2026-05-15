@@ -28,8 +28,11 @@ services:
     image: redis:7-alpine
     container_name: pxxl-proxy-redis
     restart: unless-stopped
+    command: redis-server --appendonly yes
     ports:
       - "6379:6379"
+    volumes:
+      - ./data/redis:/data
 
   postgres:
     image: postgres:16-alpine
@@ -42,7 +45,7 @@ services:
     ports:
       - "5432:5432"
     volumes:
-      - postgres-data:/var/lib/postgresql/data
+      - ./data/postgres:/var/lib/postgresql/data
 
   clickhouse:
     image: clickhouse/clickhouse-server:24.8
@@ -57,7 +60,7 @@ services:
       - "8123:8123"
       - "9000:9000"
     volumes:
-      - clickhouse-data:/var/lib/clickhouse
+      - ./data/clickhouse:/var/lib/clickhouse
 
   prometheus:
     image: prom/prometheus:v2.55.0
@@ -67,6 +70,7 @@ services:
       - "9091:9090"
     volumes:
       - ./monitoring/prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - ./data/prometheus:/prometheus
     depends_on:
       - edge
 
@@ -79,7 +83,7 @@ services:
       - "3100:3100"
     volumes:
       - ./monitoring/loki/loki-config.yml:/etc/loki/local-config.yaml:ro
-      - loki-data:/loki
+      - ./data/loki:/loki
 
   promtail:
     image: grafana/promtail:3.2.0
@@ -102,14 +106,8 @@ services:
     ports:
       - "${GRAFANA_PORT:-3000}:3000"
     volumes:
-      - grafana-data:/var/lib/grafana
+      - ./data/grafana:/var/lib/grafana
       - ./monitoring/grafana/provisioning:/etc/grafana/provisioning:ro
     depends_on:
       - prometheus
       - loki
-
-volumes:
-  postgres-data:
-  clickhouse-data:
-  grafana-data:
-  loki-data:

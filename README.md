@@ -18,7 +18,7 @@ This repository currently implements the Phase 1 MVP:
 - Active and passive upstream health checks that mark unhealthy upstreams out of rotation
 - Round-robin, weighted round-robin, IP-hash, least-connections, P2C, HRW, EWMA, and latency-aware load-balancer selection
 - Basic auth, SHA-256 digest auth, ForwardAuth, retries, circuit breakers, in-flight request limits, sticky cookie sessions, traffic mirroring, backup upstream failover, response compression, and content-type auto-detection
-- OpenTelemetry-compatible `traceparent` propagation plus richer Prometheus router, service, middleware, upstream, retry, mirror, and health metrics
+- Per-request UUID tracking with `x-request-id`, OpenTelemetry-compatible `traceparent` propagation, and richer Prometheus router, service, middleware, upstream, retry, mirror, and health metrics
 - Admin API auth with Redis-backed bearer tokens and optional admin IP allowlists
 - Prometheus metrics endpoint
 - Docker, Docker Compose, CI, docs, examples, and tests
@@ -56,6 +56,18 @@ The default local admin bearer token is `pxxl-dev-token`. For admin API calls un
 ```sh
 curl -H "Authorization: Bearer pxxl-dev-token" http://127.0.0.1:8081/v1/routes
 ```
+
+## Local Persistence
+
+Docker Compose stores stateful service data in repo-local folders under `data/`:
+
+- `data/grafana` for Grafana users, dashboards, UI changes, and datasource state
+- `data/prometheus` for Prometheus time-series history
+- `data/loki` for Loki log history
+- `data/redis` for Redis admin tokens and dynamic route cache
+- `data/postgres` and `data/clickhouse` for database state and analytics
+
+These folders are intentionally ignored by Git. Normal `docker compose restart`, `docker compose up -d`, and `docker compose down` keep the data. To fully reset local state, stop the stack and remove the matching `data/*` folder yourself.
 
 ## Container Labels
 
@@ -181,7 +193,7 @@ clickhouse_url = "http://pxxl:pxxl@clickhouse:8123"
 analytics_enabled = true
 ```
 
-Pxxl creates `pxxl_access_logs` if it can reach ClickHouse. The proxy hot path only sends to an in-memory queue; failed ClickHouse writes are logged and do not block requests.
+Pxxl creates `pxxl_access_logs` if it can reach ClickHouse. Each request gets a generated `x-request-id`; that same value is returned to the client, forwarded upstream, included in in-memory visit/log APIs, and persisted in ClickHouse. The proxy hot path only sends to an in-memory queue; failed ClickHouse writes are logged and do not block requests.
 
 ## Active Health Checks
 
@@ -469,6 +481,8 @@ For true wildcard resolution, use dnsmasq or CoreDNS.
 - `GET /v1/domains/{domain}/visits?limit=50`
 - `GET /v1/analytics/logs?limit=50`
 - `GET /v1/domains/{domain}/logs?limit=50`
+- `GET /v1/analytics/logs?request_id={x-request-id}`
+- `GET /v1/domains/{domain}/logs?request_id={x-request-id}`
 - `POST /v1/auth/tokens` with `{"name":"postman"}`
 - `GET /v1/auth/tokens`
 - `DELETE /v1/auth/tokens/{id}`

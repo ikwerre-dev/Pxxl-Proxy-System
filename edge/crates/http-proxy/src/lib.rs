@@ -52,9 +52,11 @@ use tokio::{
 use tokio_rustls::server::TlsStream;
 use tokio_rustls::TlsAcceptor;
 use tracing::{debug, error, info, warn};
+use uuid::Uuid;
 
 type BoxError = Box<dyn std::error::Error + Send + Sync>;
 type BoxBody = http_body_util::combinators::BoxBody<Bytes, BoxError>;
+const REQUEST_ID_HEADER: &str = "x-request-id";
 
 #[derive(Clone, Debug)]
 pub struct ErrorPageRenderer {
@@ -263,6 +265,7 @@ struct PolicyRejection {
 
 #[derive(Debug, Clone, Copy)]
 struct ProxyRequestContext<'a> {
+    request_id: &'a str,
     domain: &'a str,
     method: &'a str,
     path: &'a str,
@@ -1046,12 +1049,25 @@ impl ProxyServer {
         client_cert_pem: Option<String>,
     ) -> Response<BoxBody> {
         let started = Instant::now();
+        let request_id = generate_request_id();
+        macro_rules! finish_response {
+            ($response:expr) => {{
+                let mut response = $response;
+                attach_request_id_header(response.headers_mut(), &request_id);
+                return response;
+            }};
+        }
+
         let method = req.method().clone();
         let path = req
             .uri()
             .path_and_query()
             .map(|value| value.as_str().to_string())
             .unwrap_or_else(|| "/".to_string());
+        let location = remote_ip
+            .map(|ip| self.geoip.lookup(ip))
+            .unwrap_or_else(GeoLocation::unknown);
+        let timestamp_unix_ms = now_unix_ms();
         let host = match req
             .headers()
             .get(HOST)
@@ -1059,20 +1075,28 @@ impl ProxyServer {
         {
             Some(host) => host.to_string(),
             None => {
-                return self.error_response(
+                let context = ProxyRequestContext {
+                    request_id: &request_id,
+                    domain: "unknown",
+                    method: method.as_str(),
+                    path: &path,
+                    remote_ip,
+                    scheme,
+                    location: &location,
+                    timestamp_unix_ms,
+                };
+                self.observe_request(&context, StatusCode::BAD_REQUEST, started, None);
+                finish_response!(self.error_response(
                     StatusCode::BAD_REQUEST,
                     "missing host header",
-                    "",
+                    "unknown",
                     &path,
-                )
+                ));
             }
         };
         let domain = normalize_domain(&host);
-        let location = remote_ip
-            .map(|ip| self.geoip.lookup(ip))
-            .unwrap_or_else(GeoLocation::unknown);
-        let timestamp_unix_ms = now_unix_ms();
         let context = ProxyRequestContext {
+            request_id: &request_id,
             domain: &domain,
             method: method.as_str(),
             path: &path,
@@ -1092,12 +1116,12 @@ impl ProxyServer {
                         .with_label_values(&[&domain, &reason])
                         .inc();
                     self.observe_request(&context, StatusCode::FORBIDDEN, started, None);
-                    return self.error_response(
+                    finish_response!(self.error_response(
                         StatusCode::FORBIDDEN,
                         "request blocked",
                         &domain,
                         &path,
-                    );
+                    ));
                 }
                 SecurityDecision::RateLimited { retry_after } => {
                     self.state
@@ -1117,7 +1141,7 @@ impl ProxyServer {
                     {
                         response.headers_mut().insert("retry-after", value);
                     }
-                    return response;
+                    finish_response!(response);
                 }
             }
         }
@@ -1126,12 +1150,12 @@ impl ProxyServer {
             Some(matched) => matched,
             None => {
                 self.observe_request(&context, StatusCode::NOT_FOUND, started, None);
-                return self.error_response(
+                finish_response!(self.error_response(
                     StatusCode::NOT_FOUND,
                     "no route matched this host/path",
                     &domain,
                     &path,
-                );
+                ));
             }
         };
 
@@ -1174,7 +1198,7 @@ impl ProxyServer {
                 &matched.route.rules,
                 request_origin.as_ref(),
             );
-            return response;
+            finish_response!(response);
         }
 
         let middleware =
@@ -1188,7 +1212,7 @@ impl ProxyServer {
                     .with_label_values(&[&domain, "basic_auth", "rejected"])
                     .inc();
                 self.observe_request(&context, response.status(), started, None);
-                return response;
+                finish_response!(response);
             }
             self.state
                 .metrics
@@ -1205,7 +1229,7 @@ impl ProxyServer {
                     .with_label_values(&[&domain, "digest_auth", "rejected"])
                     .inc();
                 self.observe_request(&context, response.status(), started, None);
-                return response;
+                finish_response!(response);
             }
             self.state
                 .metrics
@@ -1229,27 +1253,27 @@ impl ProxyServer {
                         .with_label_values(&[&domain, "forward_auth", "rejected"])
                         .inc();
                     self.observe_request(&context, StatusCode::UNAUTHORIZED, started, None);
-                    return self.error_response(
+                    finish_response!(self.error_response(
                         StatusCode::UNAUTHORIZED,
                         "forward auth denied the request",
                         &domain,
                         &path,
-                    );
+                    ));
                 }
                 Err(error) => {
-                    warn!(%error, domain = %domain, "forward auth request failed");
+                    warn!(%error, request_id = %request_id, domain = %domain, "forward auth request failed");
                     self.state
                         .metrics
                         .middleware_executions_total
                         .with_label_values(&[&domain, "forward_auth", "error"])
                         .inc();
                     self.observe_request(&context, StatusCode::BAD_GATEWAY, started, None);
-                    return self.error_response(
+                    finish_response!(self.error_response(
                         StatusCode::BAD_GATEWAY,
                         "forward auth request failed",
                         &domain,
                         &path,
-                    );
+                    ));
                 }
             }
         }
@@ -1265,7 +1289,7 @@ impl ProxyServer {
         let max_request_bytes = request_body_limit(&matched.route.rules, &middleware);
         let buffered_request = match BufferedRequest::from_request(req, max_request_bytes).await {
             Ok(mut request) => {
-                ensure_trace_headers(&mut request.headers);
+                ensure_trace_headers(&mut request.headers, &request_id);
                 if middleware.content_type_autodetect.enabled {
                     apply_request_content_type_detection(
                         &mut request.headers,
@@ -1277,22 +1301,22 @@ impl ProxyServer {
             }
             Err(BufferError::TooLarge) => {
                 self.observe_request(&context, StatusCode::PAYLOAD_TOO_LARGE, started, None);
-                return self.error_response(
+                finish_response!(self.error_response(
                     StatusCode::PAYLOAD_TOO_LARGE,
                     "request body is too large",
                     &domain,
                     &path,
-                );
+                ));
             }
             Err(BufferError::Body(error)) => {
-                warn!(%error, domain = %domain, "failed to buffer request body");
+                warn!(%error, request_id = %request_id, domain = %domain, "failed to buffer request body");
                 self.observe_request(&context, StatusCode::BAD_REQUEST, started, None);
-                return self.error_response(
+                finish_response!(self.error_response(
                     StatusCode::BAD_REQUEST,
                     "failed to read request body",
                     &domain,
                     &path,
-                );
+                ));
             }
         };
 
@@ -1319,12 +1343,12 @@ impl ProxyServer {
             Some(upstream) => upstream,
             None => {
                 self.observe_request(&context, StatusCode::SERVICE_UNAVAILABLE, started, None);
-                return self.error_response(
+                finish_response!(self.error_response(
                     StatusCode::SERVICE_UNAVAILABLE,
                     "no healthy upstreams",
                     &domain,
                     &path,
-                );
+                ));
             }
         };
 
@@ -1341,12 +1365,12 @@ impl ProxyServer {
                     .with_label_values(&[&domain, scope])
                     .inc();
                 self.observe_request(&context, StatusCode::TOO_MANY_REQUESTS, started, None);
-                return self.error_response(
+                finish_response!(self.error_response(
                     StatusCode::TOO_MANY_REQUESTS,
                     "too many in-flight requests",
                     &domain,
                     &path,
-                );
+                ));
             }
         };
 
@@ -1448,6 +1472,7 @@ impl ProxyServer {
                     ])
                     .observe(started.elapsed().as_secs_f64());
                 info!(
+                    request_id = %request_id,
                     domain = %domain,
                     method = %method,
                     path = %path,
@@ -1456,10 +1481,10 @@ impl ProxyServer {
                     latency_ms = started.elapsed().as_millis(),
                     "proxied request"
                 );
-                response.into_response()
+                finish_response!(response.into_response());
             }
             Err(error) => {
-                warn!(%error, domain = %domain, upstream = %upstream.url, "upstream request failed");
+                warn!(%error, request_id = %request_id, domain = %domain, upstream = %upstream.url, "upstream request failed");
                 self.policy.release_in_flight(in_flight_key);
                 self.state.load_balancer.end_request(
                     &route_key,
@@ -1500,12 +1525,12 @@ impl ProxyServer {
                     started,
                     Some(&upstream.url),
                 );
-                self.error_response(
+                finish_response!(self.error_response(
                     StatusCode::BAD_GATEWAY,
                     "upstream request failed",
                     &domain,
                     &path,
-                )
+                ));
             }
         }
     }
@@ -1638,6 +1663,7 @@ impl ProxyServer {
             .with_label_values(&[context.domain, context.method, &status.as_u16().to_string()])
             .inc();
         self.state.stats.record(RequestObservation {
+            request_id: context.request_id.to_string(),
             domain: context.domain.to_string(),
             method: context.method.to_string(),
             path: context.path.to_string(),
@@ -2590,19 +2616,26 @@ fn apply_request_content_type_detection(headers: &mut HeaderMap, uri: &Uri, body
     }
 }
 
-fn ensure_trace_headers(headers: &mut HeaderMap) {
+fn ensure_trace_headers(headers: &mut HeaderMap, request_id: &str) {
     if !headers.contains_key("traceparent") {
-        let trace_id = format!("{:032x}", now_unix_ms() as u128);
+        let trace_id = Uuid::new_v4().simple().to_string();
         let span_id = format!("{:016x}", monotonic_nanos() as u64);
         if let Ok(value) = HeaderValue::from_str(&format!("00-{trace_id}-{span_id}-01")) {
             headers.insert(HeaderName::from_static("traceparent"), value);
         }
     }
-    if !headers.contains_key("x-request-id") {
-        let request_id = format!("{:x}-{:x}", now_unix_ms(), monotonic_nanos());
-        if let Ok(value) = HeaderValue::from_str(&request_id) {
-            headers.insert(HeaderName::from_static("x-request-id"), value);
-        }
+    if let Ok(value) = HeaderValue::from_str(request_id) {
+        headers.insert(HeaderName::from_static(REQUEST_ID_HEADER), value);
+    }
+}
+
+fn generate_request_id() -> String {
+    Uuid::new_v4().to_string()
+}
+
+fn attach_request_id_header(headers: &mut HeaderMap, request_id: &str) {
+    if let Ok(value) = HeaderValue::from_str(request_id) {
+        headers.insert(HeaderName::from_static(REQUEST_ID_HEADER), value);
     }
 }
 

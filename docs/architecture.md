@@ -40,7 +40,7 @@ The request hot path is:
 12. Apply sticky-session cookies, circuit-breaker state, in-flight limits, and backup upstream failover.
 13. Forward the request with Hyper, retry when configured, and optionally mirror a sampled shadow request.
 14. Apply response headers, content-type auto-detection, response buffering limits, and gzip compression.
-15. Emit structured logs, W3C `traceparent` headers, Prometheus metrics, aggregate route stats, recent visit records, and queued ClickHouse analytics events.
+15. Emit structured logs with generated `x-request-id`, W3C `traceparent` headers, Prometheus metrics, aggregate route stats, recent visit records, and queued ClickHouse analytics events.
 
 No database, internet GeoIP API, Redis lookup, ClickHouse write, health-check probe, or Docker socket access is required to forward a request.
 

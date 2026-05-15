@@ -339,9 +339,21 @@ impl ApiServer {
             }
             (Method::GET, "/v1/analytics/logs") => {
                 let limit = query_limit(&query, 50, 200);
+                let request_id = query_value(&query, "request_id");
+                let logs = request_id
+                    .as_deref()
+                    .map(|request_id| {
+                        self.state
+                            .stats
+                            .recent_visits_by_request_id(request_id, limit)
+                    })
+                    .unwrap_or_else(|| self.state.stats.recent_visits_all(limit));
                 json_response(
                     StatusCode::OK,
-                    json!({ "logs": self.state.stats.recent_visits_all(limit) }),
+                    json!({
+                        "request_id": request_id,
+                        "logs": logs
+                    }),
                 )
             }
             (Method::GET, path) if path.starts_with("/v1/domains/") && path.ends_with("/stats") => {
@@ -416,11 +428,23 @@ impl ApiServer {
                 }
                 let normalized = normalize_domain(domain);
                 let limit = query_limit(&query, 50, 200);
+                let request_id = query_value(&query, "request_id");
+                let logs = request_id
+                    .as_deref()
+                    .map(|request_id| {
+                        self.state.stats.recent_visits_for_domain_by_request_id(
+                            &normalized,
+                            request_id,
+                            limit,
+                        )
+                    })
+                    .unwrap_or_else(|| self.state.stats.recent_visits(&normalized, limit));
                 json_response(
                     StatusCode::OK,
                     json!({
                         "domain": normalized,
-                        "logs": self.state.stats.recent_visits(&normalized, limit)
+                        "request_id": request_id,
+                        "logs": logs
                     }),
                 )
             }
@@ -757,6 +781,19 @@ fn query_limit(query: &str, default: usize, max: usize) -> usize {
         })
         .unwrap_or(default)
         .clamp(1, max)
+}
+
+fn query_value(query: &str, name: &str) -> Option<String> {
+    query
+        .split('&')
+        .filter_map(|part| part.split_once('='))
+        .find_map(|(key, value)| {
+            if key == name && !value.is_empty() {
+                Some(value.to_string())
+            } else {
+                None
+            }
+        })
 }
 
 fn is_public_admin_path(method: &Method, path: &str) -> bool {

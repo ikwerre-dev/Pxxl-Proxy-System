@@ -71,6 +71,64 @@ async fn proxies_http_request_by_host() {
 }
 
 #[tokio::test]
+async fn assigns_request_id_to_response_upstream_and_analytics() {
+    let upstream_addr = spawn_request_id_echo_upstream().await;
+    let proxy_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let proxy_addr = proxy_listener.local_addr().unwrap();
+    let (shutdown_tx, shutdown_rx) = watch::channel(false);
+
+    let route = Route::new(
+        "trace.pxxlhost",
+        vec![PathRoute::new(
+            "/",
+            vec![Upstream::new(format!("http://{upstream_addr}"))],
+        )],
+        RouteSource::Static,
+    );
+    let state = test_state(vec![route]);
+    let stats_state = state.clone();
+    let server = tokio::spawn(run_http_proxy_on_listener(
+        proxy_listener,
+        state,
+        shutdown_rx,
+    ));
+
+    let client: Client<HttpConnector, Empty<Bytes>> =
+        Client::builder(TokioExecutor::new()).build_http();
+    let req = Request::builder()
+        .method("GET")
+        .uri(format!("http://{proxy_addr}/tracked"))
+        .header("host", "trace.pxxlhost")
+        .header("x-request-id", "client-sent-id")
+        .body(Empty::<Bytes>::new())
+        .unwrap();
+
+    let response = client.request(req).await.unwrap();
+    let response_request_id = response
+        .headers()
+        .get("x-request-id")
+        .unwrap()
+        .to_str()
+        .unwrap()
+        .to_string();
+    let body = response.into_body().collect().await.unwrap().to_bytes();
+
+    shutdown_tx.send(true).unwrap();
+    server.await.unwrap().unwrap();
+
+    let upstream_request_id = std::str::from_utf8(&body).unwrap();
+    let visits = stats_state
+        .stats
+        .recent_visits_by_request_id(&response_request_id, 1);
+    assert_ne!(response_request_id, "client-sent-id");
+    assert_eq!(response_request_id.len(), 36);
+    assert_eq!(upstream_request_id, response_request_id);
+    assert_eq!(visits.len(), 1);
+    assert_eq!(visits[0].request_id, response_request_id);
+    assert_eq!(visits[0].path, "/tracked");
+}
+
+#[tokio::test]
 async fn rejects_websocket_when_domain_rule_disables_it() {
     let upstream_addr = spawn_upstream("should not proxy").await;
     let proxy_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -630,6 +688,33 @@ async fn spawn_upstream(body: &'static str) -> SocketAddr {
                     Ok::<_, Infallible>(Response::new(Full::new(Bytes::from_static(
                         body.as_bytes(),
                     ))))
+                });
+                let io = TokioIo::new(stream);
+                let builder = AutoBuilder::new(TokioExecutor::new());
+                let _ = builder.serve_connection_with_upgrades(io, service).await;
+            });
+        }
+    });
+
+    addr
+}
+
+async fn spawn_request_id_echo_upstream() -> SocketAddr {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+
+    tokio::spawn(async move {
+        loop {
+            let (stream, _) = listener.accept().await.unwrap();
+            tokio::spawn(async move {
+                let service = service_fn(move |req: Request<hyper::body::Incoming>| async move {
+                    let request_id = req
+                        .headers()
+                        .get("x-request-id")
+                        .and_then(|value| value.to_str().ok())
+                        .unwrap_or("")
+                        .to_string();
+                    Ok::<_, Infallible>(Response::new(Full::new(Bytes::from(request_id))))
                 });
                 let io = TokioIo::new(stream);
                 let builder = AutoBuilder::new(TokioExecutor::new());
