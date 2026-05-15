@@ -120,7 +120,7 @@ impl RouteRegistry {
                 .get(&base_domain)
                 .into_iter()
                 .flatten()
-                .filter(|route| route.rules.www_alias && !route.domain.starts_with("www."));
+                .filter(|route| route_allows_www_alias(&route.domain, route.rules.www_alias));
             merge_best_domain_routes(routes)
         })
     }
@@ -542,9 +542,7 @@ fn matching_routes(
         .get(domain)
         .into_iter()
         .flatten()
-        .filter(|route| {
-            !require_www_alias || (route.rules.www_alias && !route.domain.starts_with("www."))
-        })
+        .filter(|route| !require_www_alias || route_allows_www_alias(&route.domain, route.rules.www_alias))
         .filter_map(|route| {
             route.best_path(path).map(|path_route| RouteMatch {
                 route: route.clone(),
@@ -559,6 +557,14 @@ fn www_alias_base(domain: &str) -> Option<String> {
         .strip_prefix("www.")
         .filter(|base| !base.is_empty() && !base.starts_with("www."))
         .map(str::to_string)
+}
+
+pub fn route_allows_www_alias(domain: &str, www_alias: bool) -> bool {
+    www_alias && !domain.starts_with("www.") && is_apex_like_domain(domain)
+}
+
+fn is_apex_like_domain(domain: &str) -> bool {
+    domain.split('.').filter(|part| !part.is_empty()).count() == 2
 }
 
 fn merge_best_domain_routes<'a>(routes: impl Iterator<Item = &'a Route>) -> Option<Route> {
@@ -814,6 +820,19 @@ mod tests {
         let registry = RouteRegistry::new(vec![route]);
 
         assert!(registry.find("www.example.com", "/").is_none());
+    }
+
+    #[test]
+    fn registry_does_not_add_www_alias_to_existing_subdomain() {
+        let mut route = Route::new(
+            "api.example.com",
+            vec![PathRoute::new("/", vec![Upstream::new("http://api:3000")])],
+            RouteSource::Static,
+        );
+        route.rules.www_alias = true;
+        let registry = RouteRegistry::new(vec![route]);
+
+        assert!(registry.find("www.api.example.com", "/").is_none());
     }
 
     #[test]

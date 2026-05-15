@@ -9,7 +9,7 @@ use hyper_util::{
 use pxxl_api::{run_admin_api, run_metrics_server, AdminApiAuth};
 use pxxl_common::{parse_ip_net, Route};
 use pxxl_config::{HealthCheckConfig, PxxlConfig};
-use pxxl_core::{EdgeState, RouteRegistry};
+use pxxl_core::{route_allows_www_alias, EdgeState, RouteRegistry};
 use pxxl_ddos::{BlacklistEngine, RateLimitConfig, RateLimiter, SecurityEngine};
 use pxxl_docker_discovery::{run_docker_polling, DockerDiscovery};
 use pxxl_geo::GeoIpResolver;
@@ -382,7 +382,7 @@ fn certificate_domains(local_subject_alt_names: &[String], state: &EdgeState) ->
     let mut domains = local_subject_alt_names.to_vec();
     for route in state.routes.snapshot() {
         domains.push(route.domain.clone());
-        if route.rules.www_alias && !route.domain.starts_with("www.") {
+        if route_allows_www_alias(&route.domain, route.rules.www_alias) {
             domains.push(format!("www.{}", route.domain));
         }
     }
