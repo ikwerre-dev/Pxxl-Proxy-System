@@ -45,7 +45,6 @@ services:
 
   clickhouse:
     image: clickhouse/clickhouse-server:24.8
-    platform: linux/amd64
     container_name: pxxl-proxy-clickhouse
     restart: unless-stopped
     environment:
@@ -70,23 +69,46 @@ services:
     depends_on:
       - edge
 
+  loki:
+    image: grafana/loki:3.2.0
+    container_name: pxxl-proxy-loki
+    restart: unless-stopped
+    command: -config.file=/etc/loki/local-config.yaml
+    ports:
+      - "3100:3100"
+    volumes:
+      - ./monitoring/loki/loki-config.yml:/etc/loki/local-config.yaml:ro
+      - loki-data:/loki
+
+  promtail:
+    image: grafana/promtail:3.2.0
+    container_name: pxxl-proxy-promtail
+    restart: unless-stopped
+    command: -config.file=/etc/promtail/config.yml
+    volumes:
+      - ./monitoring/promtail/promtail-config.yml:/etc/promtail/config.yml:ro
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+    depends_on:
+      - loki
+
   grafana:
     image: grafana/grafana:11.2.0
-    platform: linux/amd64
     container_name: pxxl-proxy-grafana
     restart: unless-stopped
     environment:
       GF_SECURITY_ADMIN_USER: admin
       GF_SECURITY_ADMIN_PASSWORD: pxxl
     ports:
-      - "3000:3000"
+      - "${GRAFANA_PORT:-3000}:3000"
     volumes:
       - grafana-data:/var/lib/grafana
       - ./monitoring/grafana/provisioning:/etc/grafana/provisioning:ro
     depends_on:
       - prometheus
+      - loki
 
 volumes:
   postgres-data:
   clickhouse-data:
   grafana-data:
+  loki-data:
