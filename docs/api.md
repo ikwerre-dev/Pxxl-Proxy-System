@@ -5,10 +5,10 @@ Base URL: `http://127.0.0.1:8081`
 Most `/v1/*` endpoints require:
 
 ```http
-Authorization: Bearer pxxl-dev-token
+Authorization: Bearer <bootstrap-or-admin-token>
 ```
 
-`/healthz` and `/readyz` are public. The default token is for local development; override it with `PXXL_ADMIN_BOOTSTRAP_TOKEN` or `config/pxxl.toml`.
+`/healthz` and `/readyz` are public. There is no checked-in default admin token. For first-run local access, set `PXXL_ADMIN_BOOTSTRAP_TOKEN` to a high-entropy value, create a Redis-backed token, then remove the bootstrap token from the environment.
 
 ## Auth
 
@@ -20,6 +20,8 @@ Content-Type: application/json
 ```
 
 Returns the raw token once plus token metadata. Token hashes are stored in Redis.
+
+Token names are capped at 128 bytes. Admin JSON request bodies are capped at 1 MiB and return `413 Payload Too Large` above that limit.
 
 ```http
 GET /v1/auth/tokens
@@ -181,6 +183,8 @@ Content-Type: application/json
 
 API-created domains are persisted in Redis and loaded into the in-memory route registry. Request forwarding does not query Redis.
 
+Dynamic routes from the API and Redis are validated before activation. Upstream URLs must currently use `http://`; `https://`, URL credentials, fragments, control characters, private/link-local/multicast IP literals, `localhost`, `.localhost`, and common internal service names such as `redis`, `postgres`, `clickhouse`, `prometheus`, `grafana`, and `loki` are rejected for control-plane created routes. Static TOML routes are operator-owned and are validated less restrictively so Compose service routes such as `http://grafana:3000` can still be used intentionally.
+
 ```http
 GET /v1/domains
 GET /v1/domains/{domain}
@@ -217,7 +221,7 @@ Available fields:
 | `traffic_splits` | array | Weighted upstream pools for canary routing. Matching country/continent constraints are optional. |
 | `waf` | object | Lightweight WAF checks for traversal, SQLi/XSS markers, scanner user agents, and custom substring patterns. |
 | `rate_limit` | object | Per-domain token bucket. Supports `requests_per_second`, `requests_per_minute`, `burst`, `scope`, `status_code`, and `retry_after_seconds`. |
-| `max_body_bytes` | number | Rejects requests whose `Content-Length` exceeds this value with `413`. |
+| `max_body_bytes` | number | Rejects requests whose `Content-Length` exceeds this value and also caps collected streaming/chunked bodies with `413`. Slow-body read deadlines are handled by the connection timeout, not a separate per-byte timeout. |
 | `max_uri_length` | number | Rejects long URLs with `414`. |
 | `allowed_content_types` | string array | Allows only these content types on body-bearing methods. |
 | `maintenance_mode` | boolean | Returns `503` before upstream selection. |
@@ -343,7 +347,7 @@ ewma_latency
 latency_aware
 ```
 
-The runtime currently proxies HTTP and HTTPS entrypoints. ACME, TCP, UDP, HTTP/3, per-router TLS cipher/client-auth selection, and HTTPS upstream mTLS fields are accepted in the route schema for control-plane compatibility, but production listener/transport implementations are still in progress.
+The runtime currently proxies HTTP and HTTPS entrypoints to HTTP upstreams. API-created routes reject `https://` upstream URLs until upstream TLS verification, SNI, custom CA, and mTLS handling are implemented. ACME, TCP, UDP, HTTP/3, per-router TLS cipher/client-auth selection, and HTTPS upstream mTLS fields are accepted in the route schema for control-plane compatibility, but production listener/transport implementations are still in progress.
 
 The GeoIP resolver is fully offline. It reads `config/geoip/geoip.csv` by default. The built-in seed only knows localhost and private ranges, so add a licensed CIDR database if you need real public-country accuracy.
 

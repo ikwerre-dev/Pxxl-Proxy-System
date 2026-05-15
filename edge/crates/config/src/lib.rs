@@ -20,6 +20,8 @@ pub enum ConfigError {
     },
     #[error("route for domain {domain} has no upstreams")]
     MissingUpstreams { domain: String },
+    #[error("route for domain {domain} is invalid: {reason}")]
+    InvalidRoute { domain: String, reason: String },
 }
 
 pub type Result<T> = std::result::Result<T, ConfigError>;
@@ -375,6 +377,12 @@ impl RouteConfig {
             route = route.with_id(id);
         }
 
+        route
+            .validate_for_runtime()
+            .map_err(|reason| ConfigError::InvalidRoute {
+                domain: self.domain.clone(),
+                reason,
+            })?;
         Ok(route)
     }
 }

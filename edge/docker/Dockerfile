@@ -17,6 +17,10 @@ RUN apt-get update \
 WORKDIR /app
 COPY --from=builder /tmp/pxxl-edge /usr/local/bin/pxxl-edge
 COPY config ./config
-RUN mkdir -p /data/certs /data/secrets
+RUN groupadd --system pxxl \
+    && useradd --system --gid pxxl --home-dir /nonexistent --shell /usr/sbin/nologin pxxl \
+    && mkdir -p /data/certs /data/secrets \
+    && chown -R pxxl:pxxl /data /app /usr/local/bin/pxxl-edge
+USER pxxl
 EXPOSE 80 443 8081 9090
 ENTRYPOINT ["pxxl-edge"]

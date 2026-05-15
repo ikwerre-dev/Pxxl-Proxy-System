@@ -28,6 +28,7 @@ pub struct RedisRouteStore {
 pub struct RedisTokenStore {
     url: String,
     key: String,
+    hash_index_key: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -73,6 +74,11 @@ impl RedisRouteStore {
                 let mut route: Route = serde_json::from_str(&value)?;
                 route.source = RouteSource::Api;
                 route.domain = normalize_domain(&route.domain);
+                route
+                    .validate_for_dynamic_control_plane()
+                    .map_err(|reason| {
+                        anyhow::anyhow!("invalid persisted route {}: {reason}", route.domain)
+                    })?;
                 Ok(route)
             })
             .collect()
@@ -84,6 +90,9 @@ impl RedisRouteStore {
         let mut persisted = route.clone();
         persisted.source = RouteSource::Api;
         persisted.domain = normalize_domain(&persisted.domain);
+        persisted
+            .validate_for_dynamic_control_plane()
+            .map_err(|reason| anyhow::anyhow!("invalid route {}: {reason}", persisted.domain))?;
         let payload = serde_json::to_string(&persisted)?;
         let _: usize = connection
             .hset(&self.key, persisted.domain.clone(), payload)
@@ -101,9 +110,11 @@ impl RedisRouteStore {
 
 impl RedisTokenStore {
     pub fn new(url: impl Into<String>, key: impl Into<String>) -> Self {
+        let key = key.into();
         Self {
             url: url.into(),
-            key: key.into(),
+            hash_index_key: format!("{key}:hash_index"),
+            key,
         }
     }
 
@@ -123,6 +134,13 @@ impl RedisTokenStore {
         let mut connection = client.get_multiplexed_async_connection().await?;
         let payload = serde_json::to_string(&record)?;
         let _: usize = connection.hset(&self.key, id, payload).await?;
+        let _: usize = connection
+            .hset(
+                &self.hash_index_key,
+                record.token_hash.clone(),
+                record.id.clone(),
+            )
+            .await?;
 
         Ok(CreatedAdminToken {
             record: record.into(),
@@ -145,6 +163,13 @@ impl RedisTokenStore {
     pub async fn revoke_token(&self, id: &str) -> Result<bool> {
         let client = redis::Client::open(self.url.as_str())?;
         let mut connection = client.get_multiplexed_async_connection().await?;
+        let existing: Option<String> = connection.hget(&self.key, id).await?;
+        if let Some(existing) = existing {
+            let record: AdminTokenRecord = serde_json::from_str(&existing)?;
+            let _: usize = connection
+                .hdel(&self.hash_index_key, record.token_hash)
+                .await?;
+        }
         let removed: usize = connection.hdel(&self.key, id).await?;
         Ok(removed > 0)
     }
@@ -153,20 +178,23 @@ impl RedisTokenStore {
         let token_hash = hash_token(token);
         let client = redis::Client::open(self.url.as_str())?;
         let mut connection = client.get_multiplexed_async_connection().await?;
-        let values: Vec<String> = connection.hvals(&self.key).await?;
-
-        for value in values {
-            let mut record: AdminTokenRecord = serde_json::from_str(&value)?;
-            if record.enabled
-                && constant_time_eq(record.token_hash.as_bytes(), token_hash.as_bytes())
-            {
-                record.last_used_unix_ms = Some(now_unix_ms());
-                let payload = serde_json::to_string(&record)?;
-                let _: usize = connection
-                    .hset(&self.key, record.id.clone(), payload)
-                    .await?;
-                return Ok(true);
-            }
+        let id: Option<String> = connection.hget(&self.hash_index_key, &token_hash).await?;
+        let Some(id) = id else {
+            return Ok(false);
+        };
+        let value: Option<String> = connection.hget(&self.key, &id).await?;
+        let Some(value) = value else {
+            let _: usize = connection.hdel(&self.hash_index_key, token_hash).await?;
+            return Ok(false);
+        };
+        let mut record: AdminTokenRecord = serde_json::from_str(&value)?;
+        if record.enabled && constant_time_eq(record.token_hash.as_bytes(), token_hash.as_bytes()) {
+            record.last_used_unix_ms = Some(now_unix_ms());
+            let payload = serde_json::to_string(&record)?;
+            let _: usize = connection
+                .hset(&self.key, record.id.clone(), payload)
+                .await?;
+            return Ok(true);
         }
 
         Ok(false)

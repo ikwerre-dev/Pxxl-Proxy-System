@@ -54,6 +54,7 @@ async fn main() -> Result<()> {
         PxxlConfig::default()
     };
     apply_env_overrides(&mut config);
+    ensure_production_safe_config(&config)?;
 
     let mut initial_routes = config.static_routes()?;
     let route_store = RedisRouteStore::new(config.redis.url.clone(), "pxxl:routes");
@@ -394,16 +395,29 @@ async fn run_tls_reloader(
 }
 
 fn certificate_domains(local_subject_alt_names: &[String], state: &EdgeState) -> Vec<String> {
+    const MAX_CERT_DOMAINS: usize = 100;
     let mut domains = local_subject_alt_names.to_vec();
     for route in state.routes.snapshot() {
-        domains.push(route.domain.clone());
+        if safe_certificate_domain(&route.domain) {
+            domains.push(route.domain.clone());
+        }
         if route_allows_www_alias(&route.domain, route.rules.www_alias) {
-            domains.push(format!("www.{}", route.domain));
+            let alias = format!("www.{}", route.domain);
+            if safe_certificate_domain(&alias) {
+                domains.push(alias);
+            }
         }
     }
     domains.sort();
     domains.dedup();
+    domains.truncate(MAX_CERT_DOMAINS);
     domains
+}
+
+fn safe_certificate_domain(domain: &str) -> bool {
+    !domain.is_empty()
+        && domain.len() <= 253
+        && !domain.bytes().any(|byte| byte <= 0x20 || byte == 0x7f)
 }
 
 fn unix_socket_available(path: &str) -> bool {
@@ -457,7 +471,10 @@ fn apply_env_overrides(config: &mut PxxlConfig) {
         config.admin.auth_enabled = parse_bool(&value);
     }
     if let Ok(value) = std::env::var("PXXL_ADMIN_BOOTSTRAP_TOKEN") {
-        config.admin.bootstrap_token = Some(value);
+        config.admin.bootstrap_token = (!value.trim().is_empty()).then_some(value);
+    }
+    if let Ok(value) = std::env::var("PXXL_REDIS_URL") {
+        config.redis.url = value;
     }
     if let Ok(value) = std::env::var("PXXL_ADMIN_IP_ALLOWLIST") {
         config.admin.ip_allowlist = value
@@ -482,6 +499,36 @@ fn apply_env_overrides(config: &mut PxxlConfig) {
     if let Ok(value) = std::env::var("PXXL_HEALTH_CHECKS_ENABLED") {
         config.health_checks.enabled = parse_bool(&value);
     }
+}
+
+fn ensure_production_safe_config(config: &PxxlConfig) -> Result<()> {
+    let is_production = std::env::var("PXXL_ENV")
+        .map(|value| value.eq_ignore_ascii_case("production"))
+        .unwrap_or(false);
+    if !is_production {
+        return Ok(());
+    }
+
+    if !config.admin.auth_enabled {
+        anyhow::bail!("admin auth must be enabled in production");
+    }
+    if config
+        .admin
+        .bootstrap_token
+        .as_deref()
+        .is_some_and(|token| token == "pxxl-dev-token" || token.len() < 32)
+    {
+        anyhow::bail!("production bootstrap token must be unique and at least 32 bytes");
+    }
+    for (name, value) in [
+        ("listeners.admin", &config.listeners.admin),
+        ("listeners.metrics", &config.listeners.metrics),
+    ] {
+        if value.starts_with("0.0.0.0:") || value.starts_with("[::]:") {
+            anyhow::bail!("{name} must not bind a wildcard address in production");
+        }
+    }
+    Ok(())
 }
 
 fn parse_bool(value: &str) -> bool {

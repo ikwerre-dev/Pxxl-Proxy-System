@@ -7,8 +7,19 @@ PXXL_HTTP_ADDR=127.0.0.1:8080 \
 PXXL_HTTPS_ADDR=127.0.0.1:8443 \
 PXXL_ADMIN_ADDR=127.0.0.1:8081 \
 PXXL_METRICS_ADDR=127.0.0.1:9090 \
+PXXL_ADMIN_BOOTSTRAP_TOKEN="$(openssl rand -hex 32)" \
 cargo run -p pxxl-edge
 ```
+
+For Docker Compose, provide local-only secrets when starting the stack:
+
+```sh
+PXXL_ADMIN_BOOTSTRAP_TOKEN="$(openssl rand -hex 32)" \
+GRAFANA_ADMIN_PASSWORD="$(openssl rand -hex 24)" \
+docker compose up --build
+```
+
+After you create a Redis-backed admin token through `POST /v1/auth/tokens`, remove `PXXL_ADMIN_BOOTSTRAP_TOKEN` for normal restarts. Compose binds admin, metrics, Prometheus, and Grafana to `127.0.0.1` and does not publish Redis, Postgres, ClickHouse, or Loki host ports.
 
 Add hosts:
 

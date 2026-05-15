@@ -20,6 +20,8 @@ use tokio::sync::mpsc;
 use tracing::info;
 
 const RECENT_VISIT_LIMIT: usize = 200;
+const MAX_COUNTER_KEYS: usize = 1_000;
+const OVERFLOW_COUNTER_KEY: &str = "__other__";
 
 #[derive(Debug)]
 pub struct RouteRegistry {
@@ -530,7 +532,11 @@ pub struct StringCount {
 
 fn increment_count(counts: &Mutex<HashMap<String, u64>>, value: String) {
     let mut counts = counts.lock();
-    *counts.entry(value).or_default() += 1;
+    if counts.contains_key(&value) || counts.len() < MAX_COUNTER_KEYS {
+        *counts.entry(value).or_default() += 1;
+    } else {
+        *counts.entry(OVERFLOW_COUNTER_KEY.to_string()).or_default() += 1;
+    }
 }
 
 fn increment_location_count(

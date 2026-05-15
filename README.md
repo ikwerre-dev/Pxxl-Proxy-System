@@ -30,6 +30,8 @@ The route schema also carries production TLS, ACME, TCP, UDP, and HTTP/3 options
 With Docker:
 
 ```sh
+PXXL_ADMIN_BOOTSTRAP_TOKEN="$(openssl rand -hex 32)" \
+GRAFANA_ADMIN_PASSWORD="$(openssl rand -hex 24)" \
 docker compose up --build
 ```
 
@@ -40,6 +42,7 @@ PXXL_HTTP_ADDR=127.0.0.1:8080 \
 PXXL_HTTPS_ADDR=127.0.0.1:8443 \
 PXXL_ADMIN_ADDR=127.0.0.1:8081 \
 PXXL_METRICS_ADDR=127.0.0.1:9090 \
+PXXL_ADMIN_BOOTSTRAP_TOKEN="$(openssl rand -hex 32)" \
 cargo run -p pxxl-edge
 ```
 
@@ -51,11 +54,13 @@ curl http://127.0.0.1:8081/readyz
 curl http://127.0.0.1:9090/metrics
 ```
 
-The default local admin bearer token is `pxxl-dev-token`. For admin API calls under `/v1/*`, send:
+There is no checked-in default admin token. Set `PXXL_ADMIN_BOOTSTRAP_TOKEN` for first-run local access, use it to create a Redis-backed token, then remove the bootstrap token from your environment:
 
 ```sh
-curl -H "Authorization: Bearer pxxl-dev-token" http://127.0.0.1:8081/v1/routes
+curl -H "Authorization: Bearer $PXXL_ADMIN_BOOTSTRAP_TOKEN" http://127.0.0.1:8081/v1/routes
 ```
+
+Compose binds admin, metrics, Prometheus, and Grafana to `127.0.0.1` by default and keeps Redis, Postgres, ClickHouse, and Loki off host ports. Grafana uses `admin` plus the `GRAFANA_ADMIN_PASSWORD` you provide.
 
 ## Local Persistence
 
@@ -105,6 +110,8 @@ published_host = "host.docker.internal"
 Containers with the same `pxxl.domain` and `pxxl.path` are merged into one route with multiple upstreams. Requests are load-balanced across those upstreams, so stopping one replica removes it from the route on the next discovery poll while traffic keeps flowing to the remaining replicas.
 
 When Pxxl itself is running in Docker and the target is a Podman container, Podman container names are usually not resolvable from the Docker network. In that case Pxxl uses Podman's published port mapping and the configured `published_host`. For example, a Podman container labeled `pxxl.port=80` and published as `-p 8080:80` becomes `http://host.docker.internal:8080`.
+
+Dynamic routes from the admin API, Redis, Docker labels, and Podman labels are validated before activation. They must use `http://` upstreams, valid hostnames, and safe path prefixes. Control-plane routes reject loopback, link-local, multicast, private IP literals, `localhost`, and common internal service names such as `redis`, `postgres`, `clickhouse`, `prometheus`, `grafana`, and `loki`. Static TOML routes are treated as operator-owned and may still point at internal Compose service names.
 
 `pxxl.path=/` is a catch-all for that domain. If a matching route exists but the selected upstream is down, the proxy returns `502 Bad Gateway`. If no route exists for the host/path, it returns `404 Not Found`.
 
@@ -166,22 +173,21 @@ Admin API auth is configured in `config/pxxl.toml`:
 ```toml
 [admin]
 auth_enabled = true
-bootstrap_token = "pxxl-dev-token"
 token_store_key = "pxxl:admin_tokens"
-ip_allowlist = []
+ip_allowlist = ["127.0.0.1", "::1"]
 ```
 
 `/healthz` and `/readyz` stay public for uptime checks. Other admin endpoints require `Authorization: Bearer <token>` when `auth_enabled = true`. Use the bootstrap token to create Redis-backed tokens:
 
 ```http
 POST /v1/auth/tokens
-Authorization: Bearer pxxl-dev-token
+Authorization: Bearer <bootstrap-or-admin-token>
 Content-Type: application/json
 
 {"name":"postman"}
 ```
 
-The raw token is returned once. Token metadata and SHA-256 token hashes are stored in Redis. Set `ip_allowlist` to bare IPs or CIDRs to restrict which clients can use the admin API.
+The raw token is returned once. Token metadata and SHA-256 token hashes are stored in Redis with a hash index so verification does not scan every token. Set `ip_allowlist` to bare IPs or CIDRs to restrict which clients can use the admin API. In Docker Compose, `PXXL_ADMIN_IP_ALLOWLIST` defaults to empty because host connections can appear as the Docker bridge address; set it explicitly for stricter environments.
 
 ## Persistent Analytics
 
@@ -194,6 +200,8 @@ analytics_enabled = true
 ```
 
 Pxxl creates `pxxl_access_logs` if it can reach ClickHouse. Each request gets a generated `x-request-id`; that same value is returned to the client, forwarded upstream, included in in-memory visit/log APIs, and persisted in ClickHouse. The proxy hot path only sends to an in-memory queue; failed ClickHouse writes are logged and do not block requests.
+
+Access logs include remote IP, route, path, upstream, status, latency, and offline GeoIP fields. Treat ClickHouse as a privileged data store and keep it on a private network unless you have a separate access-control layer.
 
 ## Active Health Checks
 

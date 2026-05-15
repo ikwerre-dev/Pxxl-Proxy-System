@@ -15,22 +15,45 @@ spec:
       containers:
         - name: edge
           image: pxxl/edge:local
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            runAsNonRoot: true
+            capabilities:
+              drop: ["ALL"]
+              add: ["NET_BIND_SERVICE"]
           ports:
             - containerPort: 80
             - containerPort: 443
-            - containerPort: 8081
-            - containerPort: 9090
+          env:
+            - name: PXXL_ADMIN_BOOTSTRAP_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: pxxl-admin
+                  key: bootstrap-token
+                  optional: true
+          resources:
+            requests:
+              cpu: 100m
+              memory: 128Mi
+            limits:
+              cpu: "1"
+              memory: 512Mi
           volumeMounts:
             - name: config
               mountPath: /app/config
               readOnly: true
             - name: data
               mountPath: /data
+            - name: tmp
+              mountPath: /tmp
       volumes:
         - name: config
           configMap:
             name: pxxl-config
         - name: data
+          emptyDir: {}
+        - name: tmp
           emptyDir: {}
 ---
 apiVersion: v1
@@ -47,9 +70,3 @@ spec:
     - name: https
       port: 443
       targetPort: 443
-    - name: admin
-      port: 8081
-      targetPort: 8081
-    - name: metrics
-      port: 9090
-      targetPort: 9090

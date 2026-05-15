@@ -1,6 +1,8 @@
 use async_trait::async_trait;
 use rcgen::{Certificate, CertificateParams, DnType};
 use rustls::{pki_types::CertificateDer, ServerConfig};
+#[cfg(unix)]
+use std::os::unix::fs::PermissionsExt;
 use std::{
     fs::File,
     io::{BufReader, Cursor},
@@ -104,6 +106,7 @@ impl LocalCertificateStore {
                 path: key_path.display().to_string(),
                 source,
             })?;
+        set_private_key_permissions(&key_path).await?;
 
         info!(cert = %cert_path.display(), "regenerated local development certificate");
 
@@ -163,6 +166,7 @@ impl CertificateIssuer for LocalCertificateStore {
                 path: key_path.display().to_string(),
                 source,
             })?;
+        set_private_key_permissions(&key_path).await?;
 
         info!(cert = %cert_path.display(), "generated local development certificate");
 
@@ -172,6 +176,22 @@ impl CertificateIssuer for LocalCertificateStore {
             domains: sans,
         })
     }
+}
+
+#[cfg(unix)]
+async fn set_private_key_permissions(path: &Path) -> Result<()> {
+    let permissions = std::fs::Permissions::from_mode(0o600);
+    fs::set_permissions(path, permissions)
+        .await
+        .map_err(|source| TlsError::Write {
+            path: path.display().to_string(),
+            source,
+        })
+}
+
+#[cfg(not(unix))]
+async fn set_private_key_permissions(_path: &Path) -> Result<()> {
+    Ok(())
 }
 
 fn generate_certificate(domains: &[String]) -> Result<(String, String, Vec<String>)> {

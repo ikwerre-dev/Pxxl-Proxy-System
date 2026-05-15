@@ -8,17 +8,37 @@ services:
     restart: unless-stopped
     environment:
       PXXL_CONFIG: /app/config/pxxl.toml
+      PXXL_ADMIN_ADDR: 0.0.0.0:8081
+      PXXL_METRICS_ADDR: 0.0.0.0:9090
+      PXXL_ADMIN_BOOTSTRAP_TOKEN: ${PXXL_ADMIN_BOOTSTRAP_TOKEN:-}
+      PXXL_ADMIN_IP_ALLOWLIST: ${PXXL_ADMIN_IP_ALLOWLIST:-}
       RUST_LOG: pxxl_edge=info,pxxl=info
     ports:
       - "80:80"
       - "443:443"
-      - "8081:8081"
-      - "9090:9090"
+      - "127.0.0.1:8081:8081"
+      - "127.0.0.1:9090:9090"
     volumes:
       - ./config:/app/config:ro
       - ./data:/data
       - /var/run/docker.sock:/var/run/docker.sock:ro
       - ${PODMAN_SOCKET_PATH:-/var/run/podman/podman.sock}:/var/run/podman/podman.sock:ro
+    read_only: true
+    tmpfs:
+      - /tmp
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    cap_add:
+      - NET_BIND_SERVICE
+    mem_limit: 512m
+    cpus: "1.0"
+    healthcheck:
+      test: ["CMD-SHELL", "test -x /usr/local/bin/pxxl-edge"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
     depends_on:
       - redis
       - postgres
@@ -29,8 +49,6 @@ services:
     container_name: pxxl-proxy-redis
     restart: unless-stopped
     command: redis-server --appendonly yes
-    ports:
-      - "6379:6379"
     volumes:
       - ./data/redis:/data
 
@@ -42,8 +60,6 @@ services:
       POSTGRES_USER: pxxl
       POSTGRES_PASSWORD: pxxl
       POSTGRES_DB: pxxl
-    ports:
-      - "5432:5432"
     volumes:
       - ./data/postgres:/var/lib/postgresql/data
 
@@ -56,9 +72,6 @@ services:
       CLICKHOUSE_USER: pxxl
       CLICKHOUSE_PASSWORD: pxxl
       CLICKHOUSE_DEFAULT_ACCESS_MANAGEMENT: "1"
-    ports:
-      - "8123:8123"
-      - "9000:9000"
     volumes:
       - ./data/clickhouse:/var/lib/clickhouse
 
@@ -67,7 +80,7 @@ services:
     container_name: pxxl-proxy-prometheus
     restart: unless-stopped
     ports:
-      - "9091:9090"
+      - "127.0.0.1:9091:9090"
     volumes:
       - ./monitoring/prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro
       - ./data/prometheus:/prometheus
@@ -79,8 +92,6 @@ services:
     container_name: pxxl-proxy-loki
     restart: unless-stopped
     command: -config.file=/etc/loki/local-config.yaml
-    ports:
-      - "3100:3100"
     volumes:
       - ./monitoring/loki/loki-config.yml:/etc/loki/local-config.yaml:ro
       - ./data/loki:/loki
@@ -102,9 +113,9 @@ services:
     restart: unless-stopped
     environment:
       GF_SECURITY_ADMIN_USER: admin
-      GF_SECURITY_ADMIN_PASSWORD: pxxl
+      GF_SECURITY_ADMIN_PASSWORD: ${GRAFANA_ADMIN_PASSWORD:?set GRAFANA_ADMIN_PASSWORD}
     ports:
-      - "${GRAFANA_PORT:-3000}:3000"
+      - "127.0.0.1:${GRAFANA_PORT:-3000}:3000"
     volumes:
       - ./data/grafana:/var/lib/grafana
       - ./monitoring/grafana/provisioning:/etc/grafana/provisioning:ro

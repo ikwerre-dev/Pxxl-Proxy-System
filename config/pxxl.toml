@@ -1,8 +1,8 @@
 [listeners]
 http = "0.0.0.0:80"
 https = "0.0.0.0:443"
-admin = "0.0.0.0:8081"
-metrics = "0.0.0.0:9090"
+admin = "127.0.0.1:8081"
+metrics = "127.0.0.1:9090"
 
 [tls]
 mode = "local"
@@ -30,9 +30,8 @@ database_path = "config/geoip/geoip.csv"
 
 [admin]
 auth_enabled = true
-bootstrap_token = "pxxl-dev-token"
 token_store_key = "pxxl:admin_tokens"
-ip_allowlist = []
+ip_allowlist = ["127.0.0.1", "::1"]
 
 [health_checks]
 enabled = true

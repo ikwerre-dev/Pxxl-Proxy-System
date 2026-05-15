@@ -1,7 +1,7 @@
 use anyhow::Context;
 use arc_swap::ArcSwap;
 use base64::Engine;
-use bytes::Bytes;
+use bytes::{Bytes, BytesMut};
 use dashmap::DashMap;
 use flate2::{write::GzEncoder, Compression};
 use http::{
@@ -21,11 +21,12 @@ use hyper_util::{
 };
 use parking_lot::Mutex;
 use pxxl_common::{
-    normalize_domain, BasicAuthConfig, BufferingConfig, CircuitBreakerConfig,
-    ClientCertForwardingConfig, CompressionConfig, ContentTypeAutoDetectConfig, DigestAuthConfig,
-    DomainRateLimit, DomainRules, ForwardAuthConfig, GeoLocation, InFlightLimitConfig,
-    InFlightLimitScope, MiddlewareDefinition, PassiveHealthConfig, PxxlError, RateLimitScope,
-    RetryConfig, RouteMatch, StickySessionConfig, TrafficMirrorConfig, TrafficSplitRule, Upstream,
+    canonicalize_request_path, normalize_domain, BasicAuthConfig, BufferingConfig,
+    CircuitBreakerConfig, ClientCertForwardingConfig, CompressionConfig,
+    ContentTypeAutoDetectConfig, DigestAuthConfig, DomainRateLimit, DomainRules, ForwardAuthConfig,
+    GeoLocation, InFlightLimitConfig, InFlightLimitScope, MiddlewareDefinition,
+    PassiveHealthConfig, PxxlError, RateLimitScope, RetryConfig, RouteMatch, StickySessionConfig,
+    TrafficMirrorConfig, TrafficSplitRule, Upstream,
 };
 use pxxl_core::{EdgeState, RequestObservation};
 use pxxl_ddos::SecurityDecision;
@@ -47,7 +48,8 @@ use std::{
 use tokio::{
     io::{AsyncRead, AsyncWrite},
     net::{TcpListener, TcpStream},
-    sync::watch,
+    sync::{watch, Semaphore},
+    time,
 };
 use tokio_rustls::server::TlsStream;
 use tokio_rustls::TlsAcceptor;
@@ -57,6 +59,10 @@ use uuid::Uuid;
 type BoxError = Box<dyn std::error::Error + Send + Sync>;
 type BoxBody = http_body_util::combinators::BoxBody<Bytes, BoxError>;
 const REQUEST_ID_HEADER: &str = "x-request-id";
+const EDGE_CONNECTION_TIMEOUT_SECONDS: u64 = 120;
+const EDGE_MAX_CONNECTIONS: usize = 8192;
+const POLICY_RATE_BUCKET_TTL_SECONDS: u64 = 600;
+const POLICY_RATE_BUCKET_EVICT_AT: usize = 100_000;
 
 #[derive(Clone, Debug)]
 pub struct ErrorPageRenderer {
@@ -540,7 +546,7 @@ impl PolicyEnforcer {
             }
         }
 
-        if let Some(reason) = waf_rejection_reason(req, rules) {
+        if let Some(reason) = waf_rejection_reason(req, rules, context.path) {
             return Some(policy_rejection(
                 StatusCode::FORBIDDEN,
                 "request blocked by waf rules",
@@ -932,6 +938,7 @@ impl PolicyRateLimiter {
         let rate = effective_rate_per_second(limit)?;
         let burst = limit.burst.max(1) as f64;
         let key = PolicyRateKey::new(domain, path, remote_ip, &limit.scope);
+        self.evict_stale();
         let entry = self.buckets.entry(key).or_insert_with(|| {
             Mutex::new(PolicyRateBucket {
                 tokens: burst,
@@ -960,6 +967,16 @@ impl PolicyRateLimiter {
                     .unwrap_or_else(|| Duration::from_secs_f64(1.0 / rate.max(0.001))),
             )
         }
+    }
+
+    fn evict_stale(&self) {
+        if self.buckets.len() < POLICY_RATE_BUCKET_EVICT_AT {
+            return;
+        }
+        let now = Instant::now();
+        let ttl = Duration::from_secs(POLICY_RATE_BUCKET_TTL_SECONDS);
+        self.buckets
+            .retain(|_, bucket| now.duration_since(bucket.lock().last_refill) <= ttl);
     }
 }
 
@@ -1059,11 +1076,36 @@ impl ProxyServer {
         }
 
         let method = req.method().clone();
-        let path = req
-            .uri()
-            .path_and_query()
-            .map(|value| value.as_str().to_string())
-            .unwrap_or_else(|| "/".to_string());
+        let original_query = req.uri().query().map(str::to_string);
+        let path = match canonicalize_request_path(req.uri().path()) {
+            Ok(path) => path,
+            Err(error) => {
+                warn!(%error, request_id = %request_id, "rejected invalid request path");
+                let raw_path = req
+                    .uri()
+                    .path_and_query()
+                    .map(|value| value.as_str().to_string())
+                    .unwrap_or_else(|| "/".to_string());
+                let unknown_location = GeoLocation::unknown();
+                let context = ProxyRequestContext {
+                    request_id: &request_id,
+                    domain: "unknown",
+                    method: method.as_str(),
+                    path: &raw_path,
+                    remote_ip,
+                    scheme,
+                    location: &unknown_location,
+                    timestamp_unix_ms: now_unix_ms(),
+                };
+                self.observe_request(&context, StatusCode::BAD_REQUEST, started, None);
+                finish_response!(self.error_response(
+                    StatusCode::BAD_REQUEST,
+                    "invalid request path",
+                    "unknown",
+                    &raw_path,
+                ));
+            }
+        };
         let location = remote_ip
             .map(|ip| self.geoip.lookup(ip))
             .unwrap_or_else(GeoLocation::unknown);
@@ -1279,6 +1321,9 @@ impl ProxyServer {
         }
 
         let mut req = req;
+        if let Ok(uri) = canonical_forward_uri(req.uri(), &path, original_query.as_deref()) {
+            *req.uri_mut() = uri;
+        }
         self.policy
             .apply_request_rules(req.headers_mut(), &matched.route.rules);
         if middleware.content_type_autodetect.enabled {
@@ -1958,6 +2003,7 @@ impl BufferedRequest {
             .body(Full::new(self.body.clone()))
             .map_err(|_| PxxlError::InvalidUpstream(upstream.url.clone()))?;
         *request.headers_mut() = self.headers.clone();
+        strip_forwarded_request_headers(request.headers_mut());
         if let Ok(length) = HeaderValue::from_str(&self.body.len().to_string()) {
             request.headers_mut().insert(CONTENT_LENGTH, length);
         }
@@ -2010,6 +2056,59 @@ pub fn build_upstream_uri(upstream: &Upstream, original: &Uri) -> Result<Uri, Px
     target
         .parse::<Uri>()
         .map_err(|_| PxxlError::InvalidUpstream(upstream.url.clone()))
+}
+
+fn canonical_forward_uri(
+    original: &Uri,
+    canonical_path: &str,
+    query: Option<&str>,
+) -> Result<Uri, PxxlError> {
+    let path_and_query = match query {
+        Some(query) if !query.is_empty() => format!("{canonical_path}?{query}"),
+        _ => canonical_path.to_string(),
+    };
+    let _ = original;
+    path_and_query
+        .parse::<Uri>()
+        .map_err(|_| PxxlError::InvalidPath(canonical_path.to_string()))
+}
+
+fn strip_forwarded_request_headers(headers: &mut HeaderMap) {
+    let connection_tokens = headers
+        .get_all(CONNECTION)
+        .iter()
+        .filter_map(|value| value.to_str().ok())
+        .flat_map(|value| value.split(',').map(str::trim).map(str::to_string))
+        .filter(|value| !value.is_empty())
+        .collect::<Vec<_>>();
+
+    for token in connection_tokens {
+        if let Ok(name) = HeaderName::from_bytes(token.as_bytes()) {
+            headers.remove(name);
+        }
+    }
+
+    for name in [
+        "connection",
+        "upgrade",
+        "te",
+        "trailer",
+        "proxy-authorization",
+        "proxy-connection",
+        "keep-alive",
+        "transfer-encoding",
+        "forwarded",
+        "x-forwarded-for",
+        "x-forwarded-host",
+        "x-forwarded-proto",
+        "x-forwarded-prefix",
+        "x-real-ip",
+        "x-original-url",
+        "x-rewrite-url",
+        "x-client-ip",
+    ] {
+        headers.remove(HeaderName::from_static(name));
+    }
 }
 
 pub async fn run_http_proxy(
@@ -2234,12 +2333,17 @@ async fn run_plain_listener(
     mut shutdown: watch::Receiver<bool>,
 ) -> anyhow::Result<()> {
     let server = ProxyServer::with_error_pages_policy_and_geoip(state, error_pages, policy, geoip);
+    let limiter = Arc::new(Semaphore::new(EDGE_MAX_CONNECTIONS));
 
     loop {
         tokio::select! {
             accepted = listener.accept() => {
                 let (stream, peer) = accepted?;
-                spawn_connection(stream, peer, server.clone(), RequestScheme::Http);
+                let Ok(permit) = limiter.clone().try_acquire_owned() else {
+                    debug!(peer = %peer, "edge HTTP connection limit reached");
+                    continue;
+                };
+                spawn_connection(stream, peer, server.clone(), RequestScheme::Http, permit);
             }
             changed = shutdown.changed() => {
                 if changed.is_ok() && *shutdown.borrow() {
@@ -2263,14 +2367,20 @@ async fn run_tls_listener(
     mut shutdown: watch::Receiver<bool>,
 ) -> anyhow::Result<()> {
     let server = ProxyServer::with_error_pages_policy_and_geoip(state, error_pages, policy, geoip);
+    let limiter = Arc::new(Semaphore::new(EDGE_MAX_CONNECTIONS));
 
     loop {
         tokio::select! {
             accepted = listener.accept() => {
                 let (stream, peer) = accepted?;
+                let Ok(permit) = limiter.clone().try_acquire_owned() else {
+                    debug!(peer = %peer, "edge HTTPS connection limit reached");
+                    continue;
+                };
                 let acceptor = TlsAcceptor::from(tls_config.load());
                 let server = server.clone();
                 tokio::spawn(async move {
+                    let _permit = permit;
                     match acceptor.accept(stream).await {
                         Ok(tls_stream) => {
                             let client_cert = peer_certificate_pem(&tls_stream);
@@ -2297,8 +2407,10 @@ fn spawn_connection(
     peer: SocketAddr,
     server: ProxyServer,
     scheme: RequestScheme,
+    permit: tokio::sync::OwnedSemaphorePermit,
 ) {
     tokio::spawn(async move {
+        let _permit = permit;
         serve_stream(stream, peer, server, scheme, None).await;
     });
 }
@@ -2341,8 +2453,15 @@ async fn serve_stream<S>(
     let io = TokioIo::new(stream);
     let builder = AutoBuilder::new(TokioExecutor::new());
 
-    if let Err(error) = builder.serve_connection_with_upgrades(io, service).await {
-        debug!(%error, "connection ended with error");
+    match time::timeout(
+        Duration::from_secs(EDGE_CONNECTION_TIMEOUT_SECONDS),
+        builder.serve_connection_with_upgrades(io, service),
+    )
+    .await
+    {
+        Ok(Ok(())) => {}
+        Ok(Err(error)) => debug!(%error, "connection ended with error"),
+        Err(_) => debug!("connection timed out"),
     }
 
     state.metrics.active_connections.dec();
@@ -2447,7 +2566,11 @@ fn cors_origin_allowed(origin: &HeaderValue, allowed_origins: &[String]) -> bool
         .any(|allowed| allowed == "*" || allowed.eq_ignore_ascii_case(origin))
 }
 
-fn waf_rejection_reason(req: &Request<Incoming>, rules: &DomainRules) -> Option<&'static str> {
+fn waf_rejection_reason(
+    req: &Request<Incoming>,
+    rules: &DomainRules,
+    canonical_path: &str,
+) -> Option<&'static str> {
     let waf = &rules.waf;
     if !waf.enabled {
         return None;
@@ -2456,6 +2579,7 @@ fn waf_rejection_reason(req: &Request<Incoming>, rules: &DomainRules) -> Option<
     let path = req.uri().path();
     let query = req.uri().query().unwrap_or_default();
     let path_lower = path.to_ascii_lowercase();
+    let canonical_path_lower = canonical_path.to_ascii_lowercase();
     let query_lower = query.to_ascii_lowercase();
     let user_agent_lower = req
         .headers()
@@ -2465,7 +2589,8 @@ fn waf_rejection_reason(req: &Request<Incoming>, rules: &DomainRules) -> Option<
         .to_ascii_lowercase();
 
     if waf.block_path_traversal
-        && contains_any(&path_lower, &["../", "..\\", "%2e%2e", "%252e%252e"])
+        && (contains_any(&path_lower, &["../", "..\\", "%2e%2e", "%252e%252e"])
+            || path_had_structural_normalization(path, canonical_path))
     {
         return Some("waf_path_traversal");
     }
@@ -2491,7 +2616,11 @@ fn waf_rejection_reason(req: &Request<Incoming>, rules: &DomainRules) -> Option<
 
     if waf.block_xss
         && (contains_any(&query_lower, &["<script", "%3cscript", "javascript:"])
-            || contains_any(&path_lower, &["<script", "%3cscript", "javascript:"]))
+            || contains_any(&path_lower, &["<script", "%3cscript", "javascript:"])
+            || contains_any(
+                &canonical_path_lower,
+                &["<script", "%3cscript", "javascript:"],
+            ))
     {
         return Some("waf_xss");
     }
@@ -2509,7 +2638,9 @@ fn waf_rejection_reason(req: &Request<Incoming>, rules: &DomainRules) -> Option<
         return Some("waf_user_agent");
     }
 
-    if string_patterns_match(&path_lower, &waf.blocked_path_patterns) {
+    if string_patterns_match(&path_lower, &waf.blocked_path_patterns)
+        || string_patterns_match(&canonical_path_lower, &waf.blocked_path_patterns)
+    {
         return Some("waf_path_pattern");
     }
 
@@ -2529,6 +2660,19 @@ fn string_patterns_match(value_lower: &str, patterns: &[String]) -> bool {
         .iter()
         .map(|pattern| pattern.to_ascii_lowercase())
         .any(|pattern| !pattern.is_empty() && value_lower.contains(&pattern))
+}
+
+fn path_had_structural_normalization(raw_path: &str, canonical_path: &str) -> bool {
+    if raw_path == canonical_path {
+        return false;
+    }
+    let raw_lower = raw_path.to_ascii_lowercase();
+    contains_any(
+        &raw_lower,
+        &[
+            "..", "%2e", "%252e", "%2f", "%252f", "%5c", "%255c", "\\", "//",
+        ],
+    )
 }
 
 fn location_rule_matches(rule: &TrafficSplitRule, location: &GeoLocation) -> bool {
@@ -2558,15 +2702,18 @@ fn insert_static_header(headers: &mut HeaderMap, name: &'static str, value: &'st
 }
 
 async fn collect_body_with_limit(body: Incoming, max_bytes: u64) -> Result<Bytes, BufferError> {
-    let collected = body
-        .collect()
-        .await
-        .map_err(|error| BufferError::Body(error.to_string()))?;
-    let bytes = collected.to_bytes();
-    if bytes.len() as u64 > max_bytes {
-        return Err(BufferError::TooLarge);
+    let mut body = body;
+    let mut collected = BytesMut::new();
+    while let Some(frame) = body.frame().await {
+        let frame = frame.map_err(|error| BufferError::Body(error.to_string()))?;
+        if let Some(data) = frame.data_ref() {
+            if collected.len() as u64 + data.len() as u64 > max_bytes {
+                return Err(BufferError::TooLarge);
+            }
+            collected.extend_from_slice(data);
+        }
     }
-    Ok(bytes)
+    Ok(collected.freeze())
 }
 
 fn expand_middleware_names(

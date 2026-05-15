@@ -24,6 +24,8 @@ pub struct DockerDiscovery {
     published_port_host: Option<String>,
 }
 
+const DOCKER_API_RESPONSE_LIMIT_BYTES: usize = 5 * 1024 * 1024;
+
 impl DockerDiscovery {
     pub fn new(socket_path: impl Into<PathBuf>) -> Self {
         Self::with_provider(ContainerProvider::Docker, socket_path)
@@ -74,7 +76,20 @@ impl DockerDiscovery {
         stream.write_all(request.as_bytes()).await?;
 
         let mut response = Vec::new();
-        stream.read_to_end(&mut response).await?;
+        let mut buffer = [0_u8; 8192];
+        loop {
+            let read = stream.read(&mut buffer).await?;
+            if read == 0 {
+                break;
+            }
+            if response.len() + read > DOCKER_API_RESPONSE_LIMIT_BYTES {
+                bail!(
+                    "Docker API response exceeded {} bytes",
+                    DOCKER_API_RESPONSE_LIMIT_BYTES
+                );
+            }
+            response.extend_from_slice(&buffer[..read]);
+        }
         parse_http_response_body(&response).context("Docker HTTP response did not include a body")
     }
 }
@@ -186,7 +201,7 @@ struct DockerRouteTarget {
 
 pub fn route_from_labels(labels: &HashMap<String, String>, container_name: &str) -> Option<Route> {
     route_target_from_labels(labels, container_name)
-        .map(|target| route_from_target(target, ContainerProvider::Docker))
+        .and_then(|target| route_from_target(target, ContainerProvider::Docker).ok())
 }
 
 fn route_target_from_labels(
@@ -270,14 +285,18 @@ fn route_target_from_label_config(
     }
 }
 
-fn route_from_target(target: DockerRouteTarget, provider: ContainerProvider) -> Route {
+fn route_from_target(target: DockerRouteTarget, provider: ContainerProvider) -> Result<Route> {
     let id = container_route_id(provider, &target.domain, Some(&target.path));
-    Route::new(
+    let route = Route::new(
         target.domain,
         vec![PathRoute::new(target.path, vec![target.upstream])],
         provider.route_source(),
     )
-    .with_id(id)
+    .with_id(id);
+    route
+        .validate_for_dynamic_control_plane()
+        .map_err(|reason| anyhow::anyhow!("invalid container route: {reason}"))?;
+    Ok(route)
 }
 
 fn routes_from_targets(
@@ -303,7 +322,7 @@ fn routes_from_targets(
 
     grouped
         .into_iter()
-        .map(|(domain, paths_by_prefix)| {
+        .filter_map(|(domain, paths_by_prefix)| {
             let paths = paths_by_prefix
                 .into_iter()
                 .map(|(prefix, mut upstreams)| {
@@ -312,8 +331,15 @@ fn routes_from_targets(
                 })
                 .collect::<Vec<_>>();
 
-            Route::new(domain.clone(), paths, provider.route_source())
-                .with_id(container_route_id(provider, &domain, None))
+            let route = Route::new(domain.clone(), paths, provider.route_source())
+                .with_id(container_route_id(provider, &domain, None));
+            match route.validate_for_dynamic_control_plane() {
+                Ok(()) => Some(route),
+                Err(reason) => {
+                    warn!(provider = provider.label(), %domain, %reason, "ignoring invalid container route");
+                    None
+                }
+            }
         })
         .collect()
 }
@@ -381,6 +407,12 @@ fn decode_chunked_body(body: &[u8]) -> Result<Vec<u8>> {
         let end = cursor + size;
         if end + 2 > body.len() {
             bail!("invalid chunked body: chunk exceeded response length");
+        }
+        if decoded.len() + size > DOCKER_API_RESPONSE_LIMIT_BYTES {
+            bail!(
+                "decoded Docker API response exceeded {} bytes",
+                DOCKER_API_RESPONSE_LIMIT_BYTES
+            );
         }
         decoded.extend_from_slice(&body[cursor..end]);
         cursor = end + 2;

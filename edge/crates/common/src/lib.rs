@@ -17,6 +17,8 @@ pub enum PxxlError {
     InvalidUpstream(String),
     #[error("invalid host header")]
     InvalidHost,
+    #[error("invalid request path: {0}")]
+    InvalidPath(String),
 }
 
 pub type Result<T> = std::result::Result<T, PxxlError>;
@@ -851,6 +853,53 @@ impl Route {
             .filter(|route| route.matches(path))
             .max_by_key(|route| route.prefix.len())
     }
+
+    pub fn validate_for_runtime(&self) -> std::result::Result<(), String> {
+        validate_domain_name(&self.domain)?;
+        if self.paths.is_empty() {
+            return Err("route needs at least one path".to_string());
+        }
+        for path in &self.paths {
+            validate_path_prefix(&path.prefix)?;
+            if path.upstreams.is_empty() {
+                return Err(format!("path {} needs at least one upstream", path.prefix));
+            }
+            for upstream in &path.upstreams {
+                validate_upstream(upstream)?;
+            }
+        }
+        validate_rules_for_runtime(&self.rules)
+    }
+
+    pub fn validate_for_dynamic_control_plane(&self) -> std::result::Result<(), String> {
+        self.validate_for_runtime()?;
+        for upstream in self.all_upstreams() {
+            validate_dynamic_upstream(upstream)?;
+        }
+        for middleware in self.rules.middlewares.values() {
+            if let Some(forward_auth) = &middleware.forward_auth {
+                if forward_auth.enabled {
+                    validate_dynamic_upstream_url(&forward_auth.url)?;
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn all_upstreams(&self) -> Vec<&Upstream> {
+        let mut upstreams = Vec::new();
+        for path in &self.paths {
+            upstreams.extend(path.upstreams.iter());
+        }
+        for route in &self.rules.location_routes {
+            upstreams.extend(route.upstreams.iter());
+        }
+        for split in &self.rules.traffic_splits {
+            upstreams.extend(split.upstreams.iter());
+        }
+        upstreams.extend(self.rules.traffic_mirroring.upstreams.iter());
+        upstreams
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -915,6 +964,283 @@ pub fn normalize_path_prefix(prefix: impl Into<String>) -> String {
         format!("/{raw}")
     };
     with_slash.trim_end_matches('/').to_string()
+}
+
+pub fn canonicalize_request_path(path: &str) -> Result<String> {
+    canonicalize_path(path).map_err(PxxlError::InvalidPath)
+}
+
+pub fn canonicalize_path(path: &str) -> std::result::Result<String, String> {
+    if path.is_empty() {
+        return Ok("/".to_string());
+    }
+    if !path.starts_with('/') {
+        return Err("path must start with '/'".to_string());
+    }
+
+    let mut decoded = path.to_string();
+    for _ in 0..4 {
+        let next = percent_decode_utf8(&decoded)?;
+        if next == decoded {
+            decoded = next;
+            break;
+        }
+        decoded = next;
+    }
+
+    if decoded
+        .as_bytes()
+        .iter()
+        .any(|byte| *byte < 0x20 || *byte == 0x7f)
+    {
+        return Err("path contains control characters".to_string());
+    }
+
+    let decoded = decoded.replace('\\', "/");
+    let mut segments = Vec::new();
+    for segment in decoded.split('/') {
+        match segment {
+            "" | "." => {}
+            ".." => {
+                segments.pop();
+            }
+            value => segments.push(value),
+        }
+    }
+
+    if segments.is_empty() {
+        Ok("/".to_string())
+    } else {
+        Ok(format!("/{}", segments.join("/")))
+    }
+}
+
+pub fn validate_domain_name(domain: &str) -> std::result::Result<(), String> {
+    let normalized = normalize_domain(domain);
+    if normalized.is_empty() {
+        return Err("domain is required".to_string());
+    }
+    if normalized.len() > 253 {
+        return Err("domain is too long".to_string());
+    }
+    if normalized
+        .bytes()
+        .any(|byte| byte <= 0x20 || byte == 0x7f || matches!(byte, b'/' | b'\\' | b'@'))
+    {
+        return Err("domain contains invalid characters".to_string());
+    }
+    if normalized.starts_with('.') || normalized.contains("..") {
+        return Err("domain has empty labels".to_string());
+    }
+    for label in normalized.split('.') {
+        if label.is_empty() || label.len() > 63 {
+            return Err("domain label is invalid".to_string());
+        }
+        if label.starts_with('-') || label.ends_with('-') {
+            return Err("domain label cannot start or end with '-'".to_string());
+        }
+        if !label
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-' || byte == b'_')
+        {
+            return Err("domain label contains invalid characters".to_string());
+        }
+    }
+    Ok(())
+}
+
+pub fn validate_path_prefix(prefix: &str) -> std::result::Result<(), String> {
+    if prefix.is_empty() || !prefix.starts_with('/') {
+        return Err("path prefix must start with '/'".to_string());
+    }
+    let canonical = canonicalize_path(prefix)?;
+    if canonical != normalize_path_prefix(prefix.to_string()) {
+        return Err("path prefix must already be canonical".to_string());
+    }
+    Ok(())
+}
+
+pub fn validate_upstream(upstream: &Upstream) -> std::result::Result<(), String> {
+    validate_upstream_url(&upstream.url)?;
+    if upstream.transport != UpstreamTransport::default() {
+        return Err("upstream transport options are not enforced yet".to_string());
+    }
+    Ok(())
+}
+
+pub fn validate_upstream_url(raw: &str) -> std::result::Result<(), String> {
+    if raw.len() > 2048 {
+        return Err("upstream URL is too long".to_string());
+    }
+    if raw.bytes().any(|byte| byte <= 0x20 || byte == 0x7f) {
+        return Err("upstream URL contains control or whitespace characters".to_string());
+    }
+    let parsed = Url::parse(raw).map_err(|error| format!("invalid upstream URL: {error}"))?;
+    match parsed.scheme() {
+        "http" => {}
+        "https" => return Err("HTTPS upstream transport is not enforced yet".to_string()),
+        _ => return Err("upstream URL scheme must be http".to_string()),
+    }
+    if !parsed.username().is_empty() || parsed.password().is_some() {
+        return Err("upstream URL must not contain credentials".to_string());
+    }
+    if parsed.fragment().is_some() {
+        return Err("upstream URL must not contain a fragment".to_string());
+    }
+    let Some(host) = parsed.host_str() else {
+        return Err("upstream URL needs a host".to_string());
+    };
+    validate_upstream_host(host)
+}
+
+pub fn validate_dynamic_upstream(upstream: &Upstream) -> std::result::Result<(), String> {
+    validate_upstream(upstream)?;
+    validate_dynamic_upstream_url(&upstream.url)
+}
+
+pub fn validate_dynamic_upstream_url(raw: &str) -> std::result::Result<(), String> {
+    validate_upstream_url(raw)?;
+    let parsed = Url::parse(raw).map_err(|error| format!("invalid upstream URL: {error}"))?;
+    let Some(host) = parsed.host_str() else {
+        return Err("upstream URL needs a host".to_string());
+    };
+    let host = host.trim_end_matches('.').to_ascii_lowercase();
+    if RESERVED_CONTROL_PLANE_HOSTS.contains(&host.as_str()) {
+        return Err(format!(
+            "reserved control-plane upstream host is not allowed: {host}"
+        ));
+    }
+    Ok(())
+}
+
+const RESERVED_CONTROL_PLANE_HOSTS: &[&str] = &[
+    "redis",
+    "postgres",
+    "clickhouse",
+    "prometheus",
+    "grafana",
+    "loki",
+    "promtail",
+    "pxxl-proxy-edge",
+    "edge",
+];
+
+fn validate_upstream_host(host: &str) -> std::result::Result<(), String> {
+    let host = host.trim_end_matches('.').to_ascii_lowercase();
+    if host.is_empty() {
+        return Err("upstream host is required".to_string());
+    }
+    if host == "localhost" || host.ends_with(".localhost") {
+        return Err("loopback upstream host is not allowed".to_string());
+    }
+    if host.bytes().any(|byte| byte <= 0x20 || byte == 0x7f) {
+        return Err("upstream host contains invalid characters".to_string());
+    }
+    if let Ok(ip) = host.parse::<IpAddr>() {
+        if !ip_allowed_for_upstream(ip) {
+            return Err("private, loopback, link-local, multicast, or unspecified upstream IP is not allowed".to_string());
+        }
+    }
+    Ok(())
+}
+
+fn ip_allowed_for_upstream(ip: IpAddr) -> bool {
+    match ip {
+        IpAddr::V4(ip) => {
+            !(ip.is_private()
+                || ip.is_loopback()
+                || ip.is_link_local()
+                || ip.is_multicast()
+                || ip.is_broadcast()
+                || ip.is_unspecified()
+                || ip.octets() == [169, 254, 169, 254])
+        }
+        IpAddr::V6(ip) => {
+            !(ip.is_loopback()
+                || ip.is_multicast()
+                || ip.is_unspecified()
+                || ip.segments()[0] & 0xfe00 == 0xfc00
+                || ip.segments()[0] & 0xffc0 == 0xfe80)
+        }
+    }
+}
+
+fn validate_rules_for_runtime(rules: &DomainRules) -> std::result::Result<(), String> {
+    if !rules.services.is_empty() {
+        return Err("weighted service composition is not enforced yet".to_string());
+    }
+    if rules.upstream_transport != UpstreamTransport::default() {
+        return Err("default upstream transport options are not enforced yet".to_string());
+    }
+    if rules.tls_options != RouterTlsOptions::default() {
+        return Err("per-router TLS options are not enforced yet".to_string());
+    }
+    if rules.acme != AcmeConfig::default() {
+        return Err("ACME options are not enforced yet".to_string());
+    }
+    if rules.tcp != TcpRoutingConfig::default() {
+        return Err("TCP routing options are not enforced yet".to_string());
+    }
+    if rules.udp != UdpRoutingConfig::default() {
+        return Err("UDP routing options are not enforced yet".to_string());
+    }
+    if rules.http3 != Http3Config::default() {
+        return Err("HTTP/3 options are not enforced yet".to_string());
+    }
+    for route in &rules.location_routes {
+        for upstream in &route.upstreams {
+            validate_upstream(upstream)?;
+        }
+    }
+    for split in &rules.traffic_splits {
+        for upstream in &split.upstreams {
+            validate_upstream(upstream)?;
+        }
+    }
+    for upstream in &rules.traffic_mirroring.upstreams {
+        validate_upstream(upstream)?;
+    }
+    for middleware in rules.middlewares.values() {
+        if let Some(forward_auth) = &middleware.forward_auth {
+            if forward_auth.enabled {
+                validate_upstream_url(&forward_auth.url)?;
+            }
+        }
+    }
+    Ok(())
+}
+
+fn percent_decode_utf8(input: &str) -> std::result::Result<String, String> {
+    let bytes = input.as_bytes();
+    let mut output = Vec::with_capacity(bytes.len());
+    let mut index = 0;
+    while index < bytes.len() {
+        if bytes[index] == b'%' {
+            if index + 2 >= bytes.len() {
+                return Err("invalid percent encoding".to_string());
+            }
+            let high = hex_value(bytes[index + 1])
+                .ok_or_else(|| "invalid percent encoding".to_string())?;
+            let low = hex_value(bytes[index + 2])
+                .ok_or_else(|| "invalid percent encoding".to_string())?;
+            output.push((high << 4) | low);
+            index += 3;
+        } else {
+            output.push(bytes[index]);
+            index += 1;
+        }
+    }
+    String::from_utf8(output)
+        .map_err(|_| "path percent-decoding produced invalid UTF-8".to_string())
+}
+
+fn hex_value(byte: u8) -> Option<u8> {
+    match byte {
+        b'0'..=b'9' => Some(byte - b'0'),
+        b'a'..=b'f' => Some(byte - b'a' + 10),
+        b'A'..=b'F' => Some(byte - b'A' + 10),
+        _ => None,
+    }
 }
 
 fn default_weight() -> u32 {
@@ -1031,6 +1357,33 @@ mod tests {
         assert!(route.matches_host("app.example.com:443"));
         assert!(route.matches_host("APP.EXAMPLE.COM"));
         assert!(!route.matches_host("api.example.com"));
+    }
+
+    #[test]
+    fn canonicalizes_encoded_and_dot_segment_paths() {
+        assert_eq!(canonicalize_path("/api/%2e%2e/admin").unwrap(), "/admin");
+        assert_eq!(
+            canonicalize_path("/api%2fusers//./42").unwrap(),
+            "/api/users/42"
+        );
+        assert_eq!(
+            canonicalize_path("/api/%252e%252e/admin").unwrap(),
+            "/admin"
+        );
+        assert!(canonicalize_path("/api/%zz").is_err());
+    }
+
+    #[test]
+    fn rejects_unsafe_dynamic_upstreams() {
+        let loopback = Upstream::new("http://127.0.0.1:8080");
+        let metadata = Upstream::new("http://169.254.169.254/latest");
+        let redis = Upstream::new("http://redis:6379");
+        let external = Upstream::new("http://example.com:8080");
+
+        assert!(validate_dynamic_upstream(&loopback).is_err());
+        assert!(validate_dynamic_upstream(&metadata).is_err());
+        assert!(validate_dynamic_upstream(&redis).is_err());
+        assert!(validate_dynamic_upstream(&external).is_ok());
     }
 
     #[test]

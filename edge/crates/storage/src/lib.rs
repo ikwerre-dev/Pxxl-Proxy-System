@@ -1,6 +1,6 @@
 use anyhow::{Context, Result};
 use base64::{engine::general_purpose::STANDARD, Engine};
-use bytes::Bytes;
+use bytes::{Bytes, BytesMut};
 use http::{header::AUTHORIZATION, Request, Uri};
 use http_body_util::{BodyExt, Full};
 use hyper_util::{
@@ -18,6 +18,8 @@ pub enum StorageError {
     #[error("storage backend is not initialized in Phase 1 MVP")]
     NotInitialized,
 }
+
+const CLICKHOUSE_ERROR_BODY_LIMIT_BYTES: u64 = 16 * 1024;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct StorageEndpoints {
@@ -152,7 +154,8 @@ ORDER BY (domain, timestamp_unix_ms, request_id)
         let request = builder.body(Full::new(Bytes::from(sql.to_string())))?;
         let response = self.client.request(request).await?;
         let status = response.status();
-        let body = response.into_body().collect().await?.to_bytes();
+        let body =
+            collect_body_limited(response.into_body(), CLICKHOUSE_ERROR_BODY_LIMIT_BYTES).await?;
         if !status.is_success() {
             anyhow::bail!(
                 "ClickHouse returned {status}: {}",
@@ -161,6 +164,21 @@ ORDER BY (domain, timestamp_unix_ms, request_id)
         }
         Ok(())
     }
+}
+
+async fn collect_body_limited(mut body: hyper::body::Incoming, max_bytes: u64) -> Result<Bytes> {
+    let mut collected = BytesMut::new();
+    while let Some(frame) = body.frame().await {
+        let frame = frame?;
+        if let Some(data) = frame.data_ref() {
+            if collected.len() as u64 + data.len() as u64 > max_bytes {
+                collected.extend_from_slice(b"<truncated>");
+                break;
+            }
+            collected.extend_from_slice(data);
+        }
+    }
+    Ok(collected.freeze())
 }
 
 impl ClickHouseEndpoint {

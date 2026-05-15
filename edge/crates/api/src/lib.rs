@@ -1,4 +1,4 @@
-use bytes::Bytes;
+use bytes::{Bytes, BytesMut};
 use http::{header::AUTHORIZATION, Method, Request, Response, StatusCode};
 use http_body_util::{BodyExt, Full};
 use hyper::{body::Incoming, service::service_fn};
@@ -20,12 +20,21 @@ use std::{
     convert::Infallible,
     net::{IpAddr, SocketAddr},
     sync::Arc,
+    time::Duration,
 };
-use tokio::{net::TcpListener, sync::watch};
+use tokio::{
+    net::TcpListener,
+    sync::{watch, Semaphore},
+    time,
+};
 use tracing::{debug, info};
 
 type BoxError = Box<dyn std::error::Error + Send + Sync>;
 type BoxBody = http_body_util::combinators::BoxBody<Bytes, BoxError>;
+const ADMIN_BODY_LIMIT_BYTES: u64 = 1024 * 1024;
+const ADMIN_TOKEN_NAME_MAX_BYTES: usize = 128;
+const API_CONNECTION_TIMEOUT_SECONDS: u64 = 120;
+const API_MAX_CONNECTIONS: usize = 2048;
 
 #[derive(Clone)]
 struct ApiServer {
@@ -199,10 +208,13 @@ impl AdminApiAuth {
                     StatusCode::UNAUTHORIZED,
                     json!({"error": "invalid bearer token"}),
                 )),
-                Err(error) => Some(json_response(
-                    StatusCode::BAD_GATEWAY,
-                    json!({"error": format!("failed to verify bearer token: {error}")}),
-                )),
+                Err(error) => {
+                    debug!(%error, "failed to verify bearer token");
+                    Some(json_response(
+                        StatusCode::BAD_GATEWAY,
+                        json!({"error": "authentication backend unavailable"}),
+                    ))
+                }
             },
             None => Some(json_response(
                 StatusCode::SERVICE_UNAVAILABLE,
@@ -217,20 +229,33 @@ async fn run_api_listener(
     server: ApiServer,
     mut shutdown: watch::Receiver<bool>,
 ) -> anyhow::Result<()> {
+    let limiter = Arc::new(Semaphore::new(API_MAX_CONNECTIONS));
     loop {
         tokio::select! {
             accepted = listener.accept() => {
                 let (stream, peer) = accepted?;
+                let Ok(permit) = limiter.clone().try_acquire_owned() else {
+                    debug!(peer = %peer, "admin API connection limit reached");
+                    continue;
+                };
                 let server = server.clone();
                 tokio::spawn(async move {
+                    let _permit = permit;
                     let service = service_fn(move |req| {
                         let server = server.clone();
                         async move { Ok::<_, Infallible>(server.handle(req, peer.ip()).await) }
                     });
                     let io = TokioIo::new(stream);
                     let builder = AutoBuilder::new(TokioExecutor::new());
-                    if let Err(error) = builder.serve_connection_with_upgrades(io, service).await {
-                        debug!(%error, "admin API connection ended with error");
+                    match time::timeout(
+                        Duration::from_secs(API_CONNECTION_TIMEOUT_SECONDS),
+                        builder.serve_connection_with_upgrades(io, service),
+                    )
+                    .await
+                    {
+                        Ok(Ok(())) => {}
+                        Ok(Err(error)) => debug!(%error, "admin API connection ended with error"),
+                        Err(_) => debug!("admin API connection timed out"),
                     }
                 });
             }
@@ -251,12 +276,18 @@ async fn run_metrics_listener(
     metrics: Arc<PxxlMetrics>,
     mut shutdown: watch::Receiver<bool>,
 ) -> anyhow::Result<()> {
+    let limiter = Arc::new(Semaphore::new(API_MAX_CONNECTIONS));
     loop {
         tokio::select! {
             accepted = listener.accept() => {
                 let (stream, _) = accepted?;
+                let Ok(permit) = limiter.clone().try_acquire_owned() else {
+                    debug!("metrics connection limit reached");
+                    continue;
+                };
                 let metrics = metrics.clone();
                 tokio::spawn(async move {
+                    let _permit = permit;
                     let service = service_fn(move |_req| {
                         let metrics = metrics.clone();
                         async move {
@@ -269,8 +300,15 @@ async fn run_metrics_listener(
                     });
                     let io = TokioIo::new(stream);
                     let builder = AutoBuilder::new(TokioExecutor::new());
-                    if let Err(error) = builder.serve_connection_with_upgrades(io, service).await {
-                        debug!(%error, "metrics connection ended with error");
+                    match time::timeout(
+                        Duration::from_secs(API_CONNECTION_TIMEOUT_SECONDS),
+                        builder.serve_connection_with_upgrades(io, service),
+                    )
+                    .await
+                    {
+                        Ok(Ok(())) => {}
+                        Ok(Err(error)) => debug!(%error, "metrics connection ended with error"),
+                        Err(_) => debug!("metrics connection timed out"),
                     }
                 });
             }
@@ -537,24 +575,26 @@ impl ApiServer {
                     );
                 }
 
-                match req.into_body().collect().await {
-                    Ok(collected) => {
-                        match serde_json::from_slice::<BlacklistBody>(&collected.to_bytes()) {
-                            Ok(body) => {
-                                self.state.security.blacklist().add(domain_id, body.ip);
-                                json_response(
-                                    StatusCode::OK,
-                                    json!({"status": "added", "domain_id": domain_id, "ip": body.ip}),
-                                )
-                            }
-                            Err(error) => json_response(
-                                StatusCode::BAD_REQUEST,
-                                json!({"error": error.to_string()}),
-                            ),
+                match collect_admin_body(req.into_body()).await {
+                    Ok(collected) => match serde_json::from_slice::<BlacklistBody>(&collected) {
+                        Ok(body) => {
+                            self.state.security.blacklist().add(domain_id, body.ip);
+                            json_response(
+                                StatusCode::OK,
+                                json!({"status": "added", "domain_id": domain_id, "ip": body.ip}),
+                            )
                         }
-                    }
-                    Err(error) => {
-                        json_response(StatusCode::BAD_REQUEST, json!({"error": error.to_string()}))
+                        Err(error) => json_response(
+                            StatusCode::BAD_REQUEST,
+                            json!({"error": error.to_string()}),
+                        ),
+                    },
+                    Err(ApiBodyError::TooLarge) => json_response(
+                        StatusCode::PAYLOAD_TOO_LARGE,
+                        json!({"error": "request body is too large"}),
+                    ),
+                    Err(ApiBodyError::Body(error)) => {
+                        json_response(StatusCode::BAD_REQUEST, json!({"error": error}))
                     }
                 }
             }
@@ -588,13 +628,19 @@ impl ApiServer {
     }
 
     async fn create_domain(&self, req: Request<Incoming>) -> Response<BoxBody> {
-        let collected = match req.into_body().collect().await {
+        let collected = match collect_admin_body(req.into_body()).await {
             Ok(collected) => collected,
-            Err(error) => {
-                return json_response(StatusCode::BAD_REQUEST, json!({"error": error.to_string()}));
+            Err(ApiBodyError::TooLarge) => {
+                return json_response(
+                    StatusCode::PAYLOAD_TOO_LARGE,
+                    json!({"error": "request body is too large"}),
+                );
+            }
+            Err(ApiBodyError::Body(error)) => {
+                return json_response(StatusCode::BAD_REQUEST, json!({"error": error}));
             }
         };
-        let body = match serde_json::from_slice::<DomainRouteBody>(&collected.to_bytes()) {
+        let body = match serde_json::from_slice::<DomainRouteBody>(&collected) {
             Ok(body) => body,
             Err(error) => {
                 return json_response(StatusCode::BAD_REQUEST, json!({"error": error.to_string()}));
@@ -625,18 +671,30 @@ impl ApiServer {
     }
 
     async fn create_auth_token(&self, req: Request<Incoming>) -> Response<BoxBody> {
-        let collected = match req.into_body().collect().await {
+        let collected = match collect_admin_body(req.into_body()).await {
             Ok(collected) => collected,
-            Err(error) => {
-                return json_response(StatusCode::BAD_REQUEST, json!({"error": error.to_string()}));
+            Err(ApiBodyError::TooLarge) => {
+                return json_response(
+                    StatusCode::PAYLOAD_TOO_LARGE,
+                    json!({"error": "request body is too large"}),
+                );
+            }
+            Err(ApiBodyError::Body(error)) => {
+                return json_response(StatusCode::BAD_REQUEST, json!({"error": error}));
             }
         };
-        let body = match serde_json::from_slice::<TokenCreateBody>(&collected.to_bytes()) {
+        let body = match serde_json::from_slice::<TokenCreateBody>(&collected) {
             Ok(body) => body,
             Err(error) => {
                 return json_response(StatusCode::BAD_REQUEST, json!({"error": error.to_string()}));
             }
         };
+        if body.name.len() > ADMIN_TOKEN_NAME_MAX_BYTES {
+            return json_response(
+                StatusCode::BAD_REQUEST,
+                json!({"error": "token name is too long"}),
+            );
+        }
 
         let Some(store) = &self.auth.token_store else {
             return json_response(
@@ -744,6 +802,7 @@ impl DomainRouteBody {
         route.tls = self.tls.unwrap_or(true);
         route.algorithm = self.algorithm;
         route.rules = self.rules;
+        route.validate_for_dynamic_control_plane()?;
         Ok(route)
     }
 }
@@ -807,6 +866,26 @@ fn bearer_token(req: &Request<Incoming>) -> Option<&str> {
         .and_then(|value| value.strip_prefix("Bearer "))
         .map(str::trim)
         .filter(|value| !value.is_empty())
+}
+
+#[derive(Debug)]
+enum ApiBodyError {
+    TooLarge,
+    Body(String),
+}
+
+async fn collect_admin_body(mut body: Incoming) -> Result<Bytes, ApiBodyError> {
+    let mut collected = BytesMut::new();
+    while let Some(frame) = body.frame().await {
+        let frame = frame.map_err(|error| ApiBodyError::Body(error.to_string()))?;
+        if let Some(data) = frame.data_ref() {
+            if collected.len() as u64 + data.len() as u64 > ADMIN_BODY_LIMIT_BYTES {
+                return Err(ApiBodyError::TooLarge);
+            }
+            collected.extend_from_slice(data);
+        }
+    }
+    Ok(collected.freeze())
 }
 
 fn constant_time_eq(left: &[u8], right: &[u8]) -> bool {

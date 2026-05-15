@@ -117,6 +117,9 @@ pub struct RateLimiter {
     buckets: DashMap<IpAddr, Mutex<RateBucket>>,
 }
 
+const RATE_BUCKET_TTL_SECONDS: u64 = 600;
+const RATE_BUCKET_EVICT_AT: usize = 100_000;
+
 impl RateLimiter {
     pub fn new(config: RateLimitConfig) -> Self {
         Self {
@@ -126,6 +129,7 @@ impl RateLimiter {
     }
 
     pub fn allow(&self, ip: IpAddr) -> SecurityDecision {
+        self.evict_stale();
         let entry = self.buckets.entry(ip).or_insert_with(|| {
             Mutex::new(RateBucket {
                 tokens: self.config.burst as f64,
@@ -156,6 +160,16 @@ impl RateLimiter {
 
     pub fn bucket_count(&self) -> usize {
         self.buckets.len()
+    }
+
+    fn evict_stale(&self) {
+        if self.buckets.len() < RATE_BUCKET_EVICT_AT {
+            return;
+        }
+        let now = Instant::now();
+        let ttl = Duration::from_secs(RATE_BUCKET_TTL_SECONDS);
+        self.buckets
+            .retain(|_, bucket| now.duration_since(bucket.lock().last_refill) <= ttl);
     }
 }
 

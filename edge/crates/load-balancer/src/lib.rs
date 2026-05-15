@@ -7,6 +7,8 @@ use std::{
     sync::atomic::{AtomicU64, AtomicUsize, Ordering},
 };
 
+const MAX_LOAD_BALANCER_KEYS: usize = 100_000;
+
 #[derive(Debug, Default)]
 pub struct LoadBalancer {
     counters: DashMap<String, AtomicUsize>,
@@ -26,6 +28,7 @@ impl LoadBalancer {
         upstreams: &[Upstream],
         client_ip: Option<IpAddr>,
     ) -> Option<Upstream> {
+        self.evict_if_needed();
         let healthy: Vec<Upstream> = upstreams
             .iter()
             .filter(|upstream| upstream.healthy)
@@ -61,6 +64,7 @@ impl LoadBalancer {
     }
 
     pub fn begin_request(&self, route_key: &str, upstream: &str) {
+        self.evict_if_needed();
         self.in_flight
             .entry(upstream_key(route_key, upstream))
             .or_insert_with(|| AtomicUsize::new(0))
@@ -99,6 +103,7 @@ impl LoadBalancer {
     }
 
     pub fn select_weighted_index(&self, route_key: &str, weights: &[u32]) -> Option<usize> {
+        self.evict_if_needed();
         if weights.is_empty() {
             return None;
         }
@@ -193,6 +198,18 @@ impl LoadBalancer {
                     .unwrap_or(0)
             })
             .cloned()
+    }
+
+    fn evict_if_needed(&self) {
+        if self.counters.len() > MAX_LOAD_BALANCER_KEYS {
+            self.counters.clear();
+        }
+        if self.in_flight.len() > MAX_LOAD_BALANCER_KEYS {
+            self.in_flight.clear();
+        }
+        if self.ewma_latency_micros.len() > MAX_LOAD_BALANCER_KEYS {
+            self.ewma_latency_micros.clear();
+        }
     }
 }
 

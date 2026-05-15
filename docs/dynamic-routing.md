@@ -8,7 +8,7 @@ The fast request path never queries Redis. API-created routes are persisted in R
 
 ```http
 POST /v1/domains
-Authorization: Bearer pxxl-dev-token
+Authorization: Bearer <bootstrap-or-admin-token>
 Content-Type: application/json
 
 {
@@ -235,9 +235,11 @@ Add `rules` to the domain body to control edge behavior per domain:
 
 Bare IPs in `ip_allowlist` and `ip_blocklist` are accepted; Pxxl treats them as single-host networks. `allowed_headers` is strict when set, so include ordinary client headers like `host`, `content-type`, `authorization`, and `origin`.
 
+Dynamic routes are validated before they enter the registry. API, Redis-loaded, Docker-label, and Podman-label routes must use valid domains, normalized absolute path prefixes, and `http://` upstream URLs. Control-plane routes reject URL credentials, fragments, control characters, `https://` upstreams until verified upstream TLS transport is implemented, loopback/private/link-local/multicast IP literals, `localhost`, `.localhost`, and common internal service names such as `redis`, `postgres`, `clickhouse`, `prometheus`, `grafana`, and `loki`. Static TOML routes are considered operator-owned and can still target internal Compose services intentionally.
+
 `www_alias = true` lets `www.<domain>` match the base route. Location rules use offline GeoIP data. Pxxl reads `config/geoip/geoip.csv` at startup and does not call the internet while handling requests. `country_*` fields match country codes like `US` or `NG`; `continent_*` fields match continent codes like `NA`, `AF`, or `EU`. `traffic_splits` provide weighted canary pools and may also be scoped by country/continent. If no traffic split matches, `location_routes` are evaluated in order and the first matching rule with upstreams replaces the normal path upstreams for that request.
 
-WAF rules are lightweight substring checks for path traversal, common SQL injection/XSS markers, scanner user agents, and custom user-agent/path/query patterns.
+WAF rules are lightweight substring checks for path traversal, common SQL injection/XSS markers, scanner user agents, and custom user-agent/path/query patterns. Route matching and WAF checks use a canonicalized request path, and the canonical path is what Pxxl forwards upstream. `max_body_bytes` pre-checks `Content-Length` and also caps collected streaming/chunked request bodies.
 
 Supported algorithms are `round_robin`, `weighted_round_robin`, `ip_hash`, `least_connections`, `p2c`, `hrw`, `ewma_latency`, and `latency_aware`.
 
