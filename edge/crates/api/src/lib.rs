@@ -189,6 +189,7 @@ impl ApiServer {
     async fn handle(&self, req: Request<Incoming>) -> Response<BoxBody> {
         let method = req.method().clone();
         let path = req.uri().path().to_string();
+        let query = req.uri().query().unwrap_or("").to_string();
 
         match (method, path.as_str()) {
             (Method::GET, "/healthz") => json_response(StatusCode::OK, json!({"status": "ok"})),
@@ -215,6 +216,17 @@ impl ApiServer {
                 StatusCode::OK,
                 json!({ "domains": self.state.stats.snapshots() }),
             ),
+            (Method::GET, "/v1/analytics/routes") => json_response(
+                StatusCode::OK,
+                json!({ "routes": self.state.stats.snapshots() }),
+            ),
+            (Method::GET, "/v1/analytics/visits") => {
+                let limit = query_limit(&query, 50, 200);
+                json_response(
+                    StatusCode::OK,
+                    json!({ "visits": self.state.stats.recent_visits_all(limit) }),
+                )
+            }
             (Method::GET, path) if path.starts_with("/v1/domains/") && path.ends_with("/stats") => {
                 let domain = path
                     .trim_start_matches("/v1/domains/")
@@ -241,11 +253,38 @@ impl ApiServer {
                                 "responses_5xx": 0,
                                 "average_latency_ms": 0.0,
                                 "last_status": null,
-                                "last_seen_unix_ms": null
+                                "last_seen_unix_ms": null,
+                                "top_countries": [],
+                                "top_continents": [],
+                                "top_paths": [],
+                                "top_upstreams": []
                             }
                         }),
                     ),
                 }
+            }
+            (Method::GET, path)
+                if path.starts_with("/v1/domains/") && path.ends_with("/visits") =>
+            {
+                let domain = path
+                    .trim_start_matches("/v1/domains/")
+                    .trim_end_matches("/visits")
+                    .trim_matches('/');
+                if domain.is_empty() {
+                    return json_response(
+                        StatusCode::BAD_REQUEST,
+                        json!({"error": "missing domain"}),
+                    );
+                }
+                let normalized = normalize_domain(domain);
+                let limit = query_limit(&query, 50, 200);
+                json_response(
+                    StatusCode::OK,
+                    json!({
+                        "domain": normalized,
+                        "visits": self.state.stats.recent_visits(&normalized, limit)
+                    }),
+                )
             }
             (Method::GET, path) if path.starts_with("/v1/domains/") => {
                 let domain = path.trim_start_matches("/v1/domains/").trim_matches('/');
@@ -489,6 +528,21 @@ fn default_weight() -> u32 {
 
 fn root_path() -> String {
     "/".to_string()
+}
+
+fn query_limit(query: &str, default: usize, max: usize) -> usize {
+    query
+        .split('&')
+        .filter_map(|part| part.split_once('='))
+        .find_map(|(key, value)| {
+            if key == "limit" {
+                value.parse::<usize>().ok()
+            } else {
+                None
+            }
+        })
+        .unwrap_or(default)
+        .clamp(1, max)
 }
 
 fn json_response(status: StatusCode, value: serde_json::Value) -> Response<BoxBody> {

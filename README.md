@@ -2,7 +2,7 @@
 
 Open source Traefik + Nginx alternative by Robinson Honour.
 
-Pxxl Proxy is a Rust-based edge proxy platform focused on low-latency HTTP routing, Docker label discovery, local TLS, in-memory DDoS controls, Prometheus metrics, and production-minded crate boundaries.
+Pxxl Proxy is a Rust-based edge proxy platform focused on low-latency HTTP routing, Docker label discovery, local TLS, in-memory DDoS controls, offline GeoIP routing, route analytics, Prometheus metrics, and production-minded crate boundaries.
 
 This repository currently implements the Phase 1 MVP:
 
@@ -13,12 +13,14 @@ This repository currently implements the Phase 1 MVP:
 - In-memory per-domain IP blacklist and CIDR blocking
 - Per-IP token-bucket request rate limiting
 - Per-domain route rules for WebSockets, headers, IP allow/block lists, CORS, HTTPS enforcement, body limits, and custom rate limits
+- Offline GeoIP lookups for country/continent analytics, blocking, and location-based upstream routing
+- In-memory route analytics with aggregate counters and recent visit history
 - Round-robin, weighted round-robin, and IP-hash load-balancer selection
 - Admin API for health, routes, upstreams, cert metadata, and blacklist changes
 - Prometheus metrics endpoint
 - Docker, Docker Compose, CI, docs, examples, and tests
 
-Future phases will add TCP/UDP proxying, production ACME flows, ClickHouse analytics ingestion, JWT/RBAC, dashboard UI, active health checks, circuit breakers, cluster sync, and deeper DDoS controls.
+Future phases will add TCP/UDP proxying, production ACME flows, durable ClickHouse analytics ingestion, JWT/RBAC, dashboard UI, active health checks, circuit breakers, cluster sync, and deeper DDoS controls.
 
 ## Quick Start
 
@@ -115,6 +117,27 @@ dir = "config/error-pages"
 
 You can also override this at runtime with `PXXL_ERROR_PAGES_DIR` or disable custom HTML pages with `PXXL_ERROR_PAGES_ENABLED=false`.
 
+## Offline GeoIP
+
+Pxxl does not call an internet API for location detection. It loads a local CSV database at startup and does longest-prefix CIDR matching in memory.
+
+Default config:
+
+```toml
+[geoip]
+enabled = true
+database_path = "config/geoip/geoip.csv"
+```
+
+CSV format:
+
+```csv
+cidr,country_code,country_name,continent_code,continent_name,region,city
+203.0.113.0/24,US,United States,NA,North America,California,Los Angeles
+```
+
+The repo includes seed records for localhost and private networks only. For real public-country detection, replace or extend `config/geoip/geoip.csv` with a licensed offline CIDR database. You can override the path with `PXXL_GEOIP_DATABASE` or disable lookups with `PXXL_GEOIP_ENABLED=false`.
+
 ## Domain Rules
 
 API and TOML routes can include a `rules` object. These rules are enforced before traffic is forwarded upstream:
@@ -148,6 +171,26 @@ API and TOML routes can include a `rules` object. These rules are enforced befor
     },
     "ip_allowlist": ["127.0.0.1", "203.0.113.0/24"],
     "ip_blocklist": ["198.51.100.10"],
+    "country_allowlist": ["US", "NG"],
+    "country_blocklist": ["RU"],
+    "continent_allowlist": ["NA", "AF"],
+    "continent_blocklist": ["EU"],
+    "location_routes": [
+      {
+        "name": "north-america",
+        "continents": ["NA"],
+        "upstreams": [
+          { "url": "http://us-edge.internal:8080", "weight": 1 }
+        ]
+      },
+      {
+        "name": "nigeria",
+        "countries": ["NG"],
+        "upstreams": [
+          { "url": "http://lagos-edge.internal:8080", "weight": 1 }
+        ]
+      }
+    ],
     "rate_limit": {
       "enabled": true,
       "requests_per_minute": 120,
@@ -172,6 +215,8 @@ API and TOML routes can include a `rules` object. These rules are enforced befor
 ```
 
 Defaults are permissive: if a field is missing, Pxxl keeps current proxy behavior. `allowed_headers` is strict when set, so include normal browser/client headers such as `host`, `content-type`, `authorization`, and `origin` when you use it.
+
+Location rules use ISO-style country codes such as `US` or `NG` and continent codes such as `NA`, `AF`, and `EU`. Allow/block checks happen before upstream selection. `location_routes` are checked in order; the first country/continent match with upstreams wins and then uses the domain's configured load-balancing algorithm.
 
 ## Local Wildcard Development
 
@@ -202,6 +247,9 @@ For true wildcard resolution, use dnsmasq or CoreDNS.
 - `DELETE /v1/domains/{domain}`
 - `GET /v1/stats/domains`
 - `GET /v1/domains/{domain}/stats`
+- `GET /v1/analytics/routes`
+- `GET /v1/analytics/visits?limit=50`
+- `GET /v1/domains/{domain}/visits?limit=50`
 - `GET /v1/upstreams`
 - `GET /v1/certs`
 - `POST /v1/blacklist/{domain_id}` with `{"ip":"203.0.113.10"}`
@@ -225,6 +273,7 @@ edge/
     core/
     ddos/
     docker-discovery/
+    geo/
     http-proxy/
     load-balancer/
     metrics/

@@ -7,7 +7,9 @@ use hyper_util::{
     rt::{TokioExecutor, TokioIo},
     server::conn::auto::Builder as AutoBuilder,
 };
-use pxxl_common::{DomainRateLimit, DomainRules, PathRoute, Route, RouteSource, Upstream};
+use pxxl_common::{
+    DomainRateLimit, DomainRules, LocationRouteRule, PathRoute, Route, RouteSource, Upstream,
+};
 use pxxl_core::{EdgeState, RouteRegistry};
 use pxxl_ddos::{BlacklistEngine, RateLimitConfig, RateLimiter, SecurityEngine};
 use pxxl_http_proxy::run_http_proxy_on_listener;
@@ -157,6 +159,105 @@ async fn enforces_domain_rate_limit_rule() {
 
     assert_eq!(first_status, StatusCode::OK);
     assert_eq!(second_status, StatusCode::TOO_MANY_REQUESTS);
+}
+
+#[tokio::test]
+async fn blocks_requests_by_country_rule() {
+    let upstream_addr = spawn_upstream("should not proxy").await;
+    let proxy_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let proxy_addr = proxy_listener.local_addr().unwrap();
+    let (shutdown_tx, shutdown_rx) = watch::channel(false);
+
+    let mut route = Route::new(
+        "geo-block.pxxlhost",
+        vec![PathRoute::new(
+            "/",
+            vec![Upstream::new(format!("http://{upstream_addr}"))],
+        )],
+        RouteSource::Static,
+    );
+    route.rules = DomainRules {
+        country_blocklist: vec!["LO".to_string()],
+        ..DomainRules::default()
+    };
+    let state = test_state(vec![route]);
+    let stats_state = state.clone();
+    let server = tokio::spawn(run_http_proxy_on_listener(
+        proxy_listener,
+        state,
+        shutdown_rx,
+    ));
+
+    let client: Client<HttpConnector, Empty<Bytes>> =
+        Client::builder(TokioExecutor::new()).build_http();
+    let req = Request::builder()
+        .method("GET")
+        .uri(format!("http://{proxy_addr}/blocked"))
+        .header("host", "geo-block.pxxlhost")
+        .body(Empty::<Bytes>::new())
+        .unwrap();
+
+    let response = client.request(req).await.unwrap();
+    let status = response.status();
+
+    shutdown_tx.send(true).unwrap();
+    server.await.unwrap().unwrap();
+
+    let visits = stats_state.stats.recent_visits("geo-block.pxxlhost", 1);
+    assert_eq!(status, StatusCode::FORBIDDEN);
+    assert_eq!(visits[0].location.country_code.as_deref(), Some("LO"));
+}
+
+#[tokio::test]
+async fn routes_requests_by_country_rule() {
+    let default_upstream_addr = spawn_upstream("default upstream").await;
+    let local_upstream_addr = spawn_upstream("local upstream").await;
+    let proxy_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let proxy_addr = proxy_listener.local_addr().unwrap();
+    let (shutdown_tx, shutdown_rx) = watch::channel(false);
+
+    let mut route = Route::new(
+        "geo-route.pxxlhost",
+        vec![PathRoute::new(
+            "/",
+            vec![Upstream::new(format!("http://{default_upstream_addr}"))],
+        )],
+        RouteSource::Static,
+    );
+    route.rules = DomainRules {
+        location_routes: vec![LocationRouteRule {
+            name: Some("local".to_string()),
+            countries: vec!["LO".to_string()],
+            continents: Vec::new(),
+            upstreams: vec![Upstream::new(format!("http://{local_upstream_addr}"))],
+        }],
+        ..DomainRules::default()
+    };
+    let state = test_state(vec![route]);
+    let server = tokio::spawn(run_http_proxy_on_listener(
+        proxy_listener,
+        state,
+        shutdown_rx,
+    ));
+
+    let client: Client<HttpConnector, Empty<Bytes>> =
+        Client::builder(TokioExecutor::new()).build_http();
+    let req = Request::builder()
+        .method("GET")
+        .uri(format!("http://{proxy_addr}/"))
+        .header("host", "geo-route.pxxlhost")
+        .body(Empty::<Bytes>::new())
+        .unwrap();
+
+    let response = client.request(req).await.unwrap();
+    let status = response.status();
+    let body = response.into_body().collect().await.unwrap().to_bytes();
+
+    shutdown_tx.send(true).unwrap();
+    server.await.unwrap().unwrap();
+
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(&body[..], b"local upstream");
 }
 
 async fn spawn_upstream(body: &'static str) -> SocketAddr {

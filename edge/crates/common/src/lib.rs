@@ -117,6 +117,38 @@ impl PathRoute {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct GeoLocation {
+    #[serde(default)]
+    pub country_code: Option<String>,
+    #[serde(default)]
+    pub country_name: Option<String>,
+    #[serde(default)]
+    pub continent_code: Option<String>,
+    #[serde(default)]
+    pub continent_name: Option<String>,
+    #[serde(default)]
+    pub region: Option<String>,
+    #[serde(default)]
+    pub city: Option<String>,
+    #[serde(default = "unknown_geo_source")]
+    pub source: String,
+}
+
+impl GeoLocation {
+    pub fn unknown() -> Self {
+        Self {
+            country_code: None,
+            country_name: None,
+            continent_code: None,
+            continent_name: None,
+            region: None,
+            city: None,
+            source: unknown_geo_source(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct DomainRules {
     #[serde(default = "default_true")]
     pub allow_websocket: bool,
@@ -154,6 +186,16 @@ pub struct DomainRules {
         deserialize_with = "deserialize_ip_nets"
     )]
     pub ip_blocklist: Vec<IpNet>,
+    #[serde(default, alias = "country_allowlist", alias = "allowed_countries")]
+    pub country_allowlist: Vec<String>,
+    #[serde(default, alias = "country_blocklist", alias = "blocked_countries")]
+    pub country_blocklist: Vec<String>,
+    #[serde(default, alias = "continent_allowlist", alias = "allowed_continents")]
+    pub continent_allowlist: Vec<String>,
+    #[serde(default, alias = "continent_blocklist", alias = "blocked_continents")]
+    pub continent_blocklist: Vec<String>,
+    #[serde(default)]
+    pub location_routes: Vec<LocationRouteRule>,
     #[serde(default)]
     pub rate_limit: Option<DomainRateLimit>,
     #[serde(default)]
@@ -196,6 +238,11 @@ impl Default for DomainRules {
             response_headers: HashMap::new(),
             ip_allowlist: Vec::new(),
             ip_blocklist: Vec::new(),
+            country_allowlist: Vec::new(),
+            country_blocklist: Vec::new(),
+            continent_allowlist: Vec::new(),
+            continent_blocklist: Vec::new(),
+            location_routes: Vec::new(),
             rate_limit: None,
             max_body_bytes: None,
             max_uri_length: None,
@@ -210,6 +257,18 @@ impl Default for DomainRules {
             cors_preflight_enabled: true,
         }
     }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct LocationRouteRule {
+    #[serde(default)]
+    pub name: Option<String>,
+    #[serde(default, alias = "country_codes")]
+    pub countries: Vec<String>,
+    #[serde(default, alias = "continent_codes")]
+    pub continents: Vec<String>,
+    #[serde(default)]
+    pub upstreams: Vec<Upstream>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -386,6 +445,10 @@ fn default_weight() -> u32 {
 
 fn default_true() -> bool {
     true
+}
+
+fn unknown_geo_source() -> String {
+    "unknown".to_string()
 }
 
 fn default_domain_rate_burst() -> u32 {

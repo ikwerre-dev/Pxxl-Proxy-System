@@ -86,6 +86,26 @@ Add `rules` to the domain body to control edge behavior per domain:
     "response_headers": { "x-proxy": "pxxl" },
     "ip_allowlist": ["127.0.0.1", "203.0.113.0/24"],
     "ip_blocklist": ["198.51.100.10"],
+    "country_allowlist": ["US", "NG"],
+    "country_blocklist": ["RU"],
+    "continent_allowlist": ["NA", "AF"],
+    "continent_blocklist": ["EU"],
+    "location_routes": [
+      {
+        "name": "nigeria",
+        "countries": ["NG"],
+        "upstreams": [
+          { "url": "http://lagos-edge.internal:8080", "weight": 1 }
+        ]
+      },
+      {
+        "name": "north-america",
+        "continents": ["NA"],
+        "upstreams": [
+          { "url": "http://us-edge.internal:8080", "weight": 1 }
+        ]
+      }
+    ],
     "rate_limit": {
       "enabled": true,
       "requests_per_second": 10,
@@ -111,6 +131,8 @@ Add `rules` to the domain body to control edge behavior per domain:
 
 Bare IPs in `ip_allowlist` and `ip_blocklist` are accepted; Pxxl treats them as single-host networks. `allowed_headers` is strict when set, so include ordinary client headers like `host`, `content-type`, `authorization`, and `origin`.
 
+Location rules use offline GeoIP data. Pxxl reads `config/geoip/geoip.csv` at startup and does not call the internet while handling requests. `country_*` fields match country codes like `US` or `NG`; `continent_*` fields match continent codes like `NA`, `AF`, or `EU`. `location_routes` are evaluated in order and the first matching rule with upstreams replaces the normal path upstreams for that request.
+
 ## Read APIs
 
 ```http
@@ -118,7 +140,12 @@ GET /v1/domains
 GET /v1/domains/{domain}
 GET /v1/stats/domains
 GET /v1/domains/{domain}/stats
+GET /v1/analytics/routes
+GET /v1/analytics/visits?limit=50
+GET /v1/domains/{domain}/visits?limit=50
 DELETE /v1/domains/{domain}
 ```
+
+The analytics endpoints are in-memory. Route stats include top countries, continents, paths, and upstreams. Visit endpoints return the most recent request events, including the resolved location and upstream.
 
 Import the Postman collection from `docs/postman/pxxl-proxy.postman_collection.json` and the environment from `docs/postman/pxxl-proxy.postman_environment.json`.

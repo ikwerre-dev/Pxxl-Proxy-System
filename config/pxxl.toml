@@ -24,6 +24,10 @@ poll_seconds = 5
 enabled = true
 dir = "config/error-pages"
 
+[geoip]
+enabled = true
+database_path = "config/geoip/geoip.csv"
+
 [security.rate_limits]
 requests_per_second = 120
 burst = 240

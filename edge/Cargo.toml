@@ -14,6 +14,7 @@ pxxl-config = { path = "crates/config" }
 pxxl-core = { path = "crates/core" }
 pxxl-ddos = { path = "crates/ddos" }
 pxxl-docker-discovery = { path = "crates/docker-discovery" }
+pxxl-geo = { path = "crates/geo" }
 pxxl-http-proxy = { path = "crates/http-proxy" }
 pxxl-load-balancer = { path = "crates/load-balancer" }
 pxxl-metrics = { path = "crates/metrics" }

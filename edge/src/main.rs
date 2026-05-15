@@ -4,9 +4,10 @@ use pxxl_config::PxxlConfig;
 use pxxl_core::{EdgeState, RouteRegistry};
 use pxxl_ddos::{BlacklistEngine, RateLimitConfig, RateLimiter, SecurityEngine};
 use pxxl_docker_discovery::{run_docker_polling, DockerDiscovery};
+use pxxl_geo::GeoIpResolver;
 use pxxl_http_proxy::{
-    run_http_proxy_with_error_pages_and_policy, run_https_proxy_with_error_pages_and_policy,
-    ErrorPageRenderer, PolicyEnforcer,
+    run_http_proxy_with_error_pages_policy_and_geoip,
+    run_https_proxy_with_error_pages_policy_and_geoip, ErrorPageRenderer, PolicyEnforcer,
 };
 use pxxl_load_balancer::LoadBalancer;
 use pxxl_metrics::PxxlMetrics;
@@ -72,6 +73,16 @@ async fn main() -> Result<()> {
             }
         };
     let policy = PolicyEnforcer::default();
+    let geoip = match GeoIpResolver::load_from_path(
+        config.geoip.enabled,
+        &config.geoip.database_path,
+    ) {
+        Ok(geoip) => geoip,
+        Err(error) => {
+            warn!(%error, "could not load GeoIP database; using built-in private/local ranges only");
+            GeoIpResolver::default()
+        }
+    };
 
     let mut cert_domains = config.tls.local_subject_alt_names.clone();
     cert_domains.extend(route_domains);
@@ -93,19 +104,21 @@ async fn main() -> Result<()> {
 
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
     let mut tasks: Vec<JoinHandle<Result<()>>> = vec![
-        tokio::spawn(run_http_proxy_with_error_pages_and_policy(
+        tokio::spawn(run_http_proxy_with_error_pages_policy_and_geoip(
             http_addr,
             state.clone(),
             error_pages.clone(),
             policy.clone(),
+            geoip.clone(),
             shutdown_rx.clone(),
         )),
-        tokio::spawn(run_https_proxy_with_error_pages_and_policy(
+        tokio::spawn(run_https_proxy_with_error_pages_policy_and_geoip(
             https_addr,
             state.clone(),
             tls_config,
             error_pages.clone(),
             policy.clone(),
+            geoip.clone(),
             shutdown_rx.clone(),
         )),
         tokio::spawn(run_admin_api(
@@ -205,6 +218,15 @@ fn apply_env_overrides(config: &mut PxxlConfig) {
     }
     if let Ok(value) = std::env::var("PXXL_ERROR_PAGES_ENABLED") {
         config.error_pages.enabled = matches!(
+            value.trim().to_ascii_lowercase().as_str(),
+            "1" | "true" | "yes" | "on"
+        );
+    }
+    if let Ok(value) = std::env::var("PXXL_GEOIP_DATABASE") {
+        config.geoip.database_path = value;
+    }
+    if let Ok(value) = std::env::var("PXXL_GEOIP_ENABLED") {
+        config.geoip.enabled = matches!(
             value.trim().to_ascii_lowercase().as_str(),
             "1" | "true" | "yes" | "on"
         );

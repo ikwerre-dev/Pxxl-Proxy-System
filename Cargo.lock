@@ -1159,6 +1159,7 @@ version = "0.1.0"
 dependencies = [
  "arc-swap",
  "dashmap",
+ "parking_lot",
  "pxxl-common",
  "pxxl-ddos",
  "pxxl-load-balancer",
@@ -1209,6 +1210,7 @@ dependencies = [
  "pxxl-core",
  "pxxl-ddos",
  "pxxl-docker-discovery",
+ "pxxl-geo",
  "pxxl-http-proxy",
  "pxxl-load-balancer",
  "pxxl-metrics",
@@ -1218,6 +1220,16 @@ dependencies = [
  "tokio",
  "tracing",
  "tracing-subscriber",
+]
+
+[[package]]
+name = "pxxl-geo"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "ipnet",
+ "pxxl-common",
+ "tracing",
 ]
 
 [[package]]
@@ -1235,6 +1247,7 @@ dependencies = [
  "pxxl-common",
  "pxxl-core",
  "pxxl-ddos",
+ "pxxl-geo",
  "pxxl-metrics",
  "pxxl-tls",
  "rustls",

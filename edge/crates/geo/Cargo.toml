@@ -1,0 +1,12 @@
+[package]
+name = "pxxl-geo"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+
+[dependencies]
+pxxl-common = { path = "../common" }
+anyhow = { workspace = true }
+ipnet = { workspace = true }
+tracing = { workspace = true }
+

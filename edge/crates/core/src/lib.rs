@@ -1,14 +1,16 @@
 use arc_swap::ArcSwap;
 use dashmap::DashMap;
+use parking_lot::Mutex;
 use pxxl_common::{
-    normalize_domain, PathRoute, PxxlError, Route, RouteMatch, RouteSource, Upstream,
+    normalize_domain, GeoLocation, PathRoute, PxxlError, Route, RouteMatch, RouteSource, Upstream,
 };
 use pxxl_ddos::SecurityEngine;
 use pxxl_load_balancer::LoadBalancer;
 use pxxl_metrics::PxxlMetrics;
 use serde::Serialize;
 use std::{
-    collections::{BTreeMap, HashMap},
+    collections::{BTreeMap, HashMap, VecDeque},
+    net::IpAddr,
     sync::{
         atomic::{AtomicU64, Ordering},
         Arc,
@@ -16,6 +18,8 @@ use std::{
     time::{SystemTime, UNIX_EPOCH},
 };
 use tracing::info;
+
+const RECENT_VISIT_LIMIT: usize = 200;
 
 #[derive(Debug)]
 pub struct RouteRegistry {
@@ -197,13 +201,13 @@ impl DomainStatsRegistry {
         Self::default()
     }
 
-    pub fn record(&self, domain: &str, status: u16, latency_ms: u64, upstream: Option<&str>) {
+    pub fn record(&self, event: RequestObservation) {
         let counters = self
             .domains
-            .entry(domain.to_string())
+            .entry(event.domain.clone())
             .or_insert_with(|| Arc::new(DomainStatsCounters::default()))
             .clone();
-        counters.record(status, latency_ms, upstream);
+        counters.record(event);
     }
 
     pub fn snapshot_domain(&self, domain: &str) -> Option<DomainStatsSnapshot> {
@@ -221,6 +225,24 @@ impl DomainStatsRegistry {
         snapshots.sort_by(|left, right| left.domain.cmp(&right.domain));
         snapshots
     }
+
+    pub fn recent_visits(&self, domain: &str, limit: usize) -> Vec<VisitSnapshot> {
+        self.domains
+            .get(domain)
+            .map(|entry| entry.value().recent_visits(limit))
+            .unwrap_or_default()
+    }
+
+    pub fn recent_visits_all(&self, limit: usize) -> Vec<VisitSnapshot> {
+        let mut visits = self
+            .domains
+            .iter()
+            .flat_map(|entry| entry.value().recent_visits(limit))
+            .collect::<Vec<_>>();
+        visits.sort_by_key(|visit| std::cmp::Reverse(visit.timestamp_unix_ms));
+        visits.truncate(limit);
+        visits
+    }
 }
 
 #[derive(Debug, Default)]
@@ -233,23 +255,64 @@ struct DomainStatsCounters {
     total_latency_ms: AtomicU64,
     last_status: AtomicU64,
     last_seen_unix_ms: AtomicU64,
+    recent_visits: Mutex<VecDeque<VisitSnapshot>>,
+    country_counts: Mutex<HashMap<String, LocationCount>>,
+    continent_counts: Mutex<HashMap<String, LocationCount>>,
+    path_counts: Mutex<HashMap<String, u64>>,
+    upstream_counts: Mutex<HashMap<String, u64>>,
 }
 
 impl DomainStatsCounters {
-    fn record(&self, status: u16, latency_ms: u64, _upstream: Option<&str>) {
+    fn record(&self, event: RequestObservation) {
         self.requests_total.fetch_add(1, Ordering::Relaxed);
         self.total_latency_ms
-            .fetch_add(latency_ms, Ordering::Relaxed);
-        self.last_status.store(status as u64, Ordering::Relaxed);
+            .fetch_add(event.latency_ms, Ordering::Relaxed);
+        self.last_status
+            .store(event.status as u64, Ordering::Relaxed);
+        let timestamp_unix_ms = now_unix_ms();
         self.last_seen_unix_ms
-            .store(now_unix_ms(), Ordering::Relaxed);
+            .store(timestamp_unix_ms, Ordering::Relaxed);
 
-        match status {
+        match event.status {
             200..=299 => self.responses_2xx.fetch_add(1, Ordering::Relaxed),
             300..=399 => self.responses_3xx.fetch_add(1, Ordering::Relaxed),
             400..=499 => self.responses_4xx.fetch_add(1, Ordering::Relaxed),
             _ => self.responses_5xx.fetch_add(1, Ordering::Relaxed),
         };
+
+        increment_count(&self.path_counts, event.path.clone());
+        increment_count(
+            &self.upstream_counts,
+            event.upstream.clone().unwrap_or_else(|| "none".to_string()),
+        );
+        increment_location_count(
+            &self.country_counts,
+            event.location.country_code.as_deref(),
+            event.location.country_name.as_deref(),
+        );
+        increment_location_count(
+            &self.continent_counts,
+            event.location.continent_code.as_deref(),
+            event.location.continent_name.as_deref(),
+        );
+
+        let visit = VisitSnapshot {
+            domain: event.domain,
+            method: event.method,
+            path: event.path,
+            status: event.status,
+            latency_ms: event.latency_ms,
+            upstream: event.upstream,
+            remote_ip: event.remote_ip.map(|ip| ip.to_string()),
+            location: event.location,
+            timestamp_unix_ms,
+        };
+
+        let mut recent = self.recent_visits.lock();
+        recent.push_front(visit);
+        while recent.len() > RECENT_VISIT_LIMIT {
+            recent.pop_back();
+        }
     }
 
     fn snapshot(&self, domain: &str) -> DomainStatsSnapshot {
@@ -271,8 +334,33 @@ impl DomainStatsCounters {
             average_latency_ms,
             last_status: nonzero_u16(self.last_status.load(Ordering::Relaxed)),
             last_seen_unix_ms: nonzero_u64(self.last_seen_unix_ms.load(Ordering::Relaxed)),
+            top_countries: top_location_counts(&self.country_counts, 10),
+            top_continents: top_location_counts(&self.continent_counts, 10),
+            top_paths: top_string_counts(&self.path_counts, 10),
+            top_upstreams: top_string_counts(&self.upstream_counts, 10),
         }
     }
+
+    fn recent_visits(&self, limit: usize) -> Vec<VisitSnapshot> {
+        self.recent_visits
+            .lock()
+            .iter()
+            .take(limit)
+            .cloned()
+            .collect()
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct RequestObservation {
+    pub domain: String,
+    pub method: String,
+    pub path: String,
+    pub status: u16,
+    pub latency_ms: u64,
+    pub upstream: Option<String>,
+    pub remote_ip: Option<IpAddr>,
+    pub location: GeoLocation,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -286,6 +374,93 @@ pub struct DomainStatsSnapshot {
     pub average_latency_ms: f64,
     pub last_status: Option<u16>,
     pub last_seen_unix_ms: Option<u64>,
+    pub top_countries: Vec<LocationCount>,
+    pub top_continents: Vec<LocationCount>,
+    pub top_paths: Vec<StringCount>,
+    pub top_upstreams: Vec<StringCount>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct VisitSnapshot {
+    pub domain: String,
+    pub method: String,
+    pub path: String,
+    pub status: u16,
+    pub latency_ms: u64,
+    pub upstream: Option<String>,
+    pub remote_ip: Option<String>,
+    pub location: GeoLocation,
+    pub timestamp_unix_ms: u64,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct LocationCount {
+    pub code: String,
+    pub name: Option<String>,
+    pub count: u64,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct StringCount {
+    pub value: String,
+    pub count: u64,
+}
+
+fn increment_count(counts: &Mutex<HashMap<String, u64>>, value: String) {
+    let mut counts = counts.lock();
+    *counts.entry(value).or_default() += 1;
+}
+
+fn increment_location_count(
+    counts: &Mutex<HashMap<String, LocationCount>>,
+    code: Option<&str>,
+    name: Option<&str>,
+) {
+    let code = code.unwrap_or("UNKNOWN").to_ascii_uppercase();
+    let mut counts = counts.lock();
+    let entry = counts.entry(code.clone()).or_insert_with(|| LocationCount {
+        code,
+        name: name.map(str::to_string),
+        count: 0,
+    });
+    if entry.name.is_none() {
+        entry.name = name.map(str::to_string);
+    }
+    entry.count += 1;
+}
+
+fn top_location_counts(
+    counts: &Mutex<HashMap<String, LocationCount>>,
+    limit: usize,
+) -> Vec<LocationCount> {
+    let mut values = counts.lock().values().cloned().collect::<Vec<_>>();
+    values.sort_by(|left, right| {
+        right
+            .count
+            .cmp(&left.count)
+            .then_with(|| left.code.cmp(&right.code))
+    });
+    values.truncate(limit);
+    values
+}
+
+fn top_string_counts(counts: &Mutex<HashMap<String, u64>>, limit: usize) -> Vec<StringCount> {
+    let mut values = counts
+        .lock()
+        .iter()
+        .map(|(value, count)| StringCount {
+            value: value.clone(),
+            count: *count,
+        })
+        .collect::<Vec<_>>();
+    values.sort_by(|left, right| {
+        right
+            .count
+            .cmp(&left.count)
+            .then_with(|| left.value.cmp(&right.value))
+    });
+    values.truncate(limit);
+    values
 }
 
 fn source_priority(source: &RouteSource) -> usize {

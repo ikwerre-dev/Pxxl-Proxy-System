@@ -1,0 +1,12 @@
+# Offline GeoIP seed file.
+# Replace or extend this with your own licensed CIDR database.
+# Format:
+# cidr,country_code,country_name,continent_code,continent_name,region,city
+127.0.0.0/8,LO,Local,LOCAL,Local,,
+::1/128,LO,Local,LOCAL,Local,,
+10.0.0.0/8,PR,Private,PRIVATE,Private,,
+172.16.0.0/12,PR,Private,PRIVATE,Private,,
+192.168.0.0/16,PR,Private,PRIVATE,Private,,
+100.64.0.0/10,PR,Private,PRIVATE,Private,,
+fc00::/7,PR,Private,PRIVATE,Private,,
+fe80::/10,PR,Private,PRIVATE,Private,,

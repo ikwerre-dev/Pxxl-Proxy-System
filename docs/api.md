@@ -52,6 +52,16 @@ Content-Type: application/json
     "blocked_methods": ["TRACE"],
     "blocked_headers": ["x-debug-token"],
     "ip_blocklist": ["198.51.100.10"],
+    "country_blocklist": ["RU"],
+    "location_routes": [
+      {
+        "name": "north-america",
+        "continents": ["NA"],
+        "upstreams": [
+          { "url": "http://us-edge.internal:8080", "weight": 1 }
+        ]
+      }
+    ],
     "rate_limit": {
       "enabled": true,
       "requests_per_minute": 120,
@@ -94,6 +104,11 @@ Available fields:
 | `response_headers` | object | Adds or overwrites headers on upstream and generated policy responses. |
 | `ip_allowlist` | string array | Allows only these IPs/CIDRs. Bare IPs are treated as `/32` or `/128`. |
 | `ip_blocklist` | string array | Blocks these IPs/CIDRs. Aliases: `blacklist_ips`, `blocked_ips`. |
+| `country_allowlist` | string array | Allows only requests whose offline GeoIP country code matches. Aliases: `allowed_countries`. |
+| `country_blocklist` | string array | Blocks requests whose offline GeoIP country code matches. Aliases: `blocked_countries`. |
+| `continent_allowlist` | string array | Allows only requests whose offline GeoIP continent code matches. Aliases: `allowed_continents`. |
+| `continent_blocklist` | string array | Blocks requests whose offline GeoIP continent code matches. Aliases: `blocked_continents`. |
+| `location_routes` | array | Ordered country/continent routing rules. First matching rule with upstreams overrides the normal path upstreams. |
 | `rate_limit` | object | Per-domain token bucket. Supports `requests_per_second`, `requests_per_minute`, `burst`, `scope`, `status_code`, and `retry_after_seconds`. |
 | `max_body_bytes` | number | Rejects requests whose `Content-Length` exceeds this value with `413`. |
 | `max_uri_length` | number | Rejects long URLs with `414`. |
@@ -115,14 +130,34 @@ per_domain
 per_ip_path
 ```
 
-## Stats
+Location routing rule shape:
+
+```json
+{
+  "name": "lagos",
+  "countries": ["NG"],
+  "continents": ["AF"],
+  "upstreams": [
+    { "url": "http://lagos-edge.internal:8080", "weight": 1 }
+  ]
+}
+```
+
+The GeoIP resolver is fully offline. It reads `config/geoip/geoip.csv` by default. The built-in seed only knows localhost and private ranges, so add a licensed CIDR database if you need real public-country accuracy.
+
+## Analytics and Stats
 
 ```http
 GET /v1/stats/domains
 GET /v1/domains/{domain}/stats
+GET /v1/analytics/routes
+GET /v1/analytics/visits?limit=50
+GET /v1/domains/{domain}/visits?limit=50
 ```
 
-Returns in-memory per-domain counters, status buckets, average latency, last status, and last-seen timestamp.
+Stats return in-memory per-domain counters, status buckets, average latency, last status, last-seen timestamp, top countries, top continents, top paths, and top upstreams.
+
+Visits return recent request events with domain, method, path, status, latency, upstream, remote IP, offline GeoIP location, and timestamp. Recent visit history is in memory and capped per domain.
 
 ## Upstreams
 

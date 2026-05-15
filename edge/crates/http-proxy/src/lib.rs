@@ -17,10 +17,12 @@ use hyper_util::{
 };
 use parking_lot::Mutex;
 use pxxl_common::{
-    normalize_domain, DomainRateLimit, DomainRules, PxxlError, RateLimitScope, RouteMatch, Upstream,
+    normalize_domain, DomainRateLimit, DomainRules, GeoLocation, PxxlError, RateLimitScope,
+    RouteMatch, Upstream,
 };
-use pxxl_core::EdgeState;
+use pxxl_core::{EdgeState, RequestObservation};
 use pxxl_ddos::SecurityDecision;
+use pxxl_geo::GeoIpResolver;
 use rustls::ServerConfig;
 use std::{
     collections::HashMap,
@@ -211,15 +213,22 @@ struct PolicyRejection {
     location: Option<String>,
 }
 
+#[derive(Debug, Clone, Copy)]
+struct ProxyRequestContext<'a> {
+    domain: &'a str,
+    method: &'a str,
+    path: &'a str,
+    remote_ip: Option<IpAddr>,
+    scheme: RequestScheme,
+    location: &'a GeoLocation,
+}
+
 impl PolicyEnforcer {
     fn evaluate(
         &self,
         req: &Request<Incoming>,
         rules: &DomainRules,
-        domain: &str,
-        path: &str,
-        remote_ip: Option<IpAddr>,
-        scheme: RequestScheme,
+        context: &ProxyRequestContext<'_>,
     ) -> Option<PolicyRejection> {
         if rules.maintenance_mode {
             return Some(policy_rejection(
@@ -229,17 +238,17 @@ impl PolicyEnforcer {
             ));
         }
 
-        if scheme == RequestScheme::Http && rules.redirect_http_to_https {
+        if context.scheme == RequestScheme::Http && rules.redirect_http_to_https {
             return Some(PolicyRejection {
                 status: StatusCode::PERMANENT_REDIRECT,
                 message: "https required",
                 metric_reason: "https_redirect",
                 retry_after: None,
-                location: Some(format!("https://{domain}{path}")),
+                location: Some(format!("https://{}{}", context.domain, context.path)),
             });
         }
 
-        if scheme == RequestScheme::Http && rules.require_https {
+        if context.scheme == RequestScheme::Http && rules.require_https {
             return Some(policy_rejection(
                 StatusCode::UPGRADE_REQUIRED,
                 "https is required for this domain",
@@ -247,7 +256,7 @@ impl PolicyEnforcer {
             ));
         }
 
-        if let Some(ip) = remote_ip {
+        if let Some(ip) = context.remote_ip {
             if !rules.ip_allowlist.is_empty()
                 && !rules
                     .ip_allowlist
@@ -272,6 +281,54 @@ impl PolicyEnforcer {
                     "ip_blocklisted",
                 ));
             }
+        }
+
+        if !rules.country_allowlist.is_empty()
+            && !location_code_matches(
+                context.location.country_code.as_deref(),
+                &rules.country_allowlist,
+            )
+        {
+            return Some(policy_rejection(
+                StatusCode::FORBIDDEN,
+                "country is not allowed for this domain",
+                "country_not_allowlisted",
+            ));
+        }
+
+        if location_code_matches(
+            context.location.country_code.as_deref(),
+            &rules.country_blocklist,
+        ) {
+            return Some(policy_rejection(
+                StatusCode::FORBIDDEN,
+                "country is blocked for this domain",
+                "country_blocklisted",
+            ));
+        }
+
+        if !rules.continent_allowlist.is_empty()
+            && !location_code_matches(
+                context.location.continent_code.as_deref(),
+                &rules.continent_allowlist,
+            )
+        {
+            return Some(policy_rejection(
+                StatusCode::FORBIDDEN,
+                "continent is not allowed for this domain",
+                "continent_not_allowlisted",
+            ));
+        }
+
+        if location_code_matches(
+            context.location.continent_code.as_deref(),
+            &rules.continent_blocklist,
+        ) {
+            return Some(policy_rejection(
+                StatusCode::FORBIDDEN,
+                "continent is blocked for this domain",
+                "continent_blocklisted",
+            ));
         }
 
         if rules
@@ -407,10 +464,12 @@ impl PolicyEnforcer {
         }
 
         if let Some(limit) = rules.rate_limit.as_ref() {
-            if let Some(retry_after) = self
-                .rate_limiter
-                .retry_after(limit, domain, path, remote_ip)
-            {
+            if let Some(retry_after) = self.rate_limiter.retry_after(
+                limit,
+                context.domain,
+                context.path,
+                context.remote_ip,
+            ) {
                 return Some(PolicyRejection {
                     status: StatusCode::from_u16(limit.status_code)
                         .unwrap_or(StatusCode::TOO_MANY_REQUESTS),
@@ -423,6 +482,38 @@ impl PolicyEnforcer {
         }
 
         None
+    }
+
+    fn location_upstreams<'a>(
+        &self,
+        rules: &'a DomainRules,
+        location: &GeoLocation,
+    ) -> Option<(String, &'a [Upstream])> {
+        rules.location_routes.iter().find_map(|rule| {
+            if rule.upstreams.is_empty() {
+                return None;
+            }
+
+            let country_matches = rule.countries.is_empty()
+                || location_code_matches(location.country_code.as_deref(), &rule.countries);
+            let continent_matches = rule.continents.is_empty()
+                || location_code_matches(location.continent_code.as_deref(), &rule.continents);
+
+            if country_matches && continent_matches {
+                Some((
+                    rule.name.clone().unwrap_or_else(|| {
+                        format!(
+                            "geo:{}:{}",
+                            rule.countries.join("_"),
+                            rule.continents.join("_")
+                        )
+                    }),
+                    rule.upstreams.as_slice(),
+                ))
+            } else {
+                None
+            }
+        })
     }
 
     fn apply_request_rules(&self, headers: &mut HeaderMap, rules: &DomainRules) {
@@ -581,6 +672,7 @@ pub struct ProxyServer {
     client: Client<HttpConnector, Incoming>,
     error_pages: ErrorPageRenderer,
     policy: PolicyEnforcer,
+    geoip: GeoIpResolver,
 }
 
 impl ProxyServer {
@@ -601,6 +693,20 @@ impl ProxyServer {
         error_pages: ErrorPageRenderer,
         policy: PolicyEnforcer,
     ) -> Self {
+        Self::with_error_pages_policy_and_geoip(
+            state,
+            error_pages,
+            policy,
+            GeoIpResolver::default(),
+        )
+    }
+
+    pub fn with_error_pages_policy_and_geoip(
+        state: EdgeState,
+        error_pages: ErrorPageRenderer,
+        policy: PolicyEnforcer,
+        geoip: GeoIpResolver,
+    ) -> Self {
         let mut connector = HttpConnector::new();
         connector.enforce_http(false);
         let client = Client::builder(TokioExecutor::new()).build(connector);
@@ -609,6 +715,7 @@ impl ProxyServer {
             client,
             error_pages,
             policy,
+            geoip,
         }
     }
 
@@ -641,6 +748,17 @@ impl ProxyServer {
             }
         };
         let domain = normalize_domain(&host);
+        let location = remote_ip
+            .map(|ip| self.geoip.lookup(ip))
+            .unwrap_or_else(GeoLocation::unknown);
+        let context = ProxyRequestContext {
+            domain: &domain,
+            method: method.as_str(),
+            path: &path,
+            remote_ip,
+            scheme,
+            location: &location,
+        };
 
         if let Some(ip) = remote_ip {
             match self.state.security.check(&domain, ip) {
@@ -651,13 +769,7 @@ impl ProxyServer {
                         .blocked_total
                         .with_label_values(&[&domain, &reason])
                         .inc();
-                    self.observe_request(
-                        &domain,
-                        method.as_str(),
-                        StatusCode::FORBIDDEN,
-                        started,
-                        None,
-                    );
+                    self.observe_request(&context, StatusCode::FORBIDDEN, started, None);
                     return self.error_response(
                         StatusCode::FORBIDDEN,
                         "request blocked",
@@ -671,13 +783,7 @@ impl ProxyServer {
                         .rate_limited_total
                         .with_label_values(&[&domain])
                         .inc();
-                    self.observe_request(
-                        &domain,
-                        method.as_str(),
-                        StatusCode::TOO_MANY_REQUESTS,
-                        started,
-                        None,
-                    );
+                    self.observe_request(&context, StatusCode::TOO_MANY_REQUESTS, started, None);
                     let mut response = self.error_response(
                         StatusCode::TOO_MANY_REQUESTS,
                         "rate limited",
@@ -697,13 +803,7 @@ impl ProxyServer {
         let matched = match self.state.routes.find(&host, &path) {
             Some(matched) => matched,
             None => {
-                self.observe_request(
-                    &domain,
-                    method.as_str(),
-                    StatusCode::NOT_FOUND,
-                    started,
-                    None,
-                );
+                self.observe_request(&context, StatusCode::NOT_FOUND, started, None);
                 return self.error_response(
                     StatusCode::NOT_FOUND,
                     "no route matched this host/path",
@@ -714,14 +814,7 @@ impl ProxyServer {
         };
 
         let request_origin = req.headers().get(ORIGIN).cloned();
-        if let Some(rejection) = self.policy.evaluate(
-            &req,
-            &matched.route.rules,
-            &domain,
-            &path,
-            remote_ip,
-            scheme,
-        ) {
+        if let Some(rejection) = self.policy.evaluate(&req, &matched.route.rules, &context) {
             if rejection.status == StatusCode::TOO_MANY_REQUESTS {
                 self.state
                     .metrics
@@ -736,7 +829,7 @@ impl ProxyServer {
                     .inc();
             }
 
-            self.observe_request(&domain, method.as_str(), rejection.status, started, None);
+            self.observe_request(&context, rejection.status, started, None);
             let mut response = if rejection.status == StatusCode::NO_CONTENT {
                 response_with_body(rejection.status, "text/plain; charset=utf-8", String::new())
             } else {
@@ -765,22 +858,24 @@ impl ProxyServer {
         self.policy
             .apply_request_rules(req.headers_mut(), &matched.route.rules);
 
-        let route_key = format!("{}:{}", matched.route.id, matched.path.prefix);
+        let (route_key_suffix, upstreams) = self
+            .policy
+            .location_upstreams(&matched.route.rules, &location)
+            .map(|(name, upstreams)| (format!(":location:{name}"), upstreams))
+            .unwrap_or_else(|| (String::new(), matched.path.upstreams.as_slice()));
+        let route_key = format!(
+            "{}:{}{}",
+            matched.route.id, matched.path.prefix, route_key_suffix
+        );
         let upstream = match self.state.load_balancer.select(
             &route_key,
             &matched.route.algorithm,
-            &matched.path.upstreams,
+            upstreams,
             remote_ip,
         ) {
             Some(upstream) => upstream,
             None => {
-                self.observe_request(
-                    &domain,
-                    method.as_str(),
-                    StatusCode::SERVICE_UNAVAILABLE,
-                    started,
-                    None,
-                );
+                self.observe_request(&context, StatusCode::SERVICE_UNAVAILABLE, started, None);
                 return self.error_response(
                     StatusCode::SERVICE_UNAVAILABLE,
                     "no healthy upstreams",
@@ -801,13 +896,7 @@ impl ProxyServer {
                     &matched.route.rules,
                     request_origin.as_ref(),
                 );
-                self.observe_request(
-                    &domain,
-                    method.as_str(),
-                    status,
-                    started,
-                    Some(&upstream.url),
-                );
+                self.observe_request(&context, status, started, Some(&upstream.url));
                 self.state
                     .metrics
                     .upstream_latency_seconds
@@ -827,8 +916,7 @@ impl ProxyServer {
             Err(error) => {
                 warn!(%error, domain = %domain, upstream = %upstream.url, "upstream request failed");
                 self.observe_request(
-                    &domain,
-                    method.as_str(),
+                    &context,
                     StatusCode::BAD_GATEWAY,
                     started,
                     Some(&upstream.url),
@@ -902,8 +990,7 @@ impl ProxyServer {
 
     fn observe_request(
         &self,
-        domain: &str,
-        method: &str,
+        context: &ProxyRequestContext<'_>,
         status: StatusCode,
         started: Instant,
         upstream: Option<&str>,
@@ -911,14 +998,18 @@ impl ProxyServer {
         self.state
             .metrics
             .requests_total
-            .with_label_values(&[domain, method, &status.as_u16().to_string()])
+            .with_label_values(&[context.domain, context.method, &status.as_u16().to_string()])
             .inc();
-        self.state.stats.record(
-            domain,
-            status.as_u16(),
-            started.elapsed().as_millis() as u64,
-            upstream,
-        );
+        self.state.stats.record(RequestObservation {
+            domain: context.domain.to_string(),
+            method: context.method.to_string(),
+            path: context.path.to_string(),
+            status: status.as_u16(),
+            latency_ms: started.elapsed().as_millis() as u64,
+            upstream: upstream.map(str::to_string),
+            remote_ip: context.remote_ip,
+            location: context.location.clone(),
+        });
     }
 }
 
@@ -964,9 +1055,28 @@ pub async fn run_http_proxy_with_error_pages_and_policy(
     policy: PolicyEnforcer,
     shutdown: watch::Receiver<bool>,
 ) -> anyhow::Result<()> {
+    run_http_proxy_with_error_pages_policy_and_geoip(
+        addr,
+        state,
+        error_pages,
+        policy,
+        GeoIpResolver::default(),
+        shutdown,
+    )
+    .await
+}
+
+pub async fn run_http_proxy_with_error_pages_policy_and_geoip(
+    addr: SocketAddr,
+    state: EdgeState,
+    error_pages: ErrorPageRenderer,
+    policy: PolicyEnforcer,
+    geoip: GeoIpResolver,
+    shutdown: watch::Receiver<bool>,
+) -> anyhow::Result<()> {
     let listener = TcpListener::bind(addr).await?;
     info!(%addr, "HTTP proxy listening");
-    run_plain_listener(listener, state, error_pages, policy, shutdown).await
+    run_plain_listener(listener, state, error_pages, policy, geoip, shutdown).await
 }
 
 pub async fn run_http_proxy_on_listener(
@@ -1006,8 +1116,27 @@ pub async fn run_http_proxy_on_listener_with_error_pages_and_policy(
     policy: PolicyEnforcer,
     shutdown: watch::Receiver<bool>,
 ) -> anyhow::Result<()> {
+    run_http_proxy_on_listener_with_error_pages_policy_and_geoip(
+        listener,
+        state,
+        error_pages,
+        policy,
+        GeoIpResolver::default(),
+        shutdown,
+    )
+    .await
+}
+
+pub async fn run_http_proxy_on_listener_with_error_pages_policy_and_geoip(
+    listener: TcpListener,
+    state: EdgeState,
+    error_pages: ErrorPageRenderer,
+    policy: PolicyEnforcer,
+    geoip: GeoIpResolver,
+    shutdown: watch::Receiver<bool>,
+) -> anyhow::Result<()> {
     info!(addr = %listener.local_addr()?, "HTTP proxy listening");
-    run_plain_listener(listener, state, error_pages, policy, shutdown).await
+    run_plain_listener(listener, state, error_pages, policy, geoip, shutdown).await
 }
 
 pub async fn run_https_proxy(
@@ -1052,10 +1181,40 @@ pub async fn run_https_proxy_with_error_pages_and_policy(
     policy: PolicyEnforcer,
     shutdown: watch::Receiver<bool>,
 ) -> anyhow::Result<()> {
+    run_https_proxy_with_error_pages_policy_and_geoip(
+        addr,
+        state,
+        tls_config,
+        error_pages,
+        policy,
+        GeoIpResolver::default(),
+        shutdown,
+    )
+    .await
+}
+
+pub async fn run_https_proxy_with_error_pages_policy_and_geoip(
+    addr: SocketAddr,
+    state: EdgeState,
+    tls_config: Arc<ServerConfig>,
+    error_pages: ErrorPageRenderer,
+    policy: PolicyEnforcer,
+    geoip: GeoIpResolver,
+    shutdown: watch::Receiver<bool>,
+) -> anyhow::Result<()> {
     let listener = TcpListener::bind(addr).await?;
     let acceptor = TlsAcceptor::from(tls_config);
     info!(%addr, "HTTPS proxy listening");
-    run_tls_listener(listener, acceptor, state, error_pages, policy, shutdown).await
+    run_tls_listener(
+        listener,
+        acceptor,
+        state,
+        error_pages,
+        policy,
+        geoip,
+        shutdown,
+    )
+    .await
 }
 
 async fn run_plain_listener(
@@ -1063,9 +1222,10 @@ async fn run_plain_listener(
     state: EdgeState,
     error_pages: ErrorPageRenderer,
     policy: PolicyEnforcer,
+    geoip: GeoIpResolver,
     mut shutdown: watch::Receiver<bool>,
 ) -> anyhow::Result<()> {
-    let server = ProxyServer::with_error_pages_and_policy(state, error_pages, policy);
+    let server = ProxyServer::with_error_pages_policy_and_geoip(state, error_pages, policy, geoip);
 
     loop {
         tokio::select! {
@@ -1091,9 +1251,10 @@ async fn run_tls_listener(
     state: EdgeState,
     error_pages: ErrorPageRenderer,
     policy: PolicyEnforcer,
+    geoip: GeoIpResolver,
     mut shutdown: watch::Receiver<bool>,
 ) -> anyhow::Result<()> {
-    let server = ProxyServer::with_error_pages_and_policy(state, error_pages, policy);
+    let server = ProxyServer::with_error_pages_policy_and_geoip(state, error_pages, policy, geoip);
 
     loop {
         tokio::select! {
@@ -1250,6 +1411,16 @@ fn cors_origin_allowed(origin: &HeaderValue, allowed_origins: &[String]) -> bool
     allowed_origins
         .iter()
         .any(|allowed| allowed == "*" || allowed.eq_ignore_ascii_case(origin))
+}
+
+fn location_code_matches(actual: Option<&str>, configured: &[String]) -> bool {
+    let Some(actual) = actual else {
+        return false;
+    };
+
+    configured
+        .iter()
+        .any(|code| code == "*" || code.eq_ignore_ascii_case(actual))
 }
 
 fn insert_static_header(headers: &mut HeaderMap, name: &'static str, value: &'static str) {

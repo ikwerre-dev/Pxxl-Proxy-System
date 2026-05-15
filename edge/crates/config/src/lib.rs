@@ -37,6 +37,8 @@ pub struct PxxlConfig {
     #[serde(default)]
     pub error_pages: ErrorPagesConfig,
     #[serde(default)]
+    pub geoip: GeoIpConfig,
+    #[serde(default)]
     pub security: SecurityConfig,
     #[serde(default)]
     pub redis: RedisConfig,
@@ -162,6 +164,23 @@ impl Default for ErrorPagesConfig {
         Self {
             enabled: true,
             dir: default_error_pages_dir(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct GeoIpConfig {
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+    #[serde(default = "default_geoip_database_path")]
+    pub database_path: String,
+}
+
+impl Default for GeoIpConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            database_path: default_geoip_database_path(),
         }
     }
 }
@@ -362,6 +381,10 @@ fn default_error_pages_dir() -> String {
     "config/error-pages".to_string()
 }
 
+fn default_geoip_database_path() -> String {
+    "config/geoip/geoip.csv".to_string()
+}
+
 fn default_requests_per_second() -> u32 {
     120
 }
@@ -478,6 +501,20 @@ mod tests {
 
         assert!(config.error_pages.enabled);
         assert_eq!(config.error_pages.dir, "/etc/pxxl/errors");
+    }
+
+    #[test]
+    fn parses_geoip_config() {
+        let raw = r#"
+            [geoip]
+            enabled = true
+            database_path = "/etc/pxxl/geoip.csv"
+        "#;
+
+        let config: PxxlConfig = toml::from_str(raw).unwrap();
+
+        assert!(config.geoip.enabled);
+        assert_eq!(config.geoip.database_path, "/etc/pxxl/geoip.csv");
     }
 
     #[test]

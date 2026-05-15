@@ -80,6 +80,23 @@
           }
         },
         {
+          "name": "Create Domain With Location Rules",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"domain\": \"geo.pxxlhost\",\n  \"path\": \"/\",\n  \"tls\": true,\n  \"algorithm\": \"round_robin\",\n  \"upstreams\": [\n    {\n      \"url\": \"{{upstreamUrl}}\",\n      \"weight\": 1\n    }\n  ],\n  \"rules\": {\n    \"country_allowlist\": [\"US\", \"NG\", \"LO\", \"PR\"],\n    \"country_blocklist\": [\"RU\"],\n    \"continent_allowlist\": [\"NA\", \"AF\", \"LOCAL\", \"PRIVATE\"],\n    \"location_routes\": [\n      {\n        \"name\": \"local-demo\",\n        \"countries\": [\"LO\", \"PR\"],\n        \"upstreams\": [\n          { \"url\": \"{{upstreamUrl}}\", \"weight\": 1 }\n        ]\n      },\n      {\n        \"name\": \"north-america\",\n        \"continents\": [\"NA\"],\n        \"upstreams\": [\n          { \"url\": \"http://us-edge.internal:8080\", \"weight\": 1 }\n        ]\n      }\n    ],\n    \"rate_limit\": {\n      \"enabled\": true,\n      \"requests_per_minute\": 120,\n      \"burst\": 30,\n      \"scope\": \"per_ip\"\n    }\n  }\n}"
+            },
+            "url": "{{baseUrl}}/v1/domains"
+          }
+        },
+        {
           "name": "List Domains",
           "request": {
             "method": "GET",
@@ -117,6 +134,27 @@
           "request": {
             "method": "GET",
             "url": "{{baseUrl}}/v1/domains/{{domain}}/stats"
+          }
+        },
+        {
+          "name": "Route Analytics",
+          "request": {
+            "method": "GET",
+            "url": "{{baseUrl}}/v1/analytics/routes"
+          }
+        },
+        {
+          "name": "Recent Visits",
+          "request": {
+            "method": "GET",
+            "url": "{{baseUrl}}/v1/analytics/visits?limit=50"
+          }
+        },
+        {
+          "name": "Domain Visits",
+          "request": {
+            "method": "GET",
+            "url": "{{baseUrl}}/v1/domains/{{domain}}/visits?limit=50"
           }
         },
         {
