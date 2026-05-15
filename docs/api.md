@@ -68,7 +68,15 @@ Content-Type: application/json
   "upstreams": [
     {
       "url": "http://host.docker.internal:3000",
-      "weight": 1
+      "weight": 1,
+      "backup": false,
+      "transport": {
+        "server_name": null,
+        "insecure_skip_verify": false,
+        "ca_roots": [],
+        "mtls_cert_path": null,
+        "mtls_key_path": null
+      }
     }
   ],
   "rules": {
@@ -122,7 +130,51 @@ Content-Type: application/json
       "status_code": 429,
       "retry_after_seconds": 5
     },
-    "add_security_headers": true
+    "add_security_headers": true,
+    "request_buffering": {
+      "enabled": true,
+      "max_request_bytes": 16777216,
+      "max_response_bytes": 33554432
+    },
+    "compression": {
+      "enabled": true,
+      "min_bytes": 1024,
+      "content_types": ["text/plain", "application/json"]
+    },
+    "content_type_autodetect": { "enabled": true },
+    "retry": {
+      "enabled": true,
+      "attempts": 3,
+      "backoff_ms": 100,
+      "retry_statuses": [502, 503, 504]
+    },
+    "circuit_breaker": {
+      "enabled": true,
+      "failure_threshold": 5,
+      "open_seconds": 30
+    },
+    "in_flight_limit": {
+      "enabled": true,
+      "max": 100,
+      "scope": "route"
+    },
+    "sticky_sessions": {
+      "enabled": true,
+      "cookie_name": "pxxl_upstream"
+    },
+    "passive_health": {
+      "enabled": true,
+      "failure_threshold": 3,
+      "recovery_seconds": 30,
+      "failure_statuses": [500, 502, 503, 504]
+    },
+    "traffic_mirroring": {
+      "enabled": true,
+      "percent": 10,
+      "upstreams": [
+        { "url": "http://shadow.internal:8080" }
+      ]
+    }
   }
 }
 ```
@@ -176,6 +228,26 @@ Available fields:
 | `cors_allowed_methods` | string array | Adds `Access-Control-Allow-Methods`. |
 | `cors_allowed_headers` | string array | Adds `Access-Control-Allow-Headers`. |
 | `cors_preflight_enabled` | boolean | Answers matching CORS preflight requests directly with `204`. Defaults to `true`. |
+| `middlewares` | object | Reusable middleware definitions referenced by `paths[].middlewares`. |
+| `middleware_chains` | object | Named arrays of middleware names. Chains can reference other chains up to a small recursion guard. |
+| `request_buffering` | object | Buffers request bodies for retry/mirror/auth pipelines and enforces `max_request_bytes`. |
+| `response_buffering` | object | Caps buffered response size with `max_response_bytes`. |
+| `compression` | object | Gzips compressible responses when the client sends `Accept-Encoding: gzip`. |
+| `content_type_autodetect` | object | Adds missing request/response content types from path extension or body sniffing. |
+| `retry` | object | Retries buffered requests on upstream errors or configured status codes. |
+| `circuit_breaker` | object | Temporarily removes repeatedly failing upstreams from selection. |
+| `in_flight_limit` | object | Rejects requests above a route/domain/upstream concurrency limit. |
+| `sticky_sessions` | object | Pins clients to an upstream with a stable cookie. |
+| `passive_health` | object | Marks upstreams unhealthy from observed failures; active checks can recover them. |
+| `traffic_mirroring` | object | Sends a sampled shadow copy of requests to mirror upstreams. |
+| `client_cert_forwarding` | object | Forwards an accepted TLS client certificate to the configured upstream header when mTLS is enabled on the listener. |
+| `services` | object | Reusable service definitions and weighted service targets for control-plane compatibility. |
+| `upstream_transport` | object | Default upstream TLS transport options: SNI override, custom CA roots, insecure skip, and mTLS cert/key paths. |
+| `tls_options` | object | Per-router TLS intent: min version, cipher suites, and client auth settings. |
+| `acme` | object | ACME intent: directory URL, email, challenge type, DNS provider, and wildcard flag. |
+| `tcp` | object | TCP routing intent including HostSNI and TLS passthrough. |
+| `udp` | object | UDP routing intent. |
+| `http3` | object | HTTP/3 entrypoint intent. |
 
 Rate limit scopes:
 
@@ -210,6 +282,68 @@ Traffic split rule shape:
   ]
 }
 ```
+
+Middleware definition shape:
+
+```json
+{
+  "chain": [],
+  "basic_auth": {
+    "enabled": true,
+    "realm": "Pxxl",
+    "users": { "demo": "secret" }
+  },
+  "digest_auth": {
+    "enabled": true,
+    "realm": "Pxxl",
+    "users": { "demo": "secret" }
+  },
+  "forward_auth": {
+    "enabled": true,
+    "url": "http://auth.internal/verify",
+    "request_headers": ["authorization", "cookie"],
+    "response_headers": []
+  },
+  "retry": {
+    "enabled": true,
+    "attempts": 3,
+    "backoff_ms": 100,
+    "retry_statuses": [502, 503, 504]
+  },
+  "circuit_breaker": {
+    "enabled": true,
+    "failure_threshold": 5,
+    "open_seconds": 30
+  },
+  "in_flight_limit": {
+    "enabled": true,
+    "max": 100,
+    "scope": "route"
+  },
+  "compression": {
+    "enabled": true,
+    "min_bytes": 1024
+  },
+  "content_type_autodetect": {
+    "enabled": true
+  }
+}
+```
+
+Supported load-balancing algorithms:
+
+```txt
+round_robin
+weighted_round_robin
+ip_hash
+least_connections
+p2c
+hrw
+ewma_latency
+latency_aware
+```
+
+The runtime currently proxies HTTP and HTTPS entrypoints. ACME, TCP, UDP, HTTP/3, per-router TLS cipher/client-auth selection, and HTTPS upstream mTLS fields are accepted in the route schema for control-plane compatibility, but production listener/transport implementations are still in progress.
 
 The GeoIP resolver is fully offline. It reads `config/geoip/geoip.csv` by default. The built-in seed only knows localhost and private ranges, so add a licensed CIDR database if you need real public-country accuracy.
 

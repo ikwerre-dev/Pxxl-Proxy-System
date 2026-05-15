@@ -8,6 +8,8 @@ flowchart LR
   Edge --> Security["DDoS Checks"]
   Edge --> GeoIP["Offline GeoIP Resolver"]
   Security --> Router["Atomic Route Registry"]
+  Router --> Middleware["Middleware Chain"]
+  Middleware --> Buffer["Request Buffer / Retry / Mirror"]
   Router --> LB["Load Balancer"]
   LB --> Upstream["Container or Service Upstream"]
   Docker["Docker Socket Poller"] --> Router
@@ -17,6 +19,7 @@ flowchart LR
   Edge --> Analytics["In-Memory Route Analytics"]
   Analytics --> ClickHouse["ClickHouse pxxl_access_logs"]
   Edge --> Metrics["Prometheus Metrics"]
+  Edge --> Trace["W3C traceparent Propagation"]
 ```
 
 ## Hot Path
@@ -30,10 +33,14 @@ The request hot path is:
 5. Resolve location from the offline GeoIP CIDR table.
 6. Match route from the atomic route registry.
 7. Enforce domain rules, including IP/location allow/block lists, WAF checks, and rate limits.
-8. Pick a traffic-split or location-specific upstream pool when rules match.
-9. Select a healthy upstream.
-10. Stream the request and response with Hyper.
-11. Emit structured logs, Prometheus metrics, aggregate route stats, recent visit records, and queued ClickHouse analytics events.
+8. Resolve and execute path middleware chains.
+9. Buffer the request body within configured limits when retry, mirroring, content sniffing, or auth middleware needs replayable bytes.
+10. Pick a traffic-split or location-specific upstream pool when rules match.
+11. Select a healthy upstream using round-robin, weighted round-robin, IP-hash, least-connections, P2C, HRW, EWMA, or latency-aware strategies.
+12. Apply sticky-session cookies, circuit-breaker state, in-flight limits, and backup upstream failover.
+13. Forward the request with Hyper, retry when configured, and optionally mirror a sampled shadow request.
+14. Apply response headers, content-type auto-detection, response buffering limits, and gzip compression.
+15. Emit structured logs, W3C `traceparent` headers, Prometheus metrics, aggregate route stats, recent visit records, and queued ClickHouse analytics events.
 
 No database, internet GeoIP API, Redis lookup, ClickHouse write, health-check probe, or Docker socket access is required to forward a request.
 
@@ -49,6 +56,7 @@ No database, internet GeoIP API, Redis lookup, ClickHouse write, health-check pr
 - ClickHouse analytics writer consumes a best-effort queue and creates `pxxl_access_logs`.
 - TLS reloader regenerates the local certificate when route domains change.
 - Health checker periodically updates upstream `healthy` flags from HTTP probes.
+- Passive health observes proxied failures and can mark upstreams unhealthy until recovery.
 - Redis sync is prepared for blacklist pub/sub propagation across nodes.
 
 ## Crate Boundaries
