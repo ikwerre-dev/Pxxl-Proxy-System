@@ -19,9 +19,15 @@ pxxl-http-proxy = { path = "crates/http-proxy" }
 pxxl-load-balancer = { path = "crates/load-balancer" }
 pxxl-metrics = { path = "crates/metrics" }
 pxxl-redis-sync = { path = "crates/redis-sync" }
+pxxl-storage = { path = "crates/storage" }
 pxxl-tls = { path = "crates/tls" }
 
 anyhow = { workspace = true }
+bytes = { workspace = true }
+http = { workspace = true }
+http-body-util = { workspace = true }
+hyper = { workspace = true }
+hyper-util = { workspace = true }
 tokio = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }

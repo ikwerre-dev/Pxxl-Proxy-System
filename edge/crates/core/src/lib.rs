@@ -15,8 +15,8 @@ use std::{
         atomic::{AtomicU64, Ordering},
         Arc,
     },
-    time::{SystemTime, UNIX_EPOCH},
 };
+use tokio::sync::mpsc;
 use tracing::info;
 
 const RECENT_VISIT_LIMIT: usize = 200;
@@ -107,12 +107,22 @@ impl RouteRegistry {
 
     pub fn find_domain(&self, domain: &str) -> Option<Route> {
         let table = self.routes.load();
-        let routes = table
-            .by_domain
-            .get(&normalize_domain(domain))
-            .into_iter()
-            .flatten();
-        merge_best_domain_routes(routes)
+        let normalized = normalize_domain(domain);
+        let routes = table.by_domain.get(&normalized).into_iter().flatten();
+        let matched = merge_best_domain_routes(routes);
+        if matched.is_some() {
+            return matched;
+        }
+
+        www_alias_base(&normalized).and_then(|base_domain| {
+            let routes = table
+                .by_domain
+                .get(&base_domain)
+                .into_iter()
+                .flatten()
+                .filter(|route| route.rules.www_alias && !route.domain.starts_with("www."));
+            merge_best_domain_routes(routes)
+        })
     }
 
     pub fn find(&self, host: &str, path: &str) -> Option<RouteMatch> {
@@ -121,18 +131,13 @@ impl RouteRegistry {
             return None;
         }
         let table = self.routes.load();
-        let matches = table
-            .by_domain
-            .get(&normalized_host)
-            .into_iter()
-            .flatten()
-            .filter_map(|route| {
-                route.best_path(path).map(|path_route| RouteMatch {
-                    route: route.clone(),
-                    path: path_route.clone(),
-                })
-            })
-            .collect::<Vec<_>>();
+        let mut matches = matching_routes(table.as_ref(), &normalized_host, path, false);
+
+        if matches.is_empty() {
+            if let Some(base_domain) = www_alias_base(&normalized_host) {
+                matches = matching_routes(table.as_ref(), &base_domain, path, true);
+            }
+        }
 
         merge_best_route_matches(matches)
     }
@@ -143,6 +148,38 @@ impl RouteRegistry {
                 host: host.to_string(),
                 path: path.to_string(),
             })
+    }
+
+    pub fn set_upstream_health(&self, health: &HashMap<String, bool>) {
+        if health.is_empty() {
+            return;
+        }
+
+        let mut routes = self.snapshot();
+        for route in &mut routes {
+            for path in &mut route.paths {
+                for upstream in &mut path.upstreams {
+                    if let Some(healthy) = health.get(&upstream.url) {
+                        upstream.healthy = *healthy;
+                    }
+                }
+            }
+            for split in &mut route.rules.traffic_splits {
+                for upstream in &mut split.upstreams {
+                    if let Some(healthy) = health.get(&upstream.url) {
+                        upstream.healthy = *healthy;
+                    }
+                }
+            }
+            for location_route in &mut route.rules.location_routes {
+                for upstream in &mut location_route.upstreams {
+                    if let Some(healthy) = health.get(&upstream.url) {
+                        upstream.healthy = *healthy;
+                    }
+                }
+            }
+        }
+        self.replace_all(routes);
     }
 }
 
@@ -162,13 +199,23 @@ impl EdgeState {
         load_balancer: Arc<LoadBalancer>,
         metrics: Arc<PxxlMetrics>,
     ) -> Self {
+        Self::new_with_stats_sink(routes, security, load_balancer, metrics, None)
+    }
+
+    pub fn new_with_stats_sink(
+        routes: Arc<RouteRegistry>,
+        security: Arc<SecurityEngine>,
+        load_balancer: Arc<LoadBalancer>,
+        metrics: Arc<PxxlMetrics>,
+        stats_sink: Option<mpsc::Sender<RequestObservation>>,
+    ) -> Self {
         refresh_route_metrics(&routes, &metrics);
         Self {
             routes,
             security,
             load_balancer,
             metrics,
-            stats: Arc::new(DomainStatsRegistry::new()),
+            stats: Arc::new(DomainStatsRegistry::new_with_sink(stats_sink)),
         }
     }
 
@@ -194,6 +241,7 @@ impl EdgeState {
 #[derive(Debug, Default)]
 pub struct DomainStatsRegistry {
     domains: DashMap<String, Arc<DomainStatsCounters>>,
+    sink: Option<mpsc::Sender<RequestObservation>>,
 }
 
 impl DomainStatsRegistry {
@@ -201,7 +249,17 @@ impl DomainStatsRegistry {
         Self::default()
     }
 
+    pub fn new_with_sink(sink: Option<mpsc::Sender<RequestObservation>>) -> Self {
+        Self {
+            domains: DashMap::new(),
+            sink,
+        }
+    }
+
     pub fn record(&self, event: RequestObservation) {
+        if let Some(sink) = &self.sink {
+            let _ = sink.try_send(event.clone());
+        }
         let counters = self
             .domains
             .entry(event.domain.clone())
@@ -269,7 +327,7 @@ impl DomainStatsCounters {
             .fetch_add(event.latency_ms, Ordering::Relaxed);
         self.last_status
             .store(event.status as u64, Ordering::Relaxed);
-        let timestamp_unix_ms = now_unix_ms();
+        let timestamp_unix_ms = event.timestamp_unix_ms;
         self.last_seen_unix_ms
             .store(timestamp_unix_ms, Ordering::Relaxed);
 
@@ -351,7 +409,7 @@ impl DomainStatsCounters {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize)]
 pub struct RequestObservation {
     pub domain: String,
     pub method: String,
@@ -361,6 +419,7 @@ pub struct RequestObservation {
     pub upstream: Option<String>,
     pub remote_ip: Option<IpAddr>,
     pub location: GeoLocation,
+    pub timestamp_unix_ms: u64,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -472,6 +531,36 @@ fn source_priority(source: &RouteSource) -> usize {
     }
 }
 
+fn matching_routes(
+    table: &RouteTable,
+    domain: &str,
+    path: &str,
+    require_www_alias: bool,
+) -> Vec<RouteMatch> {
+    table
+        .by_domain
+        .get(domain)
+        .into_iter()
+        .flatten()
+        .filter(|route| {
+            !require_www_alias || (route.rules.www_alias && !route.domain.starts_with("www."))
+        })
+        .filter_map(|route| {
+            route.best_path(path).map(|path_route| RouteMatch {
+                route: route.clone(),
+                path: path_route.clone(),
+            })
+        })
+        .collect()
+}
+
+fn www_alias_base(domain: &str) -> Option<String> {
+    domain
+        .strip_prefix("www.")
+        .filter(|base| !base.is_empty() && !base.starts_with("www."))
+        .map(str::to_string)
+}
+
 fn merge_best_domain_routes<'a>(routes: impl Iterator<Item = &'a Route>) -> Option<Route> {
     let routes = routes.collect::<Vec<_>>();
     let best_priority = routes
@@ -550,13 +639,6 @@ fn extend_unique_middlewares(target: &mut Vec<String>, middlewares: &[String]) {
             target.push(middleware.clone());
         }
     }
-}
-
-fn now_unix_ms() -> u64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|duration| duration.as_millis() as u64)
-        .unwrap_or_default()
 }
 
 fn nonzero_u16(value: u64) -> Option<u16> {
@@ -705,5 +787,57 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec!["http://docker:80", "http://podman:80"]
         );
+    }
+
+    #[test]
+    fn registry_matches_www_alias_when_enabled() {
+        let mut route = Route::new(
+            "example.com",
+            vec![PathRoute::new("/", vec![Upstream::new("http://app:3000")])],
+            RouteSource::Static,
+        );
+        route.rules.www_alias = true;
+        let registry = RouteRegistry::new(vec![route]);
+
+        let matched = registry.find("www.example.com", "/").unwrap();
+
+        assert_eq!(matched.route.domain, "example.com");
+    }
+
+    #[test]
+    fn registry_does_not_match_www_alias_by_default() {
+        let route = Route::new(
+            "example.com",
+            vec![PathRoute::new("/", vec![Upstream::new("http://app:3000")])],
+            RouteSource::Static,
+        );
+        let registry = RouteRegistry::new(vec![route]);
+
+        assert!(registry.find("www.example.com", "/").is_none());
+    }
+
+    #[test]
+    fn health_updates_cover_route_and_rule_upstreams() {
+        let mut route = Route::new(
+            "example.com",
+            vec![PathRoute::new("/", vec![Upstream::new("http://app:3000")])],
+            RouteSource::Static,
+        );
+        route.rules.location_routes = vec![pxxl_common::LocationRouteRule {
+            name: Some("local".to_string()),
+            countries: Vec::new(),
+            continents: Vec::new(),
+            upstreams: vec![Upstream::new("http://local:3000")],
+        }];
+        let registry = RouteRegistry::new(vec![route]);
+
+        registry.set_upstream_health(&HashMap::from([
+            ("http://app:3000".to_string(), false),
+            ("http://local:3000".to_string(), false),
+        ]));
+        let route = registry.find_domain("example.com").unwrap();
+
+        assert!(!route.paths[0].upstreams[0].healthy);
+        assert!(!route.rules.location_routes[0].upstreams[0].healthy);
     }
 }

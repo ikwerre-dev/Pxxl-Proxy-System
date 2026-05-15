@@ -52,6 +52,25 @@ impl LoadBalancer {
         }
     }
 
+    pub fn select_weighted_index(&self, route_key: &str, weights: &[u32]) -> Option<usize> {
+        if weights.is_empty() {
+            return None;
+        }
+
+        let weighted = weights
+            .iter()
+            .enumerate()
+            .flat_map(|(index, weight)| std::iter::repeat_n(index, (*weight).max(1) as usize))
+            .collect::<Vec<_>>();
+
+        let counter = self
+            .counters
+            .entry(route_key.to_string())
+            .or_insert_with(|| AtomicUsize::new(0));
+        let index = counter.fetch_add(1, Ordering::Relaxed) % weighted.len();
+        weighted.get(index).copied()
+    }
+
     fn round_robin(&self, route_key: &str, upstreams: &[Upstream]) -> Option<Upstream> {
         let counter = self
             .counters
@@ -127,5 +146,15 @@ mod tests {
             .url,
             "http://good:3000"
         );
+    }
+
+    #[test]
+    fn weighted_index_honors_weights() {
+        let lb = LoadBalancer::new();
+        let weights = vec![2, 1];
+
+        assert_eq!(lb.select_weighted_index("split", &weights), Some(0));
+        assert_eq!(lb.select_weighted_index("split", &weights), Some(0));
+        assert_eq!(lb.select_weighted_index("split", &weights), Some(1));
     }
 }

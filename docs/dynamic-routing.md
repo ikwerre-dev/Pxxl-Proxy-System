@@ -8,6 +8,7 @@ The fast request path never queries Redis. API-created routes are persisted in R
 
 ```http
 POST /v1/domains
+Authorization: Bearer pxxl-dev-token
 Content-Type: application/json
 
 {
@@ -71,6 +72,7 @@ Add `rules` to the domain body to control edge behavior per domain:
     { "url": "http://host.docker.internal:8080", "weight": 1 }
   ],
   "rules": {
+    "www_alias": true,
     "allow_websocket": false,
     "require_https": true,
     "redirect_http_to_https": true,
@@ -106,6 +108,33 @@ Add `rules` to the domain body to control edge behavior per domain:
         ]
       }
     ],
+    "traffic_splits": [
+      {
+        "name": "stable",
+        "weight": 90,
+        "upstreams": [
+          { "url": "http://stable.internal:8080", "weight": 1 }
+        ]
+      },
+      {
+        "name": "canary",
+        "weight": 10,
+        "countries": ["US", "NG"],
+        "upstreams": [
+          { "url": "http://canary.internal:8080", "weight": 1 }
+        ]
+      }
+    ],
+    "waf": {
+      "enabled": true,
+      "block_path_traversal": true,
+      "block_sql_injection": true,
+      "block_xss": true,
+      "block_bad_bots": true,
+      "blocked_user_agents": ["bad-scraper"],
+      "blocked_path_patterns": ["/wp-admin"],
+      "blocked_query_patterns": ["debug=true"]
+    },
     "rate_limit": {
       "enabled": true,
       "requests_per_second": 10,
@@ -131,7 +160,9 @@ Add `rules` to the domain body to control edge behavior per domain:
 
 Bare IPs in `ip_allowlist` and `ip_blocklist` are accepted; Pxxl treats them as single-host networks. `allowed_headers` is strict when set, so include ordinary client headers like `host`, `content-type`, `authorization`, and `origin`.
 
-Location rules use offline GeoIP data. Pxxl reads `config/geoip/geoip.csv` at startup and does not call the internet while handling requests. `country_*` fields match country codes like `US` or `NG`; `continent_*` fields match continent codes like `NA`, `AF`, or `EU`. `location_routes` are evaluated in order and the first matching rule with upstreams replaces the normal path upstreams for that request.
+`www_alias = true` lets `www.<domain>` match the base route. Location rules use offline GeoIP data. Pxxl reads `config/geoip/geoip.csv` at startup and does not call the internet while handling requests. `country_*` fields match country codes like `US` or `NG`; `continent_*` fields match continent codes like `NA`, `AF`, or `EU`. `traffic_splits` provide weighted canary pools and may also be scoped by country/continent. If no traffic split matches, `location_routes` are evaluated in order and the first matching rule with upstreams replaces the normal path upstreams for that request.
+
+WAF rules are lightweight substring checks for path traversal, common SQL injection/XSS markers, scanner user agents, and custom user-agent/path/query patterns.
 
 ## Read APIs
 
@@ -143,9 +174,11 @@ GET /v1/domains/{domain}/stats
 GET /v1/analytics/routes
 GET /v1/analytics/visits?limit=50
 GET /v1/domains/{domain}/visits?limit=50
+GET /v1/analytics/logs?limit=50
+GET /v1/domains/{domain}/logs?limit=50
 DELETE /v1/domains/{domain}
 ```
 
-The analytics endpoints are in-memory. Route stats include top countries, continents, paths, and upstreams. Visit endpoints return the most recent request events, including the resolved location and upstream.
+The analytics endpoints are in-memory. Route stats include top countries, continents, paths, and upstreams. Visit/log endpoints return the most recent request events, including the resolved location and upstream. When ClickHouse analytics are enabled, the same events are persisted to `pxxl_access_logs`.
 
 Import the Postman collection from `docs/postman/pxxl-proxy.postman_collection.json` and the environment from `docs/postman/pxxl-proxy.postman_environment.json`.

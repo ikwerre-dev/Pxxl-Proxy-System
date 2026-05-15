@@ -150,6 +150,8 @@ impl GeoLocation {
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct DomainRules {
+    #[serde(default)]
+    pub www_alias: bool,
     #[serde(default = "default_true")]
     pub allow_websocket: bool,
     #[serde(default)]
@@ -197,6 +199,10 @@ pub struct DomainRules {
     #[serde(default)]
     pub location_routes: Vec<LocationRouteRule>,
     #[serde(default)]
+    pub traffic_splits: Vec<TrafficSplitRule>,
+    #[serde(default)]
+    pub waf: DomainWafRules,
+    #[serde(default)]
     pub rate_limit: Option<DomainRateLimit>,
     #[serde(default)]
     pub max_body_bytes: Option<u64>,
@@ -225,6 +231,7 @@ pub struct DomainRules {
 impl Default for DomainRules {
     fn default() -> Self {
         Self {
+            www_alias: false,
             allow_websocket: true,
             require_https: false,
             redirect_http_to_https: false,
@@ -243,6 +250,8 @@ impl Default for DomainRules {
             continent_allowlist: Vec::new(),
             continent_blocklist: Vec::new(),
             location_routes: Vec::new(),
+            traffic_splits: Vec::new(),
+            waf: DomainWafRules::default(),
             rate_limit: None,
             max_body_bytes: None,
             max_uri_length: None,
@@ -269,6 +278,55 @@ pub struct LocationRouteRule {
     pub continents: Vec<String>,
     #[serde(default)]
     pub upstreams: Vec<Upstream>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct TrafficSplitRule {
+    #[serde(default)]
+    pub name: Option<String>,
+    #[serde(default = "default_weight")]
+    pub weight: u32,
+    #[serde(default, alias = "country_codes")]
+    pub countries: Vec<String>,
+    #[serde(default, alias = "continent_codes")]
+    pub continents: Vec<String>,
+    #[serde(default)]
+    pub upstreams: Vec<Upstream>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct DomainWafRules {
+    #[serde(default)]
+    pub enabled: bool,
+    #[serde(default = "default_true")]
+    pub block_path_traversal: bool,
+    #[serde(default = "default_true")]
+    pub block_sql_injection: bool,
+    #[serde(default = "default_true")]
+    pub block_xss: bool,
+    #[serde(default)]
+    pub block_bad_bots: bool,
+    #[serde(default)]
+    pub blocked_user_agents: Vec<String>,
+    #[serde(default)]
+    pub blocked_path_patterns: Vec<String>,
+    #[serde(default)]
+    pub blocked_query_patterns: Vec<String>,
+}
+
+impl Default for DomainWafRules {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            block_path_traversal: true,
+            block_sql_injection: true,
+            block_xss: true,
+            block_bad_bots: false,
+            blocked_user_agents: Vec::new(),
+            blocked_path_patterns: Vec::new(),
+            blocked_query_patterns: Vec::new(),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -470,7 +528,7 @@ where
         .collect()
 }
 
-fn parse_ip_net(value: &str) -> std::result::Result<IpNet, String> {
+pub fn parse_ip_net(value: &str) -> std::result::Result<IpNet, String> {
     if let Ok(network) = IpNet::from_str(value) {
         return Ok(network);
     }

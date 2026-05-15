@@ -13,4 +13,5 @@ arc-swap = { workspace = true }
 dashmap = { workspace = true }
 parking_lot = { workspace = true }
 serde = { workspace = true }
+tokio = { workspace = true }
 tracing = { workspace = true }

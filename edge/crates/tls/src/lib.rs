@@ -77,6 +77,47 @@ impl LocalCertificateStore {
 
     pub async fn server_config(&self, domains: &[String]) -> Result<Arc<ServerConfig>> {
         let bundle = self.ensure_certificate(domains).await?;
+        self.server_config_from_bundle(&bundle)
+    }
+
+    pub async fn regenerate_certificate(&self, domains: &[String]) -> Result<CertificateBundle> {
+        fs::create_dir_all(&self.cert_dir)
+            .await
+            .map_err(|source| TlsError::CreateDir {
+                path: self.cert_dir.display().to_string(),
+                source,
+            })?;
+
+        let cert_path = self.cert_path();
+        let key_path = self.key_path();
+        let (cert_pem, key_pem, domains) = generate_certificate(domains)?;
+
+        fs::write(&cert_path, cert_pem)
+            .await
+            .map_err(|source| TlsError::Write {
+                path: cert_path.display().to_string(),
+                source,
+            })?;
+        fs::write(&key_path, key_pem)
+            .await
+            .map_err(|source| TlsError::Write {
+                path: key_path.display().to_string(),
+                source,
+            })?;
+
+        info!(cert = %cert_path.display(), "regenerated local development certificate");
+
+        Ok(CertificateBundle {
+            cert_path,
+            key_path,
+            domains,
+        })
+    }
+
+    pub fn server_config_from_bundle(
+        &self,
+        bundle: &CertificateBundle,
+    ) -> Result<Arc<ServerConfig>> {
         let certs = load_certs(&bundle.cert_path)?;
         let key = load_private_key(&bundle.key_path)?;
         let mut config = ServerConfig::builder()
@@ -108,22 +149,7 @@ impl CertificateIssuer for LocalCertificateStore {
             });
         }
 
-        let mut sans = domains.to_vec();
-        for default in ["localhost", "pxxlhost", "*.pxxlhost"] {
-            if !sans.iter().any(|value| value == default) {
-                sans.push(default.to_string());
-            }
-        }
-        sans.sort();
-        sans.dedup();
-
-        let mut params = CertificateParams::new(sans.clone());
-        params
-            .distinguished_name
-            .push(DnType::CommonName, "Pxxl Proxy Local Development");
-        let cert = Certificate::from_params(params)?;
-        let cert_pem = cert.serialize_pem()?;
-        let key_pem = cert.serialize_private_key_pem();
+        let (cert_pem, key_pem, sans) = generate_certificate(domains)?;
 
         fs::write(&cert_path, cert_pem)
             .await
@@ -146,6 +172,26 @@ impl CertificateIssuer for LocalCertificateStore {
             domains: sans,
         })
     }
+}
+
+fn generate_certificate(domains: &[String]) -> Result<(String, String, Vec<String>)> {
+    let mut sans = domains.to_vec();
+    for default in ["localhost", "pxxlhost", "*.pxxlhost"] {
+        if !sans.iter().any(|value| value == default) {
+            sans.push(default.to_string());
+        }
+    }
+    sans.sort();
+    sans.dedup();
+
+    let mut params = CertificateParams::new(sans.clone());
+    params
+        .distinguished_name
+        .push(DnType::CommonName, "Pxxl Proxy Local Development");
+    let cert = Certificate::from_params(params)?;
+    let cert_pem = cert.serialize_pem()?;
+    let key_pem = cert.serialize_private_key_pem();
+    Ok((cert_pem, key_pem, sans))
 }
 
 fn load_certs(path: &Path) -> Result<Vec<CertificateDer<'static>>> {

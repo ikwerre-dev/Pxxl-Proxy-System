@@ -2,6 +2,30 @@
 
 Base URL: `http://127.0.0.1:8081`
 
+Most `/v1/*` endpoints require:
+
+```http
+Authorization: Bearer pxxl-dev-token
+```
+
+`/healthz` and `/readyz` are public. The default token is for local development; override it with `PXXL_ADMIN_BOOTSTRAP_TOKEN` or `config/pxxl.toml`.
+
+## Auth
+
+```http
+POST /v1/auth/tokens
+Content-Type: application/json
+
+{"name":"postman"}
+```
+
+Returns the raw token once plus token metadata. Token hashes are stored in Redis.
+
+```http
+GET /v1/auth/tokens
+DELETE /v1/auth/tokens/{id}
+```
+
 ## Health
 
 ```http
@@ -48,6 +72,7 @@ Content-Type: application/json
     }
   ],
   "rules": {
+    "www_alias": true,
     "allow_websocket": true,
     "blocked_methods": ["TRACE"],
     "blocked_headers": ["x-debug-token"],
@@ -62,6 +87,33 @@ Content-Type: application/json
         ]
       }
     ],
+    "traffic_splits": [
+      {
+        "name": "stable",
+        "weight": 90,
+        "upstreams": [
+          { "url": "http://stable.internal:8080", "weight": 1 }
+        ]
+      },
+      {
+        "name": "canary",
+        "weight": 10,
+        "countries": ["US", "NG"],
+        "upstreams": [
+          { "url": "http://canary.internal:8080", "weight": 1 }
+        ]
+      }
+    ],
+    "waf": {
+      "enabled": true,
+      "block_path_traversal": true,
+      "block_sql_injection": true,
+      "block_xss": true,
+      "block_bad_bots": true,
+      "blocked_user_agents": ["bad-scraper"],
+      "blocked_path_patterns": ["/wp-admin"],
+      "blocked_query_patterns": ["debug=true"]
+    },
     "rate_limit": {
       "enabled": true,
       "requests_per_minute": 120,
@@ -91,6 +143,7 @@ Available fields:
 
 | Field | Type | Behavior |
 | --- | --- | --- |
+| `www_alias` | boolean | Allows `www.<domain>` to match this base-domain route. Defaults to `false`. |
 | `allow_websocket` | boolean | Allows or blocks `Connection: Upgrade` + `Upgrade: websocket`. Defaults to `true`. |
 | `require_https` | boolean | Rejects plain HTTP with `426 Upgrade Required`. |
 | `redirect_http_to_https` | boolean | Redirects plain HTTP to HTTPS with `308 Permanent Redirect`. |
@@ -109,6 +162,8 @@ Available fields:
 | `continent_allowlist` | string array | Allows only requests whose offline GeoIP continent code matches. Aliases: `allowed_continents`. |
 | `continent_blocklist` | string array | Blocks requests whose offline GeoIP continent code matches. Aliases: `blocked_continents`. |
 | `location_routes` | array | Ordered country/continent routing rules. First matching rule with upstreams overrides the normal path upstreams. |
+| `traffic_splits` | array | Weighted upstream pools for canary routing. Matching country/continent constraints are optional. |
+| `waf` | object | Lightweight WAF checks for traversal, SQLi/XSS markers, scanner user agents, and custom substring patterns. |
 | `rate_limit` | object | Per-domain token bucket. Supports `requests_per_second`, `requests_per_minute`, `burst`, `scope`, `status_code`, and `retry_after_seconds`. |
 | `max_body_bytes` | number | Rejects requests whose `Content-Length` exceeds this value with `413`. |
 | `max_uri_length` | number | Rejects long URLs with `414`. |
@@ -143,6 +198,19 @@ Location routing rule shape:
 }
 ```
 
+Traffic split rule shape:
+
+```json
+{
+  "name": "canary",
+  "weight": 10,
+  "countries": ["US", "NG"],
+  "upstreams": [
+    { "url": "http://canary.internal:8080", "weight": 1 }
+  ]
+}
+```
+
 The GeoIP resolver is fully offline. It reads `config/geoip/geoip.csv` by default. The built-in seed only knows localhost and private ranges, so add a licensed CIDR database if you need real public-country accuracy.
 
 ## Analytics and Stats
@@ -153,11 +221,15 @@ GET /v1/domains/{domain}/stats
 GET /v1/analytics/routes
 GET /v1/analytics/visits?limit=50
 GET /v1/domains/{domain}/visits?limit=50
+GET /v1/analytics/logs?limit=50
+GET /v1/domains/{domain}/logs?limit=50
 ```
 
 Stats return in-memory per-domain counters, status buckets, average latency, last status, last-seen timestamp, top countries, top continents, top paths, and top upstreams.
 
 Visits return recent request events with domain, method, path, status, latency, upstream, remote IP, offline GeoIP location, and timestamp. Recent visit history is in memory and capped per domain.
+
+When `[storage].analytics_enabled = true`, the same request events are persisted to ClickHouse table `pxxl_access_logs`.
 
 ## Upstreams
 

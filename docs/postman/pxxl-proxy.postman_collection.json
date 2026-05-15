@@ -5,6 +5,16 @@
     "description": "Local admin API collection for Pxxl Proxy. Import `pxxl-proxy.postman_environment.json` and run Docker Compose before sending requests.",
     "schema": "https://schema.getpostman.com/json/collection/v2.1.0/collection.json"
   },
+  "auth": {
+    "type": "bearer",
+    "bearer": [
+      {
+        "key": "token",
+        "value": "{{adminToken}}",
+        "type": "string"
+      }
+    ]
+  },
   "item": [
     {
       "name": "Health",
@@ -21,6 +31,42 @@
           "request": {
             "method": "GET",
             "url": "{{baseUrl}}/readyz"
+          }
+        }
+      ]
+    },
+    {
+      "name": "Auth",
+      "item": [
+        {
+          "name": "Create Admin Token",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"name\": \"{{adminTokenName}}\"\n}"
+            },
+            "url": "{{baseUrl}}/v1/auth/tokens"
+          }
+        },
+        {
+          "name": "List Admin Tokens",
+          "request": {
+            "method": "GET",
+            "url": "{{baseUrl}}/v1/auth/tokens"
+          }
+        },
+        {
+          "name": "Revoke Admin Token",
+          "request": {
+            "method": "DELETE",
+            "url": "{{baseUrl}}/v1/auth/tokens/{{tokenId}}"
           }
         }
       ]
@@ -97,6 +143,23 @@
           }
         },
         {
+          "name": "Create Domain With WWW, Traffic Split, and WAF",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"domain\": \"example.pxxlhost\",\n  \"path\": \"/\",\n  \"tls\": true,\n  \"algorithm\": \"round_robin\",\n  \"upstreams\": [\n    { \"url\": \"{{upstreamUrl}}\", \"weight\": 1 }\n  ],\n  \"rules\": {\n    \"www_alias\": true,\n    \"traffic_splits\": [\n      {\n        \"name\": \"stable\",\n        \"weight\": 90,\n        \"upstreams\": [\n          { \"url\": \"{{upstreamUrl}}\", \"weight\": 1 }\n        ]\n      },\n      {\n        \"name\": \"canary\",\n        \"weight\": 10,\n        \"countries\": [\"US\", \"NG\"],\n        \"upstreams\": [\n          { \"url\": \"http://host.docker.internal:3005\", \"weight\": 1 }\n        ]\n      }\n    ],\n    \"waf\": {\n      \"enabled\": true,\n      \"block_path_traversal\": true,\n      \"block_sql_injection\": true,\n      \"block_xss\": true,\n      \"block_bad_bots\": true,\n      \"blocked_user_agents\": [\"bad-scraper\"],\n      \"blocked_path_patterns\": [\"/wp-admin\"],\n      \"blocked_query_patterns\": [\"debug=true\"]\n    }\n  }\n}"
+            },
+            "url": "{{baseUrl}}/v1/domains"
+          }
+        },
+        {
           "name": "List Domains",
           "request": {
             "method": "GET",
@@ -155,6 +218,20 @@
           "request": {
             "method": "GET",
             "url": "{{baseUrl}}/v1/domains/{{domain}}/visits?limit=50"
+          }
+        },
+        {
+          "name": "Recent Access Logs",
+          "request": {
+            "method": "GET",
+            "url": "{{baseUrl}}/v1/analytics/logs?limit=50"
+          }
+        },
+        {
+          "name": "Domain Access Logs",
+          "request": {
+            "method": "GET",
+            "url": "{{baseUrl}}/v1/domains/{{domain}}/logs?limit=50"
           }
         },
         {

@@ -9,18 +9,19 @@ This repository currently implements the Phase 1 MVP:
 - HTTP reverse proxying with Hyper and Tokio
 - Domain and path routing from TOML config
 - Docker container route discovery from `pxxl.*` labels
-- Local self-signed TLS certificate generation in `/data/certs`
+- Local self-signed TLS certificate generation and reload for dynamic domains in `/data/certs`
 - In-memory per-domain IP blacklist and CIDR blocking
 - Per-IP token-bucket request rate limiting
-- Per-domain route rules for WebSockets, headers, IP allow/block lists, CORS, HTTPS enforcement, body limits, and custom rate limits
+- Per-domain route rules for `www` aliases, WebSockets, headers, IP/location allow/block lists, CORS, HTTPS enforcement, WAF checks, body limits, and custom rate limits
 - Offline GeoIP lookups for country/continent analytics, blocking, and location-based upstream routing
-- In-memory route analytics with aggregate counters and recent visit history
+- In-memory route analytics with aggregate counters, recent visit history, access-log APIs, and optional ClickHouse persistence
+- Active upstream health checks that mark unhealthy upstreams out of rotation
 - Round-robin, weighted round-robin, and IP-hash load-balancer selection
-- Admin API for health, routes, upstreams, cert metadata, and blacklist changes
+- Admin API auth with Redis-backed bearer tokens and optional admin IP allowlists
 - Prometheus metrics endpoint
 - Docker, Docker Compose, CI, docs, examples, and tests
 
-Future phases will add TCP/UDP proxying, production ACME flows, durable ClickHouse analytics ingestion, JWT/RBAC, dashboard UI, active health checks, circuit breakers, cluster sync, and deeper DDoS controls.
+Future phases will add TCP/UDP proxying, production ACME flows, dashboard UI, circuit breakers, cluster sync, and deeper DDoS controls.
 
 ## Quick Start
 
@@ -46,6 +47,12 @@ Health checks:
 curl http://127.0.0.1:8081/healthz
 curl http://127.0.0.1:8081/readyz
 curl http://127.0.0.1:9090/metrics
+```
+
+The default local admin bearer token is `pxxl-dev-token`. For admin API calls under `/v1/*`, send:
+
+```sh
+curl -H "Authorization: Bearer pxxl-dev-token" http://127.0.0.1:8081/v1/routes
 ```
 
 ## Container Labels
@@ -138,6 +145,56 @@ cidr,country_code,country_name,continent_code,continent_name,region,city
 
 The repo includes seed records for localhost and private networks only. For real public-country detection, replace or extend `config/geoip/geoip.csv` with a licensed offline CIDR database. You can override the path with `PXXL_GEOIP_DATABASE` or disable lookups with `PXXL_GEOIP_ENABLED=false`.
 
+## Admin Auth
+
+Admin API auth is configured in `config/pxxl.toml`:
+
+```toml
+[admin]
+auth_enabled = true
+bootstrap_token = "pxxl-dev-token"
+token_store_key = "pxxl:admin_tokens"
+ip_allowlist = []
+```
+
+`/healthz` and `/readyz` stay public for uptime checks. Other admin endpoints require `Authorization: Bearer <token>` when `auth_enabled = true`. Use the bootstrap token to create Redis-backed tokens:
+
+```http
+POST /v1/auth/tokens
+Authorization: Bearer pxxl-dev-token
+Content-Type: application/json
+
+{"name":"postman"}
+```
+
+The raw token is returned once. Token metadata and SHA-256 token hashes are stored in Redis. Set `ip_allowlist` to bare IPs or CIDRs to restrict which clients can use the admin API.
+
+## Persistent Analytics
+
+Request analytics are still recorded in memory for fast API reads, and are also queued to ClickHouse when enabled:
+
+```toml
+[storage]
+clickhouse_url = "http://pxxl:pxxl@clickhouse:8123"
+analytics_enabled = true
+```
+
+Pxxl creates `pxxl_access_logs` if it can reach ClickHouse. The proxy hot path only sends to an in-memory queue; failed ClickHouse writes are logged and do not block requests.
+
+## Active Health Checks
+
+Pxxl periodically checks every known upstream, including normal path upstreams, location-route upstreams, and traffic-split upstreams:
+
+```toml
+[health_checks]
+enabled = true
+interval_seconds = 10
+timeout_ms = 1500
+path = "/"
+```
+
+Statuses below `500` are considered healthy. Unhealthy upstreams are marked out of rotation until a later check succeeds.
+
 ## Domain Rules
 
 API and TOML routes can include a `rules` object. These rules are enforced before traffic is forwarded upstream:
@@ -152,6 +209,7 @@ API and TOML routes can include a `rules` object. These rules are enforced befor
     { "url": "http://host.docker.internal:8080", "weight": 1 }
   ],
   "rules": {
+    "www_alias": true,
     "allow_websocket": false,
     "require_https": true,
     "redirect_http_to_https": true,
@@ -191,6 +249,33 @@ API and TOML routes can include a `rules` object. These rules are enforced befor
         ]
       }
     ],
+    "traffic_splits": [
+      {
+        "name": "stable",
+        "weight": 90,
+        "upstreams": [
+          { "url": "http://stable.internal:8080", "weight": 1 }
+        ]
+      },
+      {
+        "name": "canary",
+        "weight": 10,
+        "countries": ["US", "NG"],
+        "upstreams": [
+          { "url": "http://canary.internal:8080", "weight": 1 }
+        ]
+      }
+    ],
+    "waf": {
+      "enabled": true,
+      "block_path_traversal": true,
+      "block_sql_injection": true,
+      "block_xss": true,
+      "block_bad_bots": true,
+      "blocked_user_agents": ["bad-scraper"],
+      "blocked_path_patterns": ["/wp-admin"],
+      "blocked_query_patterns": ["debug=true"]
+    },
     "rate_limit": {
       "enabled": true,
       "requests_per_minute": 120,
@@ -216,7 +301,11 @@ API and TOML routes can include a `rules` object. These rules are enforced befor
 
 Defaults are permissive: if a field is missing, Pxxl keeps current proxy behavior. `allowed_headers` is strict when set, so include normal browser/client headers such as `host`, `content-type`, `authorization`, and `origin` when you use it.
 
-Location rules use ISO-style country codes such as `US` or `NG` and continent codes such as `NA`, `AF`, and `EU`. Allow/block checks happen before upstream selection. `location_routes` are checked in order; the first country/continent match with upstreams wins and then uses the domain's configured load-balancing algorithm.
+`www_alias` lets `www.<domain>` match the base route. Use it only on base domains where you want that behavior.
+
+Location rules use ISO-style country codes such as `US` or `NG` and continent codes such as `NA`, `AF`, and `EU`. Allow/block checks happen before upstream selection. `traffic_splits` are evaluated first for matching country/continent constraints, then `location_routes`; the selected upstream pool uses the domain's configured load-balancing algorithm.
+
+WAF checks are substring-pattern based and intentionally lightweight: path traversal, common SQLi/XSS markers, known scanner user agents, and custom user-agent/path/query patterns.
 
 ## Local Wildcard Development
 
@@ -250,6 +339,11 @@ For true wildcard resolution, use dnsmasq or CoreDNS.
 - `GET /v1/analytics/routes`
 - `GET /v1/analytics/visits?limit=50`
 - `GET /v1/domains/{domain}/visits?limit=50`
+- `GET /v1/analytics/logs?limit=50`
+- `GET /v1/domains/{domain}/logs?limit=50`
+- `POST /v1/auth/tokens` with `{"name":"postman"}`
+- `GET /v1/auth/tokens`
+- `DELETE /v1/auth/tokens/{id}`
 - `GET /v1/upstreams`
 - `GET /v1/certs`
 - `POST /v1/blacklist/{domain_id}` with `{"ip":"203.0.113.10"}`

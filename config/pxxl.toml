@@ -28,6 +28,18 @@ dir = "config/error-pages"
 enabled = true
 database_path = "config/geoip/geoip.csv"
 
+[admin]
+auth_enabled = true
+bootstrap_token = "pxxl-dev-token"
+token_store_key = "pxxl:admin_tokens"
+ip_allowlist = []
+
+[health_checks]
+enabled = true
+interval_seconds = 10
+timeout_ms = 1500
+path = "/"
+
 [security.rate_limits]
 requests_per_second = 120
 burst = 240
@@ -41,7 +53,8 @@ blacklist_channel = "pxxl:blacklist"
 
 [storage]
 postgres_url = "postgres://pxxl:pxxl@postgres:5432/pxxl"
-clickhouse_url = "http://clickhouse:8123"
+clickhouse_url = "http://pxxl:pxxl@clickhouse:8123"
+analytics_enabled = true
 
 [[routes]]
 id = "admin-example"

@@ -5,5 +5,17 @@ edition = "2021"
 license = "MIT"
 
 [dependencies]
+anyhow = { workspace = true }
+base64 = { workspace = true }
+bytes = { workspace = true }
+http = { workspace = true }
+http-body-util = { workspace = true }
+hyper = { workspace = true }
+hyper-util = { workspace = true }
+pxxl-core = { path = "../core" }
 serde = { workspace = true }
+serde_json = { workspace = true }
 thiserror = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }
+url = { workspace = true }

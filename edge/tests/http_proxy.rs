@@ -8,7 +8,8 @@ use hyper_util::{
     server::conn::auto::Builder as AutoBuilder,
 };
 use pxxl_common::{
-    DomainRateLimit, DomainRules, LocationRouteRule, PathRoute, Route, RouteSource, Upstream,
+    DomainRateLimit, DomainRules, DomainWafRules, LocationRouteRule, PathRoute, Route, RouteSource,
+    TrafficSplitRule, Upstream,
 };
 use pxxl_core::{EdgeState, RouteRegistry};
 use pxxl_ddos::{BlacklistEngine, RateLimitConfig, RateLimiter, SecurityEngine};
@@ -258,6 +259,124 @@ async fn routes_requests_by_country_rule() {
 
     assert_eq!(status, StatusCode::OK);
     assert_eq!(&body[..], b"local upstream");
+}
+
+#[tokio::test]
+async fn routes_requests_by_weighted_traffic_split() {
+    let stable_addr = spawn_upstream("stable").await;
+    let canary_addr = spawn_upstream("canary").await;
+    let proxy_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let proxy_addr = proxy_listener.local_addr().unwrap();
+    let (shutdown_tx, shutdown_rx) = watch::channel(false);
+
+    let mut route = Route::new(
+        "split.pxxlhost",
+        vec![PathRoute::new(
+            "/",
+            vec![Upstream::new("http://unused:3000")],
+        )],
+        RouteSource::Static,
+    );
+    route.rules = DomainRules {
+        traffic_splits: vec![
+            TrafficSplitRule {
+                name: Some("stable".to_string()),
+                weight: 2,
+                countries: Vec::new(),
+                continents: Vec::new(),
+                upstreams: vec![Upstream::new(format!("http://{stable_addr}"))],
+            },
+            TrafficSplitRule {
+                name: Some("canary".to_string()),
+                weight: 1,
+                countries: Vec::new(),
+                continents: Vec::new(),
+                upstreams: vec![Upstream::new(format!("http://{canary_addr}"))],
+            },
+        ],
+        ..DomainRules::default()
+    };
+    let state = test_state(vec![route]);
+    let server = tokio::spawn(run_http_proxy_on_listener(
+        proxy_listener,
+        state,
+        shutdown_rx,
+    ));
+    let client: Client<HttpConnector, Empty<Bytes>> =
+        Client::builder(TokioExecutor::new()).build_http();
+
+    let mut bodies = Vec::new();
+    for _ in 0..3 {
+        let req = Request::builder()
+            .method("GET")
+            .uri(format!("http://{proxy_addr}/"))
+            .header("host", "split.pxxlhost")
+            .body(Empty::<Bytes>::new())
+            .unwrap();
+        bodies.push(
+            client
+                .request(req)
+                .await
+                .unwrap()
+                .into_body()
+                .collect()
+                .await
+                .unwrap()
+                .to_bytes(),
+        );
+    }
+
+    shutdown_tx.send(true).unwrap();
+    server.await.unwrap().unwrap();
+
+    assert_eq!(&bodies[0][..], b"stable");
+    assert_eq!(&bodies[1][..], b"stable");
+    assert_eq!(&bodies[2][..], b"canary");
+}
+
+#[tokio::test]
+async fn blocks_waf_sql_injection_pattern() {
+    let upstream_addr = spawn_upstream("should not proxy").await;
+    let proxy_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let proxy_addr = proxy_listener.local_addr().unwrap();
+    let (shutdown_tx, shutdown_rx) = watch::channel(false);
+
+    let mut route = Route::new(
+        "waf.pxxlhost",
+        vec![PathRoute::new(
+            "/",
+            vec![Upstream::new(format!("http://{upstream_addr}"))],
+        )],
+        RouteSource::Static,
+    );
+    route.rules = DomainRules {
+        waf: DomainWafRules {
+            enabled: true,
+            ..DomainWafRules::default()
+        },
+        ..DomainRules::default()
+    };
+    let state = test_state(vec![route]);
+    let server = tokio::spawn(run_http_proxy_on_listener(
+        proxy_listener,
+        state,
+        shutdown_rx,
+    ));
+    let client: Client<HttpConnector, Empty<Bytes>> =
+        Client::builder(TokioExecutor::new()).build_http();
+    let req = Request::builder()
+        .method("GET")
+        .uri(format!("http://{proxy_addr}/?q=%27%20or%201=1"))
+        .header("host", "waf.pxxlhost")
+        .body(Empty::<Bytes>::new())
+        .unwrap();
+
+    let status = client.request(req).await.unwrap().status();
+
+    shutdown_tx.send(true).unwrap();
+    server.await.unwrap().unwrap();
+
+    assert_eq!(status, StatusCode::FORBIDDEN);
 }
 
 async fn spawn_upstream(body: &'static str) -> SocketAddr {

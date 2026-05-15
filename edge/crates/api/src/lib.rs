@@ -1,18 +1,19 @@
 use bytes::Bytes;
-use http::{Method, Request, Response, StatusCode};
+use http::{header::AUTHORIZATION, Method, Request, Response, StatusCode};
 use http_body_util::{BodyExt, Full};
 use hyper::{body::Incoming, service::service_fn};
 use hyper_util::{
     rt::{TokioExecutor, TokioIo},
     server::conn::auto::Builder as AutoBuilder,
 };
+use ipnet::IpNet;
 use pxxl_common::{
     normalize_domain, normalize_path_prefix, DomainRules, LoadBalancingAlgorithm, PathRoute, Route,
     RouteSource, Upstream,
 };
 use pxxl_core::EdgeState;
 use pxxl_metrics::PxxlMetrics;
-use pxxl_redis_sync::RedisRouteStore;
+use pxxl_redis_sync::{RedisRouteStore, RedisTokenStore};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use std::{
@@ -31,11 +32,25 @@ struct ApiServer {
     state: EdgeState,
     cert_dir: String,
     route_store: Option<RedisRouteStore>,
+    auth: AdminApiAuth,
 }
 
 #[derive(Debug, Deserialize)]
 struct BlacklistBody {
     ip: IpAddr,
+}
+
+#[derive(Clone)]
+pub struct AdminApiAuth {
+    enabled: bool,
+    bootstrap_token: Option<String>,
+    ip_allowlist: Vec<IpNet>,
+    token_store: Option<RedisTokenStore>,
+}
+
+#[derive(Debug, Deserialize)]
+struct TokenCreateBody {
+    name: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -89,6 +104,7 @@ pub async fn run_admin_api(
     state: EdgeState,
     cert_dir: impl Into<String>,
     route_store: Option<RedisRouteStore>,
+    auth: AdminApiAuth,
     shutdown: watch::Receiver<bool>,
 ) -> anyhow::Result<()> {
     let listener = TcpListener::bind(addr).await?;
@@ -96,6 +112,7 @@ pub async fn run_admin_api(
         state,
         cert_dir: cert_dir.into(),
         route_store,
+        auth,
     };
     info!(%addr, "admin API listening");
     run_api_listener(listener, server, shutdown).await
@@ -111,6 +128,86 @@ pub async fn run_metrics_server(
     run_metrics_listener(listener, metrics, shutdown).await
 }
 
+impl AdminApiAuth {
+    pub fn disabled() -> Self {
+        Self {
+            enabled: false,
+            bootstrap_token: None,
+            ip_allowlist: Vec::new(),
+            token_store: None,
+        }
+    }
+
+    pub fn new(
+        enabled: bool,
+        bootstrap_token: Option<String>,
+        ip_allowlist: Vec<IpNet>,
+        token_store: Option<RedisTokenStore>,
+    ) -> Self {
+        Self {
+            enabled,
+            bootstrap_token,
+            ip_allowlist,
+            token_store,
+        }
+    }
+
+    async fn authorize(
+        &self,
+        req: &Request<Incoming>,
+        remote_ip: IpAddr,
+    ) -> Option<Response<BoxBody>> {
+        if !self.ip_allowlist.is_empty()
+            && !self
+                .ip_allowlist
+                .iter()
+                .any(|network| network.contains(&remote_ip))
+        {
+            return Some(json_response(
+                StatusCode::FORBIDDEN,
+                json!({"error": "admin api ip is not allowed"}),
+            ));
+        }
+
+        if !self.enabled || is_public_admin_path(req.method(), req.uri().path()) {
+            return None;
+        }
+
+        let Some(token) = bearer_token(req) else {
+            return Some(json_response(
+                StatusCode::UNAUTHORIZED,
+                json!({"error": "missing bearer token"}),
+            ));
+        };
+
+        if self
+            .bootstrap_token
+            .as_deref()
+            .is_some_and(|bootstrap| constant_time_eq(bootstrap.as_bytes(), token.as_bytes()))
+        {
+            return None;
+        }
+
+        match &self.token_store {
+            Some(store) => match store.verify_token(token).await {
+                Ok(true) => None,
+                Ok(false) => Some(json_response(
+                    StatusCode::UNAUTHORIZED,
+                    json!({"error": "invalid bearer token"}),
+                )),
+                Err(error) => Some(json_response(
+                    StatusCode::BAD_GATEWAY,
+                    json!({"error": format!("failed to verify bearer token: {error}")}),
+                )),
+            },
+            None => Some(json_response(
+                StatusCode::SERVICE_UNAVAILABLE,
+                json!({"error": "admin token store is not configured"}),
+            )),
+        }
+    }
+}
+
 async fn run_api_listener(
     listener: TcpListener,
     server: ApiServer,
@@ -119,12 +216,12 @@ async fn run_api_listener(
     loop {
         tokio::select! {
             accepted = listener.accept() => {
-                let (stream, _) = accepted?;
+                let (stream, peer) = accepted?;
                 let server = server.clone();
                 tokio::spawn(async move {
                     let service = service_fn(move |req| {
                         let server = server.clone();
-                        async move { Ok::<_, Infallible>(server.handle(req).await) }
+                        async move { Ok::<_, Infallible>(server.handle(req, peer.ip()).await) }
                     });
                     let io = TokioIo::new(stream);
                     let builder = AutoBuilder::new(TokioExecutor::new());
@@ -186,10 +283,14 @@ async fn run_metrics_listener(
 }
 
 impl ApiServer {
-    async fn handle(&self, req: Request<Incoming>) -> Response<BoxBody> {
+    async fn handle(&self, req: Request<Incoming>, remote_ip: IpAddr) -> Response<BoxBody> {
         let method = req.method().clone();
         let path = req.uri().path().to_string();
         let query = req.uri().query().unwrap_or("").to_string();
+
+        if let Some(response) = self.auth.authorize(&req, remote_ip).await {
+            return response;
+        }
 
         match (method, path.as_str()) {
             (Method::GET, "/healthz") => json_response(StatusCode::OK, json!({"status": "ok"})),
@@ -212,6 +313,11 @@ impl ApiServer {
                 json!({ "domains": self.state.routes.snapshot() }),
             ),
             (Method::POST, "/v1/domains") => self.create_domain(req).await,
+            (Method::POST, "/v1/auth/tokens") => self.create_auth_token(req).await,
+            (Method::GET, "/v1/auth/tokens") => self.list_auth_tokens().await,
+            (Method::DELETE, path) if path.starts_with("/v1/auth/tokens/") => {
+                self.revoke_auth_token(path).await
+            }
             (Method::GET, "/v1/stats/domains") => json_response(
                 StatusCode::OK,
                 json!({ "domains": self.state.stats.snapshots() }),
@@ -225,6 +331,13 @@ impl ApiServer {
                 json_response(
                     StatusCode::OK,
                     json!({ "visits": self.state.stats.recent_visits_all(limit) }),
+                )
+            }
+            (Method::GET, "/v1/analytics/logs") => {
+                let limit = query_limit(&query, 50, 200);
+                json_response(
+                    StatusCode::OK,
+                    json!({ "logs": self.state.stats.recent_visits_all(limit) }),
                 )
             }
             (Method::GET, path) if path.starts_with("/v1/domains/") && path.ends_with("/stats") => {
@@ -283,6 +396,27 @@ impl ApiServer {
                     json!({
                         "domain": normalized,
                         "visits": self.state.stats.recent_visits(&normalized, limit)
+                    }),
+                )
+            }
+            (Method::GET, path) if path.starts_with("/v1/domains/") && path.ends_with("/logs") => {
+                let domain = path
+                    .trim_start_matches("/v1/domains/")
+                    .trim_end_matches("/logs")
+                    .trim_matches('/');
+                if domain.is_empty() {
+                    return json_response(
+                        StatusCode::BAD_REQUEST,
+                        json!({"error": "missing domain"}),
+                    );
+                }
+                let normalized = normalize_domain(domain);
+                let limit = query_limit(&query, 50, 200);
+                json_response(
+                    StatusCode::OK,
+                    json!({
+                        "domain": normalized,
+                        "logs": self.state.stats.recent_visits(&normalized, limit)
                     }),
                 )
             }
@@ -461,6 +595,80 @@ impl ApiServer {
             }),
         )
     }
+
+    async fn create_auth_token(&self, req: Request<Incoming>) -> Response<BoxBody> {
+        let collected = match req.into_body().collect().await {
+            Ok(collected) => collected,
+            Err(error) => {
+                return json_response(StatusCode::BAD_REQUEST, json!({"error": error.to_string()}));
+            }
+        };
+        let body = match serde_json::from_slice::<TokenCreateBody>(&collected.to_bytes()) {
+            Ok(body) => body,
+            Err(error) => {
+                return json_response(StatusCode::BAD_REQUEST, json!({"error": error.to_string()}));
+            }
+        };
+
+        let Some(store) = &self.auth.token_store else {
+            return json_response(
+                StatusCode::SERVICE_UNAVAILABLE,
+                json!({"error": "admin token store is not configured"}),
+            );
+        };
+
+        match store.create_token(body.name).await {
+            Ok(created) => json_response(StatusCode::CREATED, json!(created)),
+            Err(error) => json_response(
+                StatusCode::BAD_GATEWAY,
+                json!({"error": format!("failed to create admin token: {error}")}),
+            ),
+        }
+    }
+
+    async fn list_auth_tokens(&self) -> Response<BoxBody> {
+        let Some(store) = &self.auth.token_store else {
+            return json_response(
+                StatusCode::SERVICE_UNAVAILABLE,
+                json!({"error": "admin token store is not configured"}),
+            );
+        };
+
+        match store.list_tokens().await {
+            Ok(tokens) => json_response(StatusCode::OK, json!({ "tokens": tokens })),
+            Err(error) => json_response(
+                StatusCode::BAD_GATEWAY,
+                json!({"error": format!("failed to list admin tokens: {error}")}),
+            ),
+        }
+    }
+
+    async fn revoke_auth_token(&self, path: &str) -> Response<BoxBody> {
+        let id = path
+            .trim_start_matches("/v1/auth/tokens/")
+            .trim_matches('/');
+        if id.is_empty() {
+            return json_response(
+                StatusCode::BAD_REQUEST,
+                json!({"error": "missing token id"}),
+            );
+        }
+
+        let Some(store) = &self.auth.token_store else {
+            return json_response(
+                StatusCode::SERVICE_UNAVAILABLE,
+                json!({"error": "admin token store is not configured"}),
+            );
+        };
+
+        match store.revoke_token(id).await {
+            Ok(deleted) => json_response(StatusCode::OK, json!({ "deleted": deleted, "id": id })),
+            Err(error) => json_response(
+                StatusCode::BAD_GATEWAY,
+                json!({"error": format!("failed to revoke admin token: {error}")}),
+            ),
+        }
+    }
 }
 
 impl DomainRouteBody {
@@ -543,6 +751,30 @@ fn query_limit(query: &str, default: usize, max: usize) -> usize {
         })
         .unwrap_or(default)
         .clamp(1, max)
+}
+
+fn is_public_admin_path(method: &Method, path: &str) -> bool {
+    *method == Method::GET && matches!(path, "/healthz" | "/readyz")
+}
+
+fn bearer_token(req: &Request<Incoming>) -> Option<&str> {
+    req.headers()
+        .get(AUTHORIZATION)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.strip_prefix("Bearer "))
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+}
+
+fn constant_time_eq(left: &[u8], right: &[u8]) -> bool {
+    if left.len() != right.len() {
+        return false;
+    }
+
+    left.iter()
+        .zip(right)
+        .fold(0_u8, |acc, (left, right)| acc | (left ^ right))
+        == 0
 }
 
 fn json_response(status: StatusCode, value: serde_json::Value) -> Response<BoxBody> {

@@ -1,9 +1,9 @@
 use ipnet::IpNet;
 use pxxl_common::{
-    normalize_path_prefix, DomainRules, ListenerConfig, LoadBalancingAlgorithm, PathRoute, Route,
-    RouteSource, Upstream,
+    normalize_path_prefix, parse_ip_net, DomainRules, ListenerConfig, LoadBalancingAlgorithm,
+    PathRoute, Route, RouteSource, Upstream,
 };
-use serde::{Deserialize, Serialize};
+use serde::{de, Deserialize, Deserializer, Serialize};
 use std::{path::Path, time::Duration};
 
 #[derive(Debug, thiserror::Error)]
@@ -38,6 +38,10 @@ pub struct PxxlConfig {
     pub error_pages: ErrorPagesConfig,
     #[serde(default)]
     pub geoip: GeoIpConfig,
+    #[serde(default)]
+    pub admin: AdminConfig,
+    #[serde(default)]
+    pub health_checks: HealthCheckConfig,
     #[serde(default)]
     pub security: SecurityConfig,
     #[serde(default)]
@@ -185,6 +189,52 @@ impl Default for GeoIpConfig {
     }
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AdminConfig {
+    #[serde(default)]
+    pub auth_enabled: bool,
+    #[serde(default)]
+    pub bootstrap_token: Option<String>,
+    #[serde(default = "default_admin_token_store_key")]
+    pub token_store_key: String,
+    #[serde(default, deserialize_with = "deserialize_ip_nets")]
+    pub ip_allowlist: Vec<IpNet>,
+}
+
+impl Default for AdminConfig {
+    fn default() -> Self {
+        Self {
+            auth_enabled: false,
+            bootstrap_token: None,
+            token_store_key: default_admin_token_store_key(),
+            ip_allowlist: Vec::new(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct HealthCheckConfig {
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+    #[serde(default = "default_health_check_interval_seconds")]
+    pub interval_seconds: u64,
+    #[serde(default = "default_health_check_timeout_ms")]
+    pub timeout_ms: u64,
+    #[serde(default = "default_health_check_path")]
+    pub path: String,
+}
+
+impl Default for HealthCheckConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            interval_seconds: default_health_check_interval_seconds(),
+            timeout_ms: default_health_check_timeout_ms(),
+            path: default_health_check_path(),
+        }
+    }
+}
+
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct SecurityConfig {
     #[serde(default)]
@@ -239,6 +289,8 @@ pub struct StorageConfig {
     pub postgres_url: String,
     #[serde(default = "default_clickhouse_url")]
     pub clickhouse_url: String,
+    #[serde(default = "default_true")]
+    pub analytics_enabled: bool,
 }
 
 impl Default for StorageConfig {
@@ -246,6 +298,7 @@ impl Default for StorageConfig {
         Self {
             postgres_url: default_postgres_url(),
             clickhouse_url: default_clickhouse_url(),
+            analytics_enabled: true,
         }
     }
 }
@@ -385,6 +438,22 @@ fn default_geoip_database_path() -> String {
     "config/geoip/geoip.csv".to_string()
 }
 
+fn default_admin_token_store_key() -> String {
+    "pxxl:admin_tokens".to_string()
+}
+
+fn default_health_check_interval_seconds() -> u64 {
+    10
+}
+
+fn default_health_check_timeout_ms() -> u64 {
+    1_500
+}
+
+fn default_health_check_path() -> String {
+    "/".to_string()
+}
+
 fn default_requests_per_second() -> u32 {
     120
 }
@@ -406,7 +475,7 @@ fn default_postgres_url() -> String {
 }
 
 fn default_clickhouse_url() -> String {
-    "http://clickhouse:8123".to_string()
+    "http://pxxl:pxxl@clickhouse:8123".to_string()
 }
 
 fn default_weight() -> u32 {
@@ -423,6 +492,17 @@ fn default_true() -> bool {
 
 fn root_path() -> String {
     "/".to_string()
+}
+
+fn deserialize_ip_nets<'de, D>(deserializer: D) -> std::result::Result<Vec<IpNet>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    let values = Vec::<String>::deserialize(deserializer)?;
+    values
+        .into_iter()
+        .map(|value| parse_ip_net(&value).map_err(de::Error::custom))
+        .collect()
 }
 
 #[cfg(test)]
@@ -515,6 +595,41 @@ mod tests {
 
         assert!(config.geoip.enabled);
         assert_eq!(config.geoip.database_path, "/etc/pxxl/geoip.csv");
+    }
+
+    #[test]
+    fn parses_admin_auth_config_with_bare_ip_allowlist() {
+        let raw = r#"
+            [admin]
+            auth_enabled = true
+            bootstrap_token = "dev-token"
+            token_store_key = "pxxl:test_tokens"
+            ip_allowlist = ["127.0.0.1", "203.0.113.0/24"]
+        "#;
+
+        let config: PxxlConfig = toml::from_str(raw).unwrap();
+
+        assert!(config.admin.auth_enabled);
+        assert_eq!(config.admin.bootstrap_token.as_deref(), Some("dev-token"));
+        assert_eq!(config.admin.ip_allowlist.len(), 2);
+    }
+
+    #[test]
+    fn parses_health_check_config() {
+        let raw = r#"
+            [health_checks]
+            enabled = true
+            interval_seconds = 3
+            timeout_ms = 500
+            path = "/healthz"
+        "#;
+
+        let config: PxxlConfig = toml::from_str(raw).unwrap();
+
+        assert!(config.health_checks.enabled);
+        assert_eq!(config.health_checks.interval_seconds, 3);
+        assert_eq!(config.health_checks.timeout_ms, 500);
+        assert_eq!(config.health_checks.path, "/healthz");
     }
 
     #[test]

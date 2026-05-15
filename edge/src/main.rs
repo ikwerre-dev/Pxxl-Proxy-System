@@ -1,20 +1,40 @@
 use anyhow::{Context, Result};
-use pxxl_api::{run_admin_api, run_metrics_server};
-use pxxl_config::PxxlConfig;
+use bytes::Bytes;
+use http::{Request, Uri};
+use http_body_util::Empty;
+use hyper_util::{
+    client::legacy::{connect::HttpConnector, Client},
+    rt::TokioExecutor,
+};
+use pxxl_api::{run_admin_api, run_metrics_server, AdminApiAuth};
+use pxxl_common::{parse_ip_net, Route};
+use pxxl_config::{HealthCheckConfig, PxxlConfig};
 use pxxl_core::{EdgeState, RouteRegistry};
 use pxxl_ddos::{BlacklistEngine, RateLimitConfig, RateLimiter, SecurityEngine};
 use pxxl_docker_discovery::{run_docker_polling, DockerDiscovery};
 use pxxl_geo::GeoIpResolver;
 use pxxl_http_proxy::{
     run_http_proxy_with_error_pages_policy_and_geoip,
-    run_https_proxy_with_error_pages_policy_and_geoip, ErrorPageRenderer, PolicyEnforcer,
+    run_https_proxy_with_reloadable_error_pages_policy_and_geoip, ErrorPageRenderer,
+    PolicyEnforcer, ReloadableTlsConfig,
 };
 use pxxl_load_balancer::LoadBalancer;
 use pxxl_metrics::PxxlMetrics;
-use pxxl_redis_sync::RedisRouteStore;
-use pxxl_tls::{CertificateIssuer, LocalCertificateStore};
-use std::{net::SocketAddr, path::Path, sync::Arc, time::Duration};
-use tokio::{sync::watch, task::JoinHandle, time};
+use pxxl_redis_sync::{RedisRouteStore, RedisTokenStore};
+use pxxl_storage::run_clickhouse_writer;
+use pxxl_tls::LocalCertificateStore;
+use std::{
+    collections::{BTreeSet, HashMap},
+    net::SocketAddr,
+    path::Path,
+    sync::Arc,
+    time::Duration,
+};
+use tokio::{
+    sync::{mpsc, watch},
+    task::JoinHandle,
+    time,
+};
 use tracing::{info, warn};
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt, EnvFilter};
 
@@ -46,11 +66,6 @@ async fn main() -> Result<()> {
         }
     }
 
-    let route_domains = initial_routes
-        .iter()
-        .map(|route| route.domain.clone())
-        .collect::<Vec<_>>();
-
     let metrics = Arc::new(PxxlMetrics::new()?);
     let blacklist = Arc::new(BlacklistEngine::with_cidrs(
         config.security.blacklists.cidrs.clone(),
@@ -62,7 +77,19 @@ async fn main() -> Result<()> {
     let security = Arc::new(SecurityEngine::new(blacklist, rate_limiter));
     let routes = Arc::new(RouteRegistry::new(initial_routes));
     let load_balancer = Arc::new(LoadBalancer::new());
-    let state = EdgeState::new(routes, security, load_balancer, metrics.clone());
+    let (analytics_tx, analytics_rx) = if config.storage.analytics_enabled {
+        let (tx, rx) = mpsc::channel(4096);
+        (Some(tx), Some(rx))
+    } else {
+        (None, None)
+    };
+    let state = EdgeState::new_with_stats_sink(
+        routes,
+        security,
+        load_balancer,
+        metrics.clone(),
+        analytics_tx,
+    );
     let error_pages =
         match ErrorPageRenderer::load_from_dir(config.error_pages.enabled, &config.error_pages.dir)
         {
@@ -84,14 +111,12 @@ async fn main() -> Result<()> {
         }
     };
 
-    let mut cert_domains = config.tls.local_subject_alt_names.clone();
-    cert_domains.extend(route_domains);
-    cert_domains.sort();
-    cert_domains.dedup();
+    let cert_domains = certificate_domains(&config.tls.local_subject_alt_names, &state);
 
     let cert_store = LocalCertificateStore::new(config.tls.cert_dir.clone());
-    cert_store.ensure_certificate(&cert_domains).await?;
-    let tls_config = cert_store.server_config(&cert_domains).await?;
+    let bundle = cert_store.regenerate_certificate(&cert_domains).await?;
+    let tls_config = cert_store.server_config_from_bundle(&bundle)?;
+    let reloadable_tls = ReloadableTlsConfig::new(tls_config);
     metrics
         .tls_certificates_total
         .with_label_values(&["local", "ready"])
@@ -103,6 +128,16 @@ async fn main() -> Result<()> {
     let metrics_addr = parse_addr("listeners.metrics", &config.listeners.metrics)?;
 
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
+    let token_store = RedisTokenStore::new(
+        config.redis.url.clone(),
+        config.admin.token_store_key.clone(),
+    );
+    let admin_auth = AdminApiAuth::new(
+        config.admin.auth_enabled,
+        config.admin.bootstrap_token.clone(),
+        config.admin.ip_allowlist.clone(),
+        Some(token_store),
+    );
     let mut tasks: Vec<JoinHandle<Result<()>>> = vec![
         tokio::spawn(run_http_proxy_with_error_pages_policy_and_geoip(
             http_addr,
@@ -112,20 +147,23 @@ async fn main() -> Result<()> {
             geoip.clone(),
             shutdown_rx.clone(),
         )),
-        tokio::spawn(run_https_proxy_with_error_pages_policy_and_geoip(
-            https_addr,
-            state.clone(),
-            tls_config,
-            error_pages.clone(),
-            policy.clone(),
-            geoip.clone(),
-            shutdown_rx.clone(),
-        )),
+        tokio::spawn(
+            run_https_proxy_with_reloadable_error_pages_policy_and_geoip(
+                https_addr,
+                state.clone(),
+                reloadable_tls.clone(),
+                error_pages.clone(),
+                policy.clone(),
+                geoip.clone(),
+                shutdown_rx.clone(),
+            ),
+        ),
         tokio::spawn(run_admin_api(
             admin_addr,
             state.clone(),
             config.tls.cert_dir.clone(),
             Some(route_store.clone()),
+            admin_auth,
             shutdown_rx.clone(),
         )),
         tokio::spawn(run_metrics_server(
@@ -134,6 +172,30 @@ async fn main() -> Result<()> {
             shutdown_rx.clone(),
         )),
     ];
+
+    if let Some(analytics_rx) = analytics_rx {
+        tasks.push(tokio::spawn(run_clickhouse_writer(
+            config.storage.clickhouse_url.clone(),
+            analytics_rx,
+            shutdown_rx.clone(),
+        )));
+    }
+
+    if config.health_checks.enabled {
+        tasks.push(tokio::spawn(run_health_checks(
+            state.clone(),
+            config.health_checks.clone(),
+            shutdown_rx.clone(),
+        )));
+    }
+
+    tasks.push(tokio::spawn(run_tls_reloader(
+        cert_store.clone(),
+        reloadable_tls,
+        state.clone(),
+        config.tls.local_subject_alt_names.clone(),
+        shutdown_rx.clone(),
+    )));
 
     if config.docker.enabled {
         let discovery = DockerDiscovery::new(config.docker.socket_path.clone());
@@ -187,6 +249,148 @@ async fn main() -> Result<()> {
     Ok(())
 }
 
+async fn run_health_checks(
+    state: EdgeState,
+    config: HealthCheckConfig,
+    mut shutdown: watch::Receiver<bool>,
+) -> Result<()> {
+    let mut connector = HttpConnector::new();
+    connector.enforce_http(false);
+    let client: Client<HttpConnector, Empty<Bytes>> =
+        Client::builder(TokioExecutor::new()).build(connector);
+    let mut interval = time::interval(Duration::from_secs(config.interval_seconds.max(1)));
+    let timeout = Duration::from_millis(config.timeout_ms.max(100));
+
+    loop {
+        tokio::select! {
+            _ = interval.tick() => {
+                let upstreams = collect_upstream_urls(&state.routes.snapshot());
+                let mut health = HashMap::new();
+                for upstream in upstreams {
+                    let healthy = check_upstream(&client, &upstream, &config.path, timeout).await;
+                    health.insert(upstream, healthy);
+                }
+                state.routes.set_upstream_health(&health);
+            }
+            changed = shutdown.changed() => {
+                if changed.is_ok() && *shutdown.borrow() {
+                    break;
+                }
+            }
+        }
+    }
+
+    Ok(())
+}
+
+async fn check_upstream(
+    client: &Client<HttpConnector, Empty<Bytes>>,
+    upstream: &str,
+    health_path: &str,
+    timeout: Duration,
+) -> bool {
+    let Some(uri) = build_health_uri(upstream, health_path) else {
+        return false;
+    };
+    let request = match Request::builder()
+        .method("GET")
+        .uri(uri)
+        .body(Empty::<Bytes>::new())
+    {
+        Ok(request) => request,
+        Err(_) => return false,
+    };
+
+    match time::timeout(timeout, client.request(request)).await {
+        Ok(Ok(response)) => response.status().as_u16() < 500,
+        _ => false,
+    }
+}
+
+fn build_health_uri(upstream: &str, health_path: &str) -> Option<Uri> {
+    let health_path = if health_path.starts_with('/') {
+        health_path.to_string()
+    } else {
+        format!("/{health_path}")
+    };
+    format!("{}{}", upstream.trim_end_matches('/'), health_path)
+        .parse()
+        .ok()
+}
+
+fn collect_upstream_urls(routes: &[Route]) -> BTreeSet<String> {
+    let mut upstreams = BTreeSet::new();
+    for route in routes {
+        for path in &route.paths {
+            upstreams.extend(path.upstreams.iter().map(|upstream| upstream.url.clone()));
+        }
+        for location_route in &route.rules.location_routes {
+            upstreams.extend(
+                location_route
+                    .upstreams
+                    .iter()
+                    .map(|upstream| upstream.url.clone()),
+            );
+        }
+        for split in &route.rules.traffic_splits {
+            upstreams.extend(split.upstreams.iter().map(|upstream| upstream.url.clone()));
+        }
+    }
+    upstreams
+}
+
+async fn run_tls_reloader(
+    cert_store: LocalCertificateStore,
+    tls_config: ReloadableTlsConfig,
+    state: EdgeState,
+    local_subject_alt_names: Vec<String>,
+    mut shutdown: watch::Receiver<bool>,
+) -> Result<()> {
+    let mut interval = time::interval(Duration::from_secs(5));
+    let mut current_domains = certificate_domains(&local_subject_alt_names, &state);
+
+    loop {
+        tokio::select! {
+            _ = interval.tick() => {
+                let domains = certificate_domains(&local_subject_alt_names, &state);
+                if domains != current_domains {
+                    match cert_store.regenerate_certificate(&domains).await {
+                        Ok(bundle) => match cert_store.server_config_from_bundle(&bundle) {
+                            Ok(config) => {
+                                tls_config.store(config);
+                                current_domains = domains;
+                                info!("reloaded local TLS certificate for dynamic route domains");
+                            }
+                            Err(error) => warn!(%error, "failed to rebuild TLS server config"),
+                        },
+                        Err(error) => warn!(%error, "failed to regenerate local TLS certificate"),
+                    }
+                }
+            }
+            changed = shutdown.changed() => {
+                if changed.is_ok() && *shutdown.borrow() {
+                    break;
+                }
+            }
+        }
+    }
+
+    Ok(())
+}
+
+fn certificate_domains(local_subject_alt_names: &[String], state: &EdgeState) -> Vec<String> {
+    let mut domains = local_subject_alt_names.to_vec();
+    for route in state.routes.snapshot() {
+        domains.push(route.domain.clone());
+        if route.rules.www_alias && !route.domain.starts_with("www.") {
+            domains.push(format!("www.{}", route.domain));
+        }
+    }
+    domains.sort();
+    domains.dedup();
+    domains
+}
+
 fn init_tracing() {
     let env_filter = EnvFilter::try_from_default_env()
         .unwrap_or_else(|_| EnvFilter::new("pxxl_edge=info,pxxl=info,tower_http=info"));
@@ -226,11 +430,44 @@ fn apply_env_overrides(config: &mut PxxlConfig) {
         config.geoip.database_path = value;
     }
     if let Ok(value) = std::env::var("PXXL_GEOIP_ENABLED") {
-        config.geoip.enabled = matches!(
-            value.trim().to_ascii_lowercase().as_str(),
-            "1" | "true" | "yes" | "on"
-        );
+        config.geoip.enabled = parse_bool(&value);
     }
+    if let Ok(value) = std::env::var("PXXL_ADMIN_AUTH_ENABLED") {
+        config.admin.auth_enabled = parse_bool(&value);
+    }
+    if let Ok(value) = std::env::var("PXXL_ADMIN_BOOTSTRAP_TOKEN") {
+        config.admin.bootstrap_token = Some(value);
+    }
+    if let Ok(value) = std::env::var("PXXL_ADMIN_IP_ALLOWLIST") {
+        config.admin.ip_allowlist = value
+            .split(',')
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .filter_map(|value| match parse_ip_net(value) {
+                Ok(network) => Some(network),
+                Err(error) => {
+                    warn!(%value, %error, "ignoring invalid admin IP allowlist entry");
+                    None
+                }
+            })
+            .collect();
+    }
+    if let Ok(value) = std::env::var("PXXL_CLICKHOUSE_URL") {
+        config.storage.clickhouse_url = value;
+    }
+    if let Ok(value) = std::env::var("PXXL_ANALYTICS_ENABLED") {
+        config.storage.analytics_enabled = parse_bool(&value);
+    }
+    if let Ok(value) = std::env::var("PXXL_HEALTH_CHECKS_ENABLED") {
+        config.health_checks.enabled = parse_bool(&value);
+    }
+}
+
+fn parse_bool(value: &str) -> bool {
+    matches!(
+        value.trim().to_ascii_lowercase().as_str(),
+        "1" | "true" | "yes" | "on"
+    )
 }
 
 fn parse_addr(name: &str, value: &str) -> Result<SocketAddr> {

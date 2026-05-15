@@ -1,4 +1,5 @@
 use anyhow::Context;
+use arc_swap::ArcSwap;
 use bytes::Bytes;
 use dashmap::DashMap;
 use http::{
@@ -18,7 +19,7 @@ use hyper_util::{
 use parking_lot::Mutex;
 use pxxl_common::{
     normalize_domain, DomainRateLimit, DomainRules, GeoLocation, PxxlError, RateLimitScope,
-    RouteMatch, Upstream,
+    RouteMatch, TrafficSplitRule, Upstream,
 };
 use pxxl_core::{EdgeState, RequestObservation};
 use pxxl_ddos::SecurityDecision;
@@ -30,7 +31,7 @@ use std::{
     net::{IpAddr, SocketAddr},
     path::{Path, PathBuf},
     sync::Arc,
-    time::{Duration, Instant},
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 use tokio::{
     io::{AsyncRead, AsyncWrite},
@@ -195,6 +196,27 @@ pub enum RequestScheme {
     Https,
 }
 
+#[derive(Clone)]
+pub struct ReloadableTlsConfig {
+    config: Arc<ArcSwap<ServerConfig>>,
+}
+
+impl ReloadableTlsConfig {
+    pub fn new(config: Arc<ServerConfig>) -> Self {
+        Self {
+            config: Arc::new(ArcSwap::new(config)),
+        }
+    }
+
+    pub fn load(&self) -> Arc<ServerConfig> {
+        self.config.load_full()
+    }
+
+    pub fn store(&self, config: Arc<ServerConfig>) {
+        self.config.store(config);
+    }
+}
+
 impl RequestScheme {
     fn as_str(self) -> &'static str {
         match self {
@@ -221,6 +243,7 @@ struct ProxyRequestContext<'a> {
     remote_ip: Option<IpAddr>,
     scheme: RequestScheme,
     location: &'a GeoLocation,
+    timestamp_unix_ms: u64,
 }
 
 impl PolicyEnforcer {
@@ -384,6 +407,14 @@ impl PolicyEnforcer {
             }
         }
 
+        if let Some(reason) = waf_rejection_reason(req, rules) {
+            return Some(policy_rejection(
+                StatusCode::FORBIDDEN,
+                "request blocked by waf rules",
+                reason,
+            ));
+        }
+
         if !rules.allowed_content_types.is_empty() && request_can_have_body(req.method()) {
             match req
                 .headers()
@@ -514,6 +545,18 @@ impl PolicyEnforcer {
                 None
             }
         })
+    }
+
+    fn matching_traffic_splits<'a>(
+        &self,
+        rules: &'a DomainRules,
+        location: &GeoLocation,
+    ) -> Vec<&'a TrafficSplitRule> {
+        rules
+            .traffic_splits
+            .iter()
+            .filter(|rule| !rule.upstreams.is_empty() && location_rule_matches(rule, location))
+            .collect()
     }
 
     fn apply_request_rules(&self, headers: &mut HeaderMap, rules: &DomainRules) {
@@ -751,6 +794,7 @@ impl ProxyServer {
         let location = remote_ip
             .map(|ip| self.geoip.lookup(ip))
             .unwrap_or_else(GeoLocation::unknown);
+        let timestamp_unix_ms = now_unix_ms();
         let context = ProxyRequestContext {
             domain: &domain,
             method: method.as_str(),
@@ -758,6 +802,7 @@ impl ProxyServer {
             remote_ip,
             scheme,
             location: &location,
+            timestamp_unix_ms,
         };
 
         if let Some(ip) = remote_ip {
@@ -858,15 +903,10 @@ impl ProxyServer {
         self.policy
             .apply_request_rules(req.headers_mut(), &matched.route.rules);
 
-        let (route_key_suffix, upstreams) = self
-            .policy
-            .location_upstreams(&matched.route.rules, &location)
-            .map(|(name, upstreams)| (format!(":location:{name}"), upstreams))
-            .unwrap_or_else(|| (String::new(), matched.path.upstreams.as_slice()));
-        let route_key = format!(
-            "{}:{}{}",
-            matched.route.id, matched.path.prefix, route_key_suffix
-        );
+        let base_route_key = format!("{}:{}", matched.route.id, matched.path.prefix);
+        let (route_key_suffix, upstreams) =
+            self.select_upstream_pool(&base_route_key, &matched, &location);
+        let route_key = format!("{base_route_key}{route_key_suffix}");
         let upstream = match self.state.load_balancer.select(
             &route_key,
             &matched.route.algorithm,
@@ -1009,7 +1049,43 @@ impl ProxyServer {
             upstream: upstream.map(str::to_string),
             remote_ip: context.remote_ip,
             location: context.location.clone(),
+            timestamp_unix_ms: context.timestamp_unix_ms,
         });
+    }
+
+    fn select_upstream_pool<'a>(
+        &self,
+        base_route_key: &str,
+        matched: &'a RouteMatch,
+        location: &GeoLocation,
+    ) -> (String, &'a [Upstream]) {
+        let traffic_splits = self
+            .policy
+            .matching_traffic_splits(&matched.route.rules, location);
+        if !traffic_splits.is_empty() {
+            let weights = traffic_splits
+                .iter()
+                .map(|split| split.weight)
+                .collect::<Vec<_>>();
+            if let Some(index) = self
+                .state
+                .load_balancer
+                .select_weighted_index(&format!("{base_route_key}:traffic_split"), &weights)
+            {
+                if let Some(split) = traffic_splits.get(index) {
+                    let name = split
+                        .name
+                        .clone()
+                        .unwrap_or_else(|| format!("weighted-{index}"));
+                    return (format!(":split:{name}"), split.upstreams.as_slice());
+                }
+            }
+        }
+
+        self.policy
+            .location_upstreams(&matched.route.rules, location)
+            .map(|(name, upstreams)| (format!(":location:{name}"), upstreams))
+            .unwrap_or_else(|| (String::new(), matched.path.upstreams.as_slice()))
     }
 }
 
@@ -1202,12 +1278,32 @@ pub async fn run_https_proxy_with_error_pages_policy_and_geoip(
     geoip: GeoIpResolver,
     shutdown: watch::Receiver<bool>,
 ) -> anyhow::Result<()> {
+    run_https_proxy_with_reloadable_error_pages_policy_and_geoip(
+        addr,
+        state,
+        ReloadableTlsConfig::new(tls_config),
+        error_pages,
+        policy,
+        geoip,
+        shutdown,
+    )
+    .await
+}
+
+pub async fn run_https_proxy_with_reloadable_error_pages_policy_and_geoip(
+    addr: SocketAddr,
+    state: EdgeState,
+    tls_config: ReloadableTlsConfig,
+    error_pages: ErrorPageRenderer,
+    policy: PolicyEnforcer,
+    geoip: GeoIpResolver,
+    shutdown: watch::Receiver<bool>,
+) -> anyhow::Result<()> {
     let listener = TcpListener::bind(addr).await?;
-    let acceptor = TlsAcceptor::from(tls_config);
     info!(%addr, "HTTPS proxy listening");
     run_tls_listener(
         listener,
-        acceptor,
+        tls_config,
         state,
         error_pages,
         policy,
@@ -1247,7 +1343,7 @@ async fn run_plain_listener(
 
 async fn run_tls_listener(
     listener: TcpListener,
-    acceptor: TlsAcceptor,
+    tls_config: ReloadableTlsConfig,
     state: EdgeState,
     error_pages: ErrorPageRenderer,
     policy: PolicyEnforcer,
@@ -1260,7 +1356,7 @@ async fn run_tls_listener(
         tokio::select! {
             accepted = listener.accept() => {
                 let (stream, peer) = accepted?;
-                let acceptor = acceptor.clone();
+                let acceptor = TlsAcceptor::from(tls_config.load());
                 let server = server.clone();
                 tokio::spawn(async move {
                     match acceptor.accept(stream).await {
@@ -1413,6 +1509,99 @@ fn cors_origin_allowed(origin: &HeaderValue, allowed_origins: &[String]) -> bool
         .any(|allowed| allowed == "*" || allowed.eq_ignore_ascii_case(origin))
 }
 
+fn waf_rejection_reason(req: &Request<Incoming>, rules: &DomainRules) -> Option<&'static str> {
+    let waf = &rules.waf;
+    if !waf.enabled {
+        return None;
+    }
+
+    let path = req.uri().path();
+    let query = req.uri().query().unwrap_or_default();
+    let path_lower = path.to_ascii_lowercase();
+    let query_lower = query.to_ascii_lowercase();
+    let user_agent_lower = req
+        .headers()
+        .get("user-agent")
+        .and_then(|value| value.to_str().ok())
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+
+    if waf.block_path_traversal
+        && contains_any(&path_lower, &["../", "..\\", "%2e%2e", "%252e%252e"])
+    {
+        return Some("waf_path_traversal");
+    }
+
+    if waf.block_sql_injection
+        && contains_any(
+            &query_lower,
+            &[
+                " union select ",
+                "union%20select",
+                "' or 1=1",
+                "%27%20or%201=1",
+                "\" or 1=1",
+                "%22%20or%201=1",
+                "information_schema",
+                "sleep(",
+                "benchmark(",
+            ],
+        )
+    {
+        return Some("waf_sql_injection");
+    }
+
+    if waf.block_xss
+        && (contains_any(&query_lower, &["<script", "%3cscript", "javascript:"])
+            || contains_any(&path_lower, &["<script", "%3cscript", "javascript:"]))
+    {
+        return Some("waf_xss");
+    }
+
+    if waf.block_bad_bots
+        && contains_any(
+            &user_agent_lower,
+            &["sqlmap", "nikto", "masscan", "zgrab", "nmap", "dirbuster"],
+        )
+    {
+        return Some("waf_bad_bot");
+    }
+
+    if string_patterns_match(&user_agent_lower, &waf.blocked_user_agents) {
+        return Some("waf_user_agent");
+    }
+
+    if string_patterns_match(&path_lower, &waf.blocked_path_patterns) {
+        return Some("waf_path_pattern");
+    }
+
+    if string_patterns_match(&query_lower, &waf.blocked_query_patterns) {
+        return Some("waf_query_pattern");
+    }
+
+    None
+}
+
+fn contains_any(value: &str, patterns: &[&str]) -> bool {
+    patterns.iter().any(|pattern| value.contains(pattern))
+}
+
+fn string_patterns_match(value_lower: &str, patterns: &[String]) -> bool {
+    patterns
+        .iter()
+        .map(|pattern| pattern.to_ascii_lowercase())
+        .any(|pattern| !pattern.is_empty() && value_lower.contains(&pattern))
+}
+
+fn location_rule_matches(rule: &TrafficSplitRule, location: &GeoLocation) -> bool {
+    let country_matches = rule.countries.is_empty()
+        || location_code_matches(location.country_code.as_deref(), &rule.countries);
+    let continent_matches = rule.continents.is_empty()
+        || location_code_matches(location.continent_code.as_deref(), &rule.continents);
+
+    country_matches && continent_matches
+}
+
 fn location_code_matches(actual: Option<&str>, configured: &[String]) -> bool {
     let Some(actual) = actual else {
         return false;
@@ -1432,6 +1621,13 @@ fn insert_static_header(headers: &mut HeaderMap, name: &'static str, value: &'st
 
 fn path_without_query(path: &str) -> &str {
     path.split('?').next().unwrap_or(path)
+}
+
+fn now_unix_ms() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_millis() as u64)
+        .unwrap_or_default()
 }
 
 fn is_html_template(path: &Path) -> bool {
