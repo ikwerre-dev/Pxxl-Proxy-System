@@ -49,20 +49,15 @@ pub enum RouteSource {
     Api,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum LoadBalancingAlgorithm {
+    #[default]
     RoundRobin,
     LeastConnections,
     IpHash,
     WeightedRoundRobin,
     EwmaLatency,
-}
-
-impl Default for LoadBalancingAlgorithm {
-    fn default() -> Self {
-        Self::RoundRobin
-    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -256,18 +251,13 @@ impl Default for DomainRateLimit {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq, Hash)]
 #[serde(rename_all = "snake_case")]
 pub enum RateLimitScope {
+    #[default]
     PerIp,
     PerDomain,
     PerIpPath,
-}
-
-impl Default for RateLimitScope {
-    fn default() -> Self {
-        Self::PerIp
-    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]

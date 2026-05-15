@@ -24,7 +24,7 @@ pub enum ConfigError {
 
 pub type Result<T> = std::result::Result<T, ConfigError>;
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct PxxlConfig {
     #[serde(default)]
     pub listeners: ListenerConfig,
@@ -44,22 +44,6 @@ pub struct PxxlConfig {
     pub storage: StorageConfig,
     #[serde(default)]
     pub routes: Vec<RouteConfig>,
-}
-
-impl Default for PxxlConfig {
-    fn default() -> Self {
-        Self {
-            listeners: ListenerConfig::default(),
-            tls: TlsConfig::default(),
-            docker: DockerConfig::default(),
-            podman: PodmanConfig::default(),
-            error_pages: ErrorPagesConfig::default(),
-            security: SecurityConfig::default(),
-            redis: RedisConfig::default(),
-            storage: StorageConfig::default(),
-            routes: Vec::new(),
-        }
-    }
 }
 
 impl PxxlConfig {
@@ -182,21 +166,12 @@ impl Default for ErrorPagesConfig {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct SecurityConfig {
     #[serde(default)]
     pub rate_limits: RateLimitConfig,
     #[serde(default)]
     pub blacklists: BlacklistConfig,
-}
-
-impl Default for SecurityConfig {
-    fn default() -> Self {
-        Self {
-            rate_limits: RateLimitConfig::default(),
-            blacklists: BlacklistConfig::default(),
-        }
-    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

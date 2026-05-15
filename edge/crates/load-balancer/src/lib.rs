@@ -67,7 +67,7 @@ fn weighted_upstreams(upstreams: &[Upstream]) -> Vec<Upstream> {
         .iter()
         .flat_map(|upstream| {
             let weight = upstream.weight.max(1);
-            std::iter::repeat(upstream.clone()).take(weight as usize)
+            std::iter::repeat_n(upstream.clone(), weight as usize)
         })
         .collect()
 }

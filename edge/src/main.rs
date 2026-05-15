@@ -92,35 +92,35 @@ async fn main() -> Result<()> {
     let metrics_addr = parse_addr("listeners.metrics", &config.listeners.metrics)?;
 
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
-    let mut tasks: Vec<JoinHandle<Result<()>>> = Vec::new();
-
-    tasks.push(tokio::spawn(run_http_proxy_with_error_pages_and_policy(
-        http_addr,
-        state.clone(),
-        error_pages.clone(),
-        policy.clone(),
-        shutdown_rx.clone(),
-    )));
-    tasks.push(tokio::spawn(run_https_proxy_with_error_pages_and_policy(
-        https_addr,
-        state.clone(),
-        tls_config,
-        error_pages.clone(),
-        policy.clone(),
-        shutdown_rx.clone(),
-    )));
-    tasks.push(tokio::spawn(run_admin_api(
-        admin_addr,
-        state.clone(),
-        config.tls.cert_dir.clone(),
-        Some(route_store.clone()),
-        shutdown_rx.clone(),
-    )));
-    tasks.push(tokio::spawn(run_metrics_server(
-        metrics_addr,
-        metrics.clone(),
-        shutdown_rx.clone(),
-    )));
+    let mut tasks: Vec<JoinHandle<Result<()>>> = vec![
+        tokio::spawn(run_http_proxy_with_error_pages_and_policy(
+            http_addr,
+            state.clone(),
+            error_pages.clone(),
+            policy.clone(),
+            shutdown_rx.clone(),
+        )),
+        tokio::spawn(run_https_proxy_with_error_pages_and_policy(
+            https_addr,
+            state.clone(),
+            tls_config,
+            error_pages.clone(),
+            policy.clone(),
+            shutdown_rx.clone(),
+        )),
+        tokio::spawn(run_admin_api(
+            admin_addr,
+            state.clone(),
+            config.tls.cert_dir.clone(),
+            Some(route_store.clone()),
+            shutdown_rx.clone(),
+        )),
+        tokio::spawn(run_metrics_server(
+            metrics_addr,
+            metrics.clone(),
+            shutdown_rx.clone(),
+        )),
+    ];
 
     if config.docker.enabled {
         let discovery = DockerDiscovery::new(config.docker.socket_path.clone());
