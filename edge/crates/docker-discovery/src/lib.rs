@@ -2,7 +2,11 @@ use anyhow::{bail, Context, Result};
 use pxxl_common::{normalize_domain, normalize_path_prefix, PathRoute, Route, RouteSource, Upstream};
 use pxxl_core::EdgeState;
 use serde::Deserialize;
-use std::{collections::HashMap, path::PathBuf, time::Duration};
+use std::{
+    collections::{BTreeMap, HashMap},
+    path::PathBuf,
+    time::Duration,
+};
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
     net::UnixStream,
@@ -31,13 +35,15 @@ impl DockerDiscovery {
         let containers: Vec<DockerContainerSummary> =
             serde_json::from_slice(&body).context("failed to parse Docker containers JSON")?;
 
-        Ok(containers
+        let targets = containers
             .into_iter()
             .filter_map(|container| {
                 let name = container.primary_name();
-                route_from_labels(&container.labels, &name)
+                route_target_from_labels(&container.labels, &name)
             })
-            .collect())
+            .collect::<Vec<_>>();
+
+        Ok(routes_from_targets(targets))
     }
 
     async fn docker_get(&self, path: &str) -> Result<Vec<u8>> {
@@ -104,7 +110,18 @@ impl DockerContainerSummary {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct DockerRouteTarget {
+    domain: String,
+    path: String,
+    upstream: Upstream,
+}
+
 pub fn route_from_labels(labels: &HashMap<String, String>, container_name: &str) -> Option<Route> {
+    route_target_from_labels(labels, container_name).map(route_from_target)
+}
+
+fn route_target_from_labels(labels: &HashMap<String, String>, container_name: &str) -> Option<DockerRouteTarget> {
     let enabled = labels
         .get("pxxl.enable")
         .is_some_and(|value| value.eq_ignore_ascii_case("true"));
@@ -127,21 +144,59 @@ pub fn route_from_labels(labels: &HashMap<String, String>, container_name: &str)
         .map(String::as_str)
         .unwrap_or(container_name);
 
-    let upstream = Upstream::new(format!("{scheme}://{host}:{port}"));
-    let id = format!(
-        "docker-{}-{}",
-        normalize_domain(domain),
-        normalize_path_prefix(path).replace('/', "_")
-    );
+    Some(DockerRouteTarget {
+        domain: normalize_domain(domain),
+        path: normalize_path_prefix(path),
+        upstream: Upstream::new(format!("{scheme}://{host}:{port}")),
+    })
+}
 
-    Some(
-        Route::new(
-            domain.as_str(),
-            vec![PathRoute::new(path, vec![upstream])],
-            RouteSource::Docker,
-        )
-        .with_id(id),
+fn route_from_target(target: DockerRouteTarget) -> Route {
+    let id = docker_route_id(&target.domain, Some(&target.path));
+    Route::new(
+        target.domain,
+        vec![PathRoute::new(target.path, vec![target.upstream])],
+        RouteSource::Docker,
     )
+    .with_id(id)
+}
+
+fn routes_from_targets(targets: impl IntoIterator<Item = DockerRouteTarget>) -> Vec<Route> {
+    let mut grouped: BTreeMap<String, BTreeMap<String, Vec<Upstream>>> = BTreeMap::new();
+
+    for target in targets {
+        let upstreams = grouped
+            .entry(target.domain)
+            .or_default()
+            .entry(target.path)
+            .or_default();
+
+        if !upstreams.iter().any(|upstream| upstream.url == target.upstream.url) {
+            upstreams.push(target.upstream);
+        }
+    }
+
+    grouped
+        .into_iter()
+        .map(|(domain, paths_by_prefix)| {
+            let paths = paths_by_prefix
+                .into_iter()
+                .map(|(prefix, mut upstreams)| {
+                    upstreams.sort_by(|left, right| left.url.cmp(&right.url));
+                    PathRoute::new(prefix, upstreams)
+                })
+                .collect::<Vec<_>>();
+
+            Route::new(domain.clone(), paths, RouteSource::Docker).with_id(docker_route_id(&domain, None))
+        })
+        .collect()
+}
+
+fn docker_route_id(domain: &str, path: Option<&str>) -> String {
+    match path {
+        Some(path) => format!("docker-{}-{}", domain, path.replace('/', "_")),
+        None => format!("docker-{domain}"),
+    }
 }
 
 fn parse_http_response_body(response: &[u8]) -> Result<Vec<u8>> {
@@ -229,6 +284,64 @@ mod tests {
         assert_eq!(route.domain, "app.pxxlhost");
         assert_eq!(route.paths[0].prefix, "/api");
         assert_eq!(route.paths[0].upstreams[0].url, "http://web:3000");
+    }
+
+    #[test]
+    fn aggregates_same_domain_and_path_into_multiple_upstreams() {
+        let labels = HashMap::from([
+            ("pxxl.enable".to_string(), "true".to_string()),
+            ("pxxl.domain".to_string(), "app.pxxlhost".to_string()),
+            ("pxxl.port".to_string(), "3000".to_string()),
+            ("pxxl.path".to_string(), "/".to_string()),
+        ]);
+
+        let routes = routes_from_targets([
+            route_target_from_labels(&labels, "web-1").unwrap(),
+            route_target_from_labels(&labels, "web-2").unwrap(),
+        ]);
+
+        assert_eq!(routes.len(), 1);
+        assert_eq!(routes[0].domain, "app.pxxlhost");
+        assert_eq!(routes[0].paths.len(), 1);
+        assert_eq!(
+            routes[0].paths[0]
+                .upstreams
+                .iter()
+                .map(|upstream| upstream.url.as_str())
+                .collect::<Vec<_>>(),
+            vec!["http://web-1:3000", "http://web-2:3000"]
+        );
+    }
+
+    #[test]
+    fn aggregates_same_domain_paths_into_one_route() {
+        let root_labels = HashMap::from([
+            ("pxxl.enable".to_string(), "true".to_string()),
+            ("pxxl.domain".to_string(), "app.pxxlhost".to_string()),
+            ("pxxl.port".to_string(), "3000".to_string()),
+            ("pxxl.path".to_string(), "/".to_string()),
+        ]);
+        let api_labels = HashMap::from([
+            ("pxxl.enable".to_string(), "true".to_string()),
+            ("pxxl.domain".to_string(), "app.pxxlhost".to_string()),
+            ("pxxl.port".to_string(), "4000".to_string()),
+            ("pxxl.path".to_string(), "/api".to_string()),
+        ]);
+
+        let routes = routes_from_targets([
+            route_target_from_labels(&root_labels, "web").unwrap(),
+            route_target_from_labels(&api_labels, "api").unwrap(),
+        ]);
+
+        assert_eq!(routes.len(), 1);
+        assert_eq!(
+            routes[0]
+                .paths
+                .iter()
+                .map(|path| path.prefix.as_str())
+                .collect::<Vec<_>>(),
+            vec!["/", "/api"]
+        );
     }
 
     #[test]

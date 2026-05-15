@@ -65,6 +65,8 @@ labels:
   - pxxl.host=my-service
 ```
 
+Containers with the same `pxxl.domain` and `pxxl.path` are merged into one route with multiple upstreams. Requests are load-balanced across those upstreams, so stopping one replica removes it from the route on the next Docker discovery poll while traffic keeps flowing to the remaining replicas.
+
 ## Local Wildcard Development
 
 The default certificate includes:
