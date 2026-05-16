@@ -1,0 +1,293 @@
+#!/usr/bin/env sh
+set -eu
+
+PROG="${0##*/}"
+
+fail() {
+  printf '%s\n' "ERROR: $*" >&2
+  exit 1
+}
+
+warn() {
+  printf '%s\n' "WARN: $*" >&2
+}
+
+have() {
+  command -v "$1" >/dev/null 2>&1
+}
+
+script_dir() {
+  src="$0"
+  while [ -L "$src" ] && have readlink; do
+    dir="$(CDPATH= cd -- "$(dirname "$src")" 2>/dev/null && pwd -P)"
+    target="$(readlink "$src")"
+    case "$target" in
+      /*) src="$target" ;;
+      *) src="$dir/$target" ;;
+    esac
+  done
+  CDPATH= cd -- "$(dirname "$src")" 2>/dev/null && pwd -P
+}
+
+resolve_app_dir() {
+  if [ -n "${PXXL_HOME:-}" ]; then
+    [ -f "$PXXL_HOME/docker-compose.yml" ] || fail "PXXL_HOME does not look like a Pxxl checkout: $PXXL_HOME"
+    CDPATH= cd -- "$PXXL_HOME" 2>/dev/null && pwd -P
+    return
+  fi
+
+  dir="$(script_dir)"
+  if [ -f "$dir/../docker-compose.yml" ] && [ -f "$dir/../Cargo.toml" ]; then
+    CDPATH= cd -- "$dir/.." 2>/dev/null && pwd -P
+    return
+  fi
+
+  if [ -f "$PWD/docker-compose.yml" ] && [ -f "$PWD/Cargo.toml" ]; then
+    pwd -P
+    return
+  fi
+
+  if [ -n "${HOME:-}" ] && [ -f "$HOME/pxxl-proxy-system/docker-compose.yml" ]; then
+    CDPATH= cd -- "$HOME/pxxl-proxy-system" 2>/dev/null && pwd -P
+    return
+  fi
+
+  fail "could not find Pxxl checkout. Set PXXL_HOME=/path/to/Pxxl-Proxy-System."
+}
+
+use_discovery_compose() {
+  [ "${PXXL_DISCOVERY:-0}" = "1" ] || [ "${PXXL_RUNTIME_DISCOVERY:-0}" = "1" ]
+}
+
+compose() {
+  cd "$APP_DIR"
+  if docker compose version >/dev/null 2>&1; then
+    if use_discovery_compose && [ -f docker-compose.discovery.yml ]; then
+      docker compose -f docker-compose.yml -f docker-compose.discovery.yml "$@"
+    else
+      docker compose "$@"
+    fi
+  elif have docker-compose; then
+    if use_discovery_compose && [ -f docker-compose.discovery.yml ]; then
+      docker-compose -f docker-compose.yml -f docker-compose.discovery.yml "$@"
+    else
+      docker-compose "$@"
+    fi
+  else
+    fail "Docker Compose is required. Install Docker Desktop or the docker compose plugin."
+  fi
+}
+
+print_help() {
+  cat <<EOF
+Pxxl Proxy command line
+
+Usage:
+  $PROG <command> [args]
+
+Commands:
+  status              Show Compose service status
+  start [service]     Start the stack or one service
+  stop [service]      Stop the stack or one service
+  restart [service]   Restart the stack or one service
+  reload              Restart only the edge proxy service
+  rebuild [service]   Rebuild and start the stack or one service
+  down                Stop and remove containers, keeping data/ state
+  logs [service]      Follow logs, defaulting to the edge service
+  health              Check healthz, readyz, and metrics reachability
+  urls                Print local service URLs
+  env                 Show .env keys with values masked
+  doctor              Check local requirements and install layout
+  update              Run update.sh from the installed checkout
+  version             Show checkout version information
+  compose <args>      Pass raw arguments to docker compose
+  help                Show this help
+
+Environment:
+  PXXL_HOME=/path/to/Pxxl-Proxy-System   Use a specific checkout
+  PXXL_DISCOVERY=1                       Include docker-compose.discovery.yml
+  PXXL_ADMIN_URL=http://127.0.0.1:8081   Override admin health URL
+  PXXL_METRICS_URL=http://127.0.0.1:9090/metrics
+
+Examples:
+  $PROG status
+  $PROG logs edge
+  $PROG restart
+  PXXL_DISCOVERY=1 $PROG rebuild
+EOF
+}
+
+print_urls() {
+  cat <<EOF
+Pxxl Proxy URLs
+
+Proxy HTTP:     http://127.0.0.1
+Proxy HTTPS:    https://127.0.0.1
+Admin API:      ${PXXL_ADMIN_URL:-http://127.0.0.1:8081}
+Metrics:        ${PXXL_METRICS_URL:-http://127.0.0.1:9090/metrics}
+Prometheus:     http://127.0.0.1:9091
+Grafana:        http://127.0.0.1:${GRAFANA_PORT:-3000}
+
+Checkout:
+  $APP_DIR
+EOF
+}
+
+check_url() {
+  label="$1"
+  url="$2"
+  protected_ok="${3:-0}"
+  status="$(curl -sS -o /dev/null -w '%{http_code}' --max-time 3 "$url" 2>/dev/null || true)"
+  [ -n "$status" ] || status="000"
+  case "$status" in
+    2*|3*)
+      printf '%-10s ok      %s (%s)\n' "$label" "$url" "$status"
+      return 0
+      ;;
+    401|403)
+      if [ "$protected_ok" = "1" ]; then
+        printf '%-10s protected %s (%s)\n' "$label" "$url" "$status"
+        return 0
+      fi
+      ;;
+  esac
+  printf '%-10s failed  %s (%s)\n' "$label" "$url" "$status"
+  return 1
+}
+
+health() {
+  have curl || fail "curl is required for health checks"
+  admin_url="${PXXL_ADMIN_URL:-http://127.0.0.1:8081}"
+  metrics_url="${PXXL_METRICS_URL:-http://127.0.0.1:9090/metrics}"
+  failed=0
+  check_url healthz "$admin_url/healthz" || failed=1
+  check_url readyz "$admin_url/readyz" || failed=1
+  check_url metrics "$metrics_url" 1 || failed=1
+  return "$failed"
+}
+
+doctor_check() {
+  label="$1"
+  shift
+  if "$@" >/dev/null 2>&1; then
+    printf '%-18s ok\n' "$label"
+  else
+    printf '%-18s failed\n' "$label"
+    DOCTOR_FAILED=1
+  fi
+}
+
+doctor() {
+  DOCTOR_FAILED=0
+  printf 'Pxxl checkout: %s\n\n' "$APP_DIR"
+  doctor_check "git" have git
+  doctor_check "docker" have docker
+  doctor_check "compose" compose version
+  if have docker; then
+    doctor_check "docker daemon" docker info
+  else
+    printf '%-18s skipped\n' "docker daemon"
+    DOCTOR_FAILED=1
+  fi
+  [ -f "$APP_DIR/.env" ] && printf '%-18s ok\n' ".env" || { printf '%-18s missing\n' ".env"; DOCTOR_FAILED=1; }
+  [ -d "$APP_DIR/data" ] && printf '%-18s ok\n' "data/" || { printf '%-18s missing\n' "data/"; DOCTOR_FAILED=1; }
+  doctor_check "compose config" compose config
+  return "$DOCTOR_FAILED"
+}
+
+show_env() {
+  cd "$APP_DIR"
+  [ -f .env ] || fail ".env does not exist yet. Run ./install.sh first."
+  sed 's/=.*/=<set>/' .env
+}
+
+version() {
+  printf 'Pxxl Proxy CLI\n'
+  printf 'Checkout: %s\n' "$APP_DIR"
+  if have git && [ -d "$APP_DIR/.git" ]; then
+    printf 'Branch:   %s\n' "$(git -C "$APP_DIR" rev-parse --abbrev-ref HEAD 2>/dev/null || printf unknown)"
+    printf 'Commit:   %s\n' "$(git -C "$APP_DIR" rev-parse --short HEAD 2>/dev/null || printf unknown)"
+  fi
+}
+
+if [ "$#" -eq 0 ]; then
+  print_help
+  exit 0
+fi
+
+COMMAND="$1"
+shift
+
+case "$COMMAND" in
+  help|-h|--help)
+    print_help
+    exit 0
+    ;;
+esac
+
+APP_DIR="$(resolve_app_dir)"
+
+case "$COMMAND" in
+  status|ps)
+    compose ps "$@"
+    ;;
+  start|up)
+    compose up -d "$@"
+    compose ps
+    ;;
+  stop)
+    compose stop "$@"
+    compose ps
+    ;;
+  restart)
+    compose restart "$@"
+    compose ps
+    ;;
+  reload)
+    compose restart edge
+    compose ps edge
+    ;;
+  rebuild|build)
+    compose up -d --build --remove-orphans "$@"
+    compose ps
+    ;;
+  down)
+    compose down "$@"
+    ;;
+  logs)
+    if [ "$#" -eq 0 ]; then
+      compose logs -f --tail=200 edge
+    else
+      compose logs -f --tail=200 "$@"
+    fi
+    ;;
+  health)
+    health
+    ;;
+  urls)
+    print_urls
+    ;;
+  env)
+    show_env
+    ;;
+  doctor)
+    doctor
+    ;;
+  update)
+    cd "$APP_DIR"
+    sh "$APP_DIR/update.sh" "$@"
+    ;;
+  version)
+    version
+    ;;
+  compose)
+    [ "$#" -gt 0 ] || fail "usage: $PROG compose <docker-compose-args>"
+    compose "$@"
+    ;;
+  *)
+    warn "unknown command: $COMMAND"
+    printf '\n'
+    print_help
+    exit 2
+    ;;
+esac

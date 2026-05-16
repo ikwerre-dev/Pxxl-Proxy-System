@@ -7,15 +7,15 @@ INSTALL_DIR="${PXXL_INSTALL_DIR:-$HOME/pxxl-proxy-system}"
 NO_START="${PXXL_NO_START:-0}"
 ALLOW_DIRTY="${PXXL_ALLOW_DIRTY:-0}"
 VERIFY_GIT_SIGNATURE="${PXXL_VERIFY_GIT_SIGNATURE:-0}"
+SKIP_CLI="${PXXL_SKIP_CLI:-0}"
 
 banner() {
   cat <<'ART'
- ____            _   ____                      
-|  _ \ __  ____ | | |  _ \ _ __ _____  ___   _ 
-| |_) |\ \/ / _` | | | |_) | '__/ _ \ \/ / | | |
-|  __/  >  < (_| | | |  __/| | | (_) >  <| |_| |
-|_|    /_/\_\__, |_| |_|   |_|  \___/_/\_\\__, |
-            |___/                         |___/ 
+PPPP  X   X X   X L      PPPP  RRRR   OOO  X   X Y   Y
+P   P  X X   X X  L      P   P R   R O   O  X X   Y Y
+PPPP    X     X   L      PPPP  RRRR  O   O   X     Y
+P      X X   X X  L      P     R R   O   O  X X    Y
+P     X   X X   X LLLLL  P     R  RR  OOO  X   X   Y
 
 Pxxl Proxy installer
 ART
@@ -154,6 +154,77 @@ prepare_env() {
   fi
 }
 
+install_cli() {
+  if [ "$SKIP_CLI" = "1" ]; then
+    info "PXXL_SKIP_CLI=1 set; skipping pxxl command install"
+    return
+  fi
+
+  cli_source="$APP_DIR/bin/pxxl"
+  [ -f "$cli_source" ] || {
+    warn "CLI source not found at $cli_source"
+    return
+  }
+
+  chmod +x "$cli_source" || true
+  bin_dir="${PXXL_CLI_BIN_DIR:-${HOME:?HOME is required to choose a default CLI install directory}/.local/bin}"
+  mkdir -p "$bin_dir"
+  if ln -sf "$cli_source" "$bin_dir/pxxl"; then
+    info "installed pxxl command to $bin_dir/pxxl"
+    ensure_cli_path "$bin_dir"
+  else
+    warn "could not install pxxl command to $bin_dir; set PXXL_CLI_BIN_DIR to a writable directory"
+  fi
+}
+
+ensure_cli_path() {
+  bin_dir="$1"
+  case ":${PATH:-}:" in
+    *":$bin_dir:"*) return 0 ;;
+    *) PATH="$bin_dir:${PATH:-}"; export PATH ;;
+  esac
+
+  if [ "${PXXL_UPDATE_PATH:-1}" != "1" ]; then
+    warn "$bin_dir is not in PATH; PXXL_UPDATE_PATH=0 set, so shell profile was not updated"
+    return 0
+  fi
+
+  profile="${PXXL_PATH_PROFILE:-}"
+  if [ -z "$profile" ]; then
+    shell_name="${SHELL:-}"
+    shell_name="${shell_name##*/}"
+    case "$shell_name" in
+      zsh) profile="$HOME/.zshrc" ;;
+      bash) profile="$HOME/.bashrc" ;;
+      *) profile="$HOME/.profile" ;;
+    esac
+  fi
+
+  profile_dir="$(dirname "$profile")"
+  if ! { mkdir -p "$profile_dir" && touch "$profile"; }; then
+    warn "could not update shell profile at $profile; run: export PATH=\"$bin_dir:\$PATH\""
+    return 0
+  fi
+
+  if grep -F "# Pxxl Proxy CLI" "$profile" >/dev/null 2>&1; then
+    info "shell profile already has Pxxl PATH entry: $profile"
+    return 0
+  fi
+
+  if {
+    printf '\n# Pxxl Proxy CLI\n'
+    printf 'case ":$PATH:" in\n'
+    printf '  *":%s:"*) ;;\n' "$bin_dir"
+    printf '  *) export PATH="%s:$PATH" ;;\n' "$bin_dir"
+    printf 'esac\n'
+  } >> "$profile"; then
+    info "added $bin_dir to PATH in $profile"
+    info "open a new terminal, or run: . $profile"
+  else
+    warn "could not write PATH entry to $profile; run: export PATH=\"$bin_dir:\$PATH\""
+  fi
+}
+
 start_stack() {
   cd "$APP_DIR"
   if [ "$NO_START" = "1" ]; then
@@ -190,7 +261,13 @@ Secrets were written to:
   $APP_DIR/.env
 
 Update later with:
-  $APP_DIR/update.sh
+  pxxl update
+
+Command line:
+  pxxl
+  pxxl status
+  pxxl logs
+  pxxl restart
 EOF
 }
 
@@ -198,5 +275,6 @@ banner
 check_requirements
 prepare_repo
 prepare_env
+install_cli
 start_stack
 print_summary

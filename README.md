@@ -41,7 +41,22 @@ curl -fsSL https://raw.githubusercontent.com/ikwerre-dev/Pxxl-Proxy-System/main/
   | PXXL_INSTALL_DIR="$HOME/pxxl-proxy-system" sh
 ```
 
-The installer checks for Git, Docker, Docker Compose, OpenSSL, and a reachable Docker daemon. It creates a local `.env`, generates first-run secrets, prepares persistent `data/` folders, and starts the Compose stack.
+The installer checks for Git, Docker, Docker Compose, OpenSSL, and a reachable Docker daemon. It creates a local `.env`, generates first-run secrets, prepares persistent `data/` folders, starts the Compose stack, installs a `pxxl` operator command into `~/.local/bin` by default, and adds that folder to your shell profile when needed. Set `PXXL_CLI_BIN_DIR=/usr/local/bin` to choose another location, `PXXL_SKIP_CLI=1` to skip command installation, `PXXL_UPDATE_PATH=0` to avoid shell profile edits, or `PXXL_PATH_PROFILE=/path/to/profile` to choose the exact profile file.
+
+After install, running `pxxl` with no arguments prints help:
+
+```sh
+pxxl
+pxxl status
+pxxl start
+pxxl restart
+pxxl reload
+pxxl logs
+pxxl health
+pxxl update
+```
+
+The CLI is a thin wrapper around this checkout's Docker Compose stack. If the current terminal was already open before install, open a new terminal or run `. ~/.zshrc` / `. ~/.bashrc` once so your shell picks up the updated `PATH`.
 
 With Docker:
 
