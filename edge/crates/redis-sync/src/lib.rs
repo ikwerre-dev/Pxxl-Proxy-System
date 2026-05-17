@@ -195,6 +195,28 @@ impl RedisTokenStore {
         Ok(removed > 0)
     }
 
+    pub async fn revoke_tokens_by_name(&self, name: &str) -> Result<usize> {
+        let client = redis::Client::open(self.url.as_str())?;
+        let mut connection = client.get_multiplexed_async_connection().await?;
+        let values: Vec<String> = connection.hvals(&self.key).await?;
+        let mut removed = 0;
+
+        for value in values {
+            let record: AdminTokenRecord = serde_json::from_str(&value)?;
+            if record.name != name {
+                continue;
+            }
+
+            let _: usize = connection
+                .hdel(&self.hash_index_key, record.token_hash)
+                .await?;
+            let deleted: usize = connection.hdel(&self.key, record.id).await?;
+            removed += deleted;
+        }
+
+        Ok(removed)
+    }
+
     pub async fn verify_token(&self, token: &str) -> Result<Option<AdminTokenView>> {
         let token_hash = hash_token(token);
         let client = redis::Client::open(self.url.as_str())?;
