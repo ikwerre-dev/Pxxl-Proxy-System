@@ -95,6 +95,14 @@ Commands:
   down                Stop and remove containers, keeping data/ state
   logs [service]      Follow logs, defaulting to the edge service
   health              Check healthz, readyz, and metrics reachability
+  login               Log in with the initial account and print a fresh token once
+  account             Show initial account status
+  account setup       Set or replace the initial admin email/password
+  token refresh       Rotate the one-time bootstrap token in .env
+  hosts add <domain> [ip]
+                      Add/update a local /etc/hosts entry, default ip 127.0.0.1
+  hosts remove <domain>
+                      Remove a local /etc/hosts entry
   urls                Print local service URLs
   env                 Show .env keys with values masked
   doctor              Check local requirements and install layout
@@ -112,6 +120,8 @@ Environment:
 Examples:
   $PROG status
   $PROG logs edge
+  $PROG login
+  $PROG token refresh
   $PROG restart
   PXXL_DISCOVERY=1 $PROG rebuild
 EOF
@@ -164,6 +174,258 @@ health() {
   check_url readyz "$admin_url/readyz" || failed=1
   check_url metrics "$metrics_url" 1 || failed=1
   return "$failed"
+}
+
+env_file() {
+  printf '%s/.env' "$APP_DIR"
+}
+
+env_get_var() {
+  key="$1"
+  file="$(env_file)"
+  [ -f "$file" ] || return 0
+  grep "^$key=" "$file" | tail -n 1 | sed "s/^$key=//"
+}
+
+env_has_var() {
+  key="$1"
+  file="$(env_file)"
+  [ -f "$file" ] && grep -q "^$key=" "$file"
+}
+
+set_env_var() {
+  key="$1"
+  value="$2"
+  file="$(env_file)"
+  tmp="$file.tmp.$$"
+  [ -f "$file" ] || : > "$file"
+  awk -v key="$key" -v value="$value" '
+    BEGIN { found = 0 }
+    index($0, key "=") == 1 { print key "=" value; found = 1; next }
+    { print }
+    END { if (!found) print key "=" value }
+  ' "$file" > "$tmp"
+  mv "$tmp" "$file"
+  chmod 600 "$file" || true
+}
+
+random_hex() {
+  have openssl || fail "openssl is required"
+  openssl rand -hex "$1"
+}
+
+prompt_tty() {
+  prompt="$1"
+  default="${2:-}"
+  [ -r /dev/tty ] || fail "interactive prompt needs a terminal"
+  if [ -n "$default" ]; then
+    printf '%s [%s]: ' "$prompt" "$default" > /dev/tty
+  else
+    printf '%s: ' "$prompt" > /dev/tty
+  fi
+  IFS= read -r value < /dev/tty
+  [ -n "$value" ] || value="$default"
+  printf '%s' "$value"
+}
+
+prompt_secret_tty() {
+  prompt="$1"
+  [ -r /dev/tty ] || fail "interactive prompt needs a terminal"
+  printf '%s: ' "$prompt" > /dev/tty
+  old_stty="$(stty -g < /dev/tty 2>/dev/null || true)"
+  stty -echo < /dev/tty 2>/dev/null || true
+  IFS= read -r value < /dev/tty
+  [ -n "$old_stty" ] && stty "$old_stty" < /dev/tty 2>/dev/null || true
+  printf '\n' > /dev/tty
+  printf '%s' "$value"
+}
+
+validate_admin_email() {
+  case "$1" in
+    *@*.*) ;;
+    *) return 1 ;;
+  esac
+  case "$1" in
+    *[[:space:]]*|*@|@*|"") return 1 ;;
+  esac
+  return 0
+}
+
+validate_hosts_domain() {
+  case "$1" in
+    ""|*[!A-Za-z0-9.-]*|.*|*..*|*.) return 1 ;;
+  esac
+  return 0
+}
+
+hosts_file() {
+  printf '/etc/hosts'
+}
+
+write_hosts_file() {
+  src="$1"
+  dst="$(hosts_file)"
+  if [ -w "$dst" ]; then
+    cp "$src" "$dst"
+  else
+    have sudo || fail "sudo is required to update $dst"
+    sudo cp "$src" "$dst"
+  fi
+}
+
+hosts_remove_entry() {
+  domain="$1"
+  validate_hosts_domain "$domain" || fail "invalid hosts domain: $domain"
+  file="$(hosts_file)"
+  tmp="$(mktemp "${TMPDIR:-/tmp}/pxxl-hosts.XXXXXX")"
+  awk -v host="$domain" '
+    /^[[:space:]]*#/ { print; next }
+    {
+      keep = 1
+      for (i = 2; i <= NF; i++) {
+        if ($i == host) keep = 0
+      }
+      if (keep) print
+    }
+  ' "$file" > "$tmp"
+  write_hosts_file "$tmp"
+  rm -f "$tmp"
+  printf 'Removed %s from %s\n' "$domain" "$file"
+}
+
+hosts_add_entry() {
+  domain="$1"
+  ip="${2:-127.0.0.1}"
+  validate_hosts_domain "$domain" || fail "invalid hosts domain: $domain"
+  case "$ip" in
+    *[!0-9a-fA-F:.:]*|"") fail "invalid hosts IP: $ip" ;;
+  esac
+  file="$(hosts_file)"
+  tmp="$(mktemp "${TMPDIR:-/tmp}/pxxl-hosts.XXXXXX")"
+  awk -v host="$domain" '
+    /^[[:space:]]*#/ { print; next }
+    {
+      keep = 1
+      for (i = 2; i <= NF; i++) {
+        if ($i == host) keep = 0
+      }
+      if (keep) print
+    }
+  ' "$file" > "$tmp"
+  printf '%s\t%s\t# pxxl-local\n' "$ip" "$domain" >> "$tmp"
+  write_hosts_file "$tmp"
+  rm -f "$tmp"
+  printf 'Added %s -> %s in %s\n' "$domain" "$ip" "$file"
+}
+
+hash_admin_password() {
+  password="$1"
+  salt="$(random_hex 16)"
+  iterations="${PXXL_ADMIN_PASSWORD_ITERATIONS:-200000}"
+  derived="$(openssl kdf -keylen 32 \
+    -kdfopt digest:SHA256 \
+    -kdfopt "pass:$password" \
+    -kdfopt "salt:$salt" \
+    -kdfopt "iter:$iterations" \
+    PBKDF2 | tr -d ':' | tr 'A-F' 'a-f')"
+  printf 'pbkdf2-sha256:%s:%s:%s' "$iterations" "$salt" "$derived"
+}
+
+json_escape() {
+  printf '%s' "$1" | sed 's/\\/\\\\/g; s/"/\\"/g'
+}
+
+account_status() {
+  email="$(env_get_var PXXL_ADMIN_EMAIL)"
+  if [ -n "$email" ] && env_has_var PXXL_ADMIN_PASSWORD_HASH; then
+    printf 'Initial admin account: configured\n'
+    printf 'Email: %s\n' "$email"
+    printf 'Password hash: stored in .env\n'
+  else
+    printf 'Initial admin account: not configured\n'
+    printf 'Run: %s account setup\n' "$PROG"
+  fi
+  if env_has_var PXXL_ADMIN_BOOTSTRAP_TOKEN; then
+    printf 'Bootstrap token: set, hidden\n'
+  else
+    printf 'Bootstrap token: missing; run %s token refresh\n' "$PROG"
+  fi
+}
+
+account_setup() {
+  cd "$APP_DIR"
+  [ -f .env ] || : > .env
+  current_email="$(env_get_var PXXL_ADMIN_EMAIL)"
+  email="${PXXL_ADMIN_EMAIL:-}"
+  [ -n "$email" ] || email="$(prompt_tty "Admin email" "$current_email")"
+  validate_admin_email "$email" || fail "admin email does not look valid: $email"
+
+  password="${PXXL_ADMIN_PASSWORD:-}"
+  if [ -z "$password" ]; then
+    password="$(prompt_secret_tty "Admin password")"
+    confirm="$(prompt_secret_tty "Confirm admin password")"
+    [ "$password" = "$confirm" ] || fail "admin passwords did not match"
+  fi
+  [ "${#password}" -ge 12 ] || fail "admin password must be at least 12 characters"
+
+  set_env_var PXXL_ADMIN_EMAIL "$email"
+  set_env_var PXXL_ADMIN_PASSWORD_HASH "$(hash_admin_password "$password")"
+  printf 'Initial admin account saved for %s\n' "$email"
+  restart_edge_if_possible
+}
+
+login_account() {
+  have curl || fail "curl is required"
+  email="${PXXL_ADMIN_EMAIL:-}"
+  [ -n "$email" ] || email="$(env_get_var PXXL_ADMIN_EMAIL)"
+  [ -n "$email" ] || email="$(prompt_tty "Admin email" "")"
+  password="${PXXL_ADMIN_PASSWORD:-}"
+  [ -n "$password" ] || password="$(prompt_secret_tty "Admin password")"
+
+  admin_url="${PXXL_ADMIN_URL:-http://127.0.0.1:8081}"
+  email_json="$(json_escape "$email")"
+  password_json="$(json_escape "$password")"
+  response="$(curl -sS -X POST "$admin_url/v1/auth/login" \
+    -H "content-type: application/json" \
+    --data "{\"email\":\"$email_json\",\"password\":\"$password_json\"}" 2>/dev/null || true)"
+  token="$(printf '%s' "$response" | sed -n 's/.*"token":"\([^"]*\)".*/\1/p')"
+  if [ -z "$token" ]; then
+    printf '%s\n' "$response" >&2
+    fail "login failed"
+  fi
+
+  cat <<EOF
+Admin token (shown once):
+$token
+
+Use it as:
+Authorization: Bearer $token
+
+Logging in again rotates this account token and revokes the previous one.
+EOF
+}
+
+restart_edge_if_possible() {
+  if have docker && docker info >/dev/null 2>&1; then
+    compose up -d --force-recreate edge >/dev/null
+    printf 'Recreated edge service so it can read the updated .env\n'
+  else
+    warn "Docker daemon is not reachable; run '$PROG reload' after Docker is running"
+  fi
+}
+
+refresh_bootstrap_token() {
+  cd "$APP_DIR"
+  [ -f .env ] || : > .env
+  token="$(random_hex 32)"
+  set_env_var PXXL_ADMIN_BOOTSTRAP_TOKEN "$token"
+  restart_edge_if_possible
+  cat <<EOF
+New bootstrap token (shown once):
+$token
+
+The old bootstrap token was removed from .env. The running edge service must be recreated for this token to take effect.
+EOF
 }
 
 doctor_check() {
@@ -263,6 +525,38 @@ case "$COMMAND" in
     ;;
   health)
     health
+    ;;
+  login)
+    login_account
+    ;;
+  account)
+    subcommand="${1:-status}"
+    case "$subcommand" in
+      status) account_status ;;
+      setup) account_setup ;;
+      *) fail "usage: $PROG account [status|setup]" ;;
+    esac
+    ;;
+  token)
+    subcommand="${1:-}"
+    case "$subcommand" in
+      refresh|rotate) refresh_bootstrap_token ;;
+      *) fail "usage: $PROG token refresh" ;;
+    esac
+    ;;
+  hosts)
+    subcommand="${1:-}"
+    case "$subcommand" in
+      add)
+        [ "$#" -ge 2 ] || fail "usage: $PROG hosts add <domain> [ip]"
+        hosts_add_entry "$2" "${3:-127.0.0.1}"
+        ;;
+      remove|rm)
+        [ "$#" -ge 2 ] || fail "usage: $PROG hosts remove <domain>"
+        hosts_remove_entry "$2"
+        ;;
+      *) fail "usage: $PROG hosts [add|remove] <domain> [ip]" ;;
+    esac
     ;;
   urls)
     print_urls

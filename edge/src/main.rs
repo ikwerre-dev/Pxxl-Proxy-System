@@ -6,7 +6,7 @@ use hyper_util::{
     client::legacy::{connect::HttpConnector, Client},
     rt::TokioExecutor,
 };
-use pxxl_api::{run_admin_api, run_metrics_server, AdminApiAuth, MetricsAuth};
+use pxxl_api::{run_admin_api, run_metrics_server, AdminApiAuth, AdminLoginAccount, MetricsAuth};
 use pxxl_common::{ip_allowed_for_upstream, parse_ip_net, Route, RouteSource};
 use pxxl_config::{HealthCheckConfig, PxxlConfig};
 use pxxl_core::{route_allows_www_alias, EdgeState, RouteRegistry};
@@ -138,12 +138,14 @@ async fn main() -> Result<()> {
         config.redis.url.clone(),
         config.admin.token_store_key.clone(),
     );
+    let admin_login_account = admin_login_account_from_env()?;
     let admin_auth = AdminApiAuth::new(
         config.admin.auth_enabled,
         config.admin.bootstrap_token.clone(),
         config.admin.bootstrap_token_permanent,
         config.admin.ip_allowlist.clone(),
         Some(token_store),
+        admin_login_account,
     );
     let mut tasks: Vec<JoinHandle<Result<()>>> = vec![
         tokio::spawn(run_http_proxy_with_error_pages_policy_and_geoip(
@@ -584,6 +586,27 @@ fn apply_env_overrides(config: &mut PxxlConfig) {
     }
     if let Ok(value) = std::env::var("PXXL_HEALTH_CHECKS_ENABLED") {
         config.health_checks.enabled = parse_bool(&value);
+    }
+}
+
+fn admin_login_account_from_env() -> Result<Option<AdminLoginAccount>> {
+    let email = std::env::var("PXXL_ADMIN_EMAIL")
+        .ok()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty());
+    let password_hash = std::env::var("PXXL_ADMIN_PASSWORD_HASH")
+        .ok()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty());
+
+    match (email, password_hash) {
+        (Some(email), Some(password_hash)) => AdminLoginAccount::new(email, password_hash)
+            .map(Some)
+            .map_err(|error| anyhow::anyhow!("invalid initial admin account config: {error}")),
+        (None, None) => Ok(None),
+        _ => anyhow::bail!(
+            "PXXL_ADMIN_EMAIL and PXXL_ADMIN_PASSWORD_HASH must be configured together"
+        ),
     }
 }
 

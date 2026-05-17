@@ -52,7 +52,9 @@ pxxl start
 pxxl restart
 pxxl reload
 pxxl logs
-pxxl health
+pxxl login
+pxxl account
+pxxl token refresh
 pxxl update
 ```
 
@@ -220,7 +222,32 @@ token_store_key = "pxxl:admin_tokens"
 ip_allowlist = ["127.0.0.1", "::1"]
 ```
 
-`/healthz` and `/readyz` stay public for uptime checks. Other admin endpoints require `Authorization: Bearer <token>` when `auth_enabled = true`. Use the bootstrap token to create Redis-backed tokens:
+`/healthz` and `/readyz` stay public for uptime checks. Other admin endpoints require `Authorization: Bearer <token>` when `auth_enabled = true`.
+
+The installer asks for an initial admin email and password. It stores only `PXXL_ADMIN_EMAIL` plus a PBKDF2-SHA256 password hash in `.env`; the plaintext password is not written to disk. Log in with that account to get a Redis-backed admin token:
+
+```sh
+pxxl login
+```
+
+The login response prints the raw token once. Logging in again rotates the account token by deleting the previous `account:<email>` token from Redis and creating a new one.
+
+API form:
+
+```http
+POST /v1/auth/login
+Content-Type: application/json
+
+{"email":"owner@example.com","password":"your-password"}
+```
+
+The installer also creates a one-time bootstrap token for break-glass first-run access. If you need to rotate it, run:
+
+```sh
+pxxl token refresh
+```
+
+You can still use the bootstrap token to create Redis-backed tokens:
 
 ```http
 POST /v1/auth/tokens

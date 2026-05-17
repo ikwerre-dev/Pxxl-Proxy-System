@@ -8,9 +8,36 @@ Most `/v1/*` endpoints require:
 Authorization: Bearer <bootstrap-or-admin-token>
 ```
 
-`/healthz` and `/readyz` are public. There is no checked-in default admin token. For first-run local access, set `PXXL_ADMIN_BOOTSTRAP_TOKEN` to a high-entropy value, create the first Redis-backed token, then remove the bootstrap token from the environment. By default the bootstrap token is one-shot and stops authenticating once Redis contains an admin token.
+`/healthz` and `/readyz` are public. `POST /v1/auth/login` is also public when an initial admin account is configured through `PXXL_ADMIN_EMAIL` and `PXXL_ADMIN_PASSWORD_HASH`; it verifies the email/password, revokes the previous `account:<email>` login token, and returns a fresh Redis-backed token once.
+
+There is no checked-in default admin token. The installer generates a high-entropy `PXXL_ADMIN_BOOTSTRAP_TOKEN` for first-run/break-glass access. By default the bootstrap token is one-shot and stops authenticating once Redis contains an admin token.
 
 ## Auth
+
+```http
+POST /v1/auth/login
+Content-Type: application/json
+
+{"email":"owner@example.com","password":"your-password"}
+```
+
+Returns:
+
+```json
+{
+  "account": "owner@example.com",
+  "token": "pxxl_...",
+  "record": {
+    "id": "...",
+    "name": "account:owner@example.com",
+    "scopes": ["admin"],
+    "created_at_unix_ms": 1760000000000,
+    "last_used_unix_ms": null,
+    "enabled": true
+  },
+  "message": "token is shown once; log in again to rotate it"
+}
+```
 
 ```http
 POST /v1/auth/tokens

@@ -17,6 +17,7 @@ use pxxl_metrics::PxxlMetrics;
 use pxxl_redis_sync::{RedisRouteStore, RedisTokenStore};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
+use sha2::{Digest, Sha256};
 use std::{
     convert::Infallible,
     net::{IpAddr, SocketAddr},
@@ -63,6 +64,20 @@ pub struct AdminApiAuth {
     bootstrap_token_permanent: bool,
     ip_allowlist: Vec<IpNet>,
     token_store: Option<RedisTokenStore>,
+    login_account: Option<AdminLoginAccount>,
+}
+
+#[derive(Clone)]
+pub struct AdminLoginAccount {
+    email: String,
+    password_hash: PasswordHashSpec,
+}
+
+#[derive(Clone)]
+struct PasswordHashSpec {
+    iterations: u32,
+    salt: String,
+    hash: Vec<u8>,
 }
 
 #[derive(Clone, Debug)]
@@ -80,6 +95,12 @@ struct TokenCreateBody {
     name: String,
     #[serde(default)]
     scopes: Vec<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct LoginBody {
+    email: String,
+    password: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -170,6 +191,7 @@ impl AdminApiAuth {
             bootstrap_token_permanent: false,
             ip_allowlist: Vec::new(),
             token_store: None,
+            login_account: None,
         }
     }
 
@@ -179,6 +201,7 @@ impl AdminApiAuth {
         bootstrap_token_permanent: bool,
         ip_allowlist: Vec<IpNet>,
         token_store: Option<RedisTokenStore>,
+        login_account: Option<AdminLoginAccount>,
     ) -> Self {
         Self {
             enabled,
@@ -186,6 +209,7 @@ impl AdminApiAuth {
             bootstrap_token_permanent,
             ip_allowlist,
             token_store,
+            login_account,
         }
     }
 
@@ -267,6 +291,84 @@ impl AdminApiAuth {
                 json!({"error": "admin token store is not configured"}),
             )),
         }
+    }
+}
+
+impl AdminLoginAccount {
+    pub fn new(email: impl Into<String>, password_hash: impl AsRef<str>) -> Result<Self, String> {
+        let email = normalize_login_email(&email.into())
+            .ok_or_else(|| "admin email must be a valid email-like value".to_string())?;
+        let password_hash = PasswordHashSpec::parse(password_hash.as_ref())?;
+        Ok(Self {
+            email,
+            password_hash,
+        })
+    }
+
+    fn email(&self) -> &str {
+        &self.email
+    }
+
+    fn token_name(&self) -> String {
+        format!("account:{}", self.email)
+    }
+
+    fn verify(&self, email: &str, password: &str) -> bool {
+        let Some(email) = normalize_login_email(email) else {
+            return false;
+        };
+
+        if !constant_time_eq(email.as_bytes(), self.email.as_bytes()) {
+            return false;
+        }
+
+        self.password_hash.verify(password.as_bytes())
+    }
+}
+
+impl PasswordHashSpec {
+    fn parse(encoded: &str) -> Result<Self, String> {
+        let parts = encoded.split(':').collect::<Vec<_>>();
+        if parts.len() != 4 || parts[0] != "pbkdf2-sha256" {
+            return Err(
+                "admin password hash must use pbkdf2-sha256:<iterations>:<salt>:<hash>".to_string(),
+            );
+        }
+
+        let iterations = parts[1]
+            .parse::<u32>()
+            .map_err(|_| "admin password hash iterations must be a positive integer".to_string())?;
+        if !(10_000..=1_000_000).contains(&iterations) {
+            return Err(
+                "admin password hash iterations must be between 10000 and 1000000".to_string(),
+            );
+        }
+
+        let salt = parts[2].to_string();
+        if salt.len() < 16 || !salt.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+            return Err("admin password hash salt must be at least 16 hex characters".to_string());
+        }
+
+        let hash = decode_hex(parts[3])?;
+        if hash.len() != 32 {
+            return Err("admin password hash must be a 32-byte SHA-256 derived key".to_string());
+        }
+
+        Ok(Self {
+            iterations,
+            salt,
+            hash,
+        })
+    }
+
+    fn verify(&self, password: &[u8]) -> bool {
+        let derived = pbkdf2_sha256(
+            password,
+            self.salt.as_bytes(),
+            self.iterations,
+            self.hash.len(),
+        );
+        constant_time_eq(&derived, &self.hash)
     }
 }
 
@@ -468,6 +570,7 @@ impl ApiServer {
                 }
                 self.create_domain(req).await
             }
+            (Method::POST, "/v1/auth/login") => self.login(req).await,
             (Method::POST, "/v1/auth/tokens") => {
                 if let Some(response) = require_scope(&principal, SCOPE_TOKENS_WRITE) {
                     return response;
@@ -857,6 +960,74 @@ impl ApiServer {
         )
     }
 
+    async fn login(&self, req: Request<Incoming>) -> Response<BoxBody> {
+        let Some(account) = &self.auth.login_account else {
+            return json_response(
+                StatusCode::NOT_FOUND,
+                json!({"error": "initial admin account is not configured"}),
+            );
+        };
+        let Some(store) = &self.auth.token_store else {
+            return json_response(
+                StatusCode::SERVICE_UNAVAILABLE,
+                json!({"error": "admin token store is not configured"}),
+            );
+        };
+
+        let collected = match collect_admin_body(req.into_body()).await {
+            Ok(collected) => collected,
+            Err(ApiBodyError::TooLarge) => {
+                return json_response(
+                    StatusCode::PAYLOAD_TOO_LARGE,
+                    json!({"error": "request body is too large"}),
+                );
+            }
+            Err(ApiBodyError::Body(error)) => {
+                return json_response(StatusCode::BAD_REQUEST, json!({"error": error}));
+            }
+        };
+        let body = match serde_json::from_slice::<LoginBody>(&collected) {
+            Ok(body) => body,
+            Err(error) => {
+                return json_response(StatusCode::BAD_REQUEST, json!({"error": error.to_string()}));
+            }
+        };
+
+        if !account.verify(&body.email, &body.password) {
+            return json_response(
+                StatusCode::UNAUTHORIZED,
+                json!({"error": "invalid email or password"}),
+            );
+        }
+
+        let token_name = account.token_name();
+        if let Err(error) = store.revoke_tokens_by_name(&token_name).await {
+            return json_response(
+                StatusCode::BAD_GATEWAY,
+                json!({"error": format!("failed to rotate previous login token: {error}")}),
+            );
+        }
+
+        match store
+            .create_token_with_scopes(token_name, vec![SCOPE_ADMIN.to_string()])
+            .await
+        {
+            Ok(created) => json_response(
+                StatusCode::CREATED,
+                json!({
+                    "account": account.email(),
+                    "token": created.token,
+                    "record": created.record,
+                    "message": "token is shown once; log in again to rotate it"
+                }),
+            ),
+            Err(error) => json_response(
+                StatusCode::BAD_GATEWAY,
+                json!({"error": format!("failed to create login token: {error}")}),
+            ),
+        }
+    }
+
     async fn create_auth_token(&self, req: Request<Incoming>) -> Response<BoxBody> {
         let collected = match collect_admin_body(req.into_body()).await {
             Ok(collected) => collected,
@@ -1061,6 +1232,97 @@ fn normalize_scopes(scopes: Vec<String>) -> Vec<String> {
     }
 }
 
+fn normalize_login_email(email: &str) -> Option<String> {
+    let email = email.trim().to_ascii_lowercase();
+    let valid = email.len() <= 254
+        && email.contains('@')
+        && !email.starts_with('@')
+        && !email.ends_with('@')
+        && !email.bytes().any(|byte| byte.is_ascii_control())
+        && !email.bytes().any(|byte| byte.is_ascii_whitespace());
+    valid.then_some(email)
+}
+
+fn decode_hex(value: &str) -> Result<Vec<u8>, String> {
+    if !value.len().is_multiple_of(2) {
+        return Err("hex value must have an even length".to_string());
+    }
+
+    value
+        .as_bytes()
+        .chunks_exact(2)
+        .map(|pair| {
+            let high = hex_nibble(pair[0])
+                .ok_or_else(|| "hex value contains invalid characters".to_string())?;
+            let low = hex_nibble(pair[1])
+                .ok_or_else(|| "hex value contains invalid characters".to_string())?;
+            Ok((high << 4) | low)
+        })
+        .collect()
+}
+
+fn hex_nibble(byte: u8) -> Option<u8> {
+    match byte {
+        b'0'..=b'9' => Some(byte - b'0'),
+        b'a'..=b'f' => Some(byte - b'a' + 10),
+        b'A'..=b'F' => Some(byte - b'A' + 10),
+        _ => None,
+    }
+}
+
+fn pbkdf2_sha256(password: &[u8], salt: &[u8], iterations: u32, output_len: usize) -> Vec<u8> {
+    let mut output = Vec::with_capacity(output_len);
+    let mut block_index = 1_u32;
+
+    while output.len() < output_len {
+        let mut block_salt = Vec::with_capacity(salt.len() + 4);
+        block_salt.extend_from_slice(salt);
+        block_salt.extend_from_slice(&block_index.to_be_bytes());
+
+        let mut previous = hmac_sha256(password, &block_salt);
+        let mut block = previous;
+        for _ in 1..iterations {
+            previous = hmac_sha256(password, &previous);
+            for (left, right) in block.iter_mut().zip(previous) {
+                *left ^= right;
+            }
+        }
+
+        output.extend_from_slice(&block);
+        block_index = block_index.saturating_add(1);
+    }
+
+    output.truncate(output_len);
+    output
+}
+
+fn hmac_sha256(key: &[u8], data: &[u8]) -> [u8; 32] {
+    const BLOCK_SIZE: usize = 64;
+    let mut normalized_key = [0_u8; BLOCK_SIZE];
+    if key.len() > BLOCK_SIZE {
+        normalized_key[..32].copy_from_slice(&Sha256::digest(key));
+    } else {
+        normalized_key[..key.len()].copy_from_slice(key);
+    }
+
+    let mut outer = [0x5c_u8; BLOCK_SIZE];
+    let mut inner = [0x36_u8; BLOCK_SIZE];
+    for index in 0..BLOCK_SIZE {
+        outer[index] ^= normalized_key[index];
+        inner[index] ^= normalized_key[index];
+    }
+
+    let mut inner_hasher = Sha256::new();
+    inner_hasher.update(inner);
+    inner_hasher.update(data);
+    let inner_digest = inner_hasher.finalize();
+
+    let mut outer_hasher = Sha256::new();
+    outer_hasher.update(outer);
+    outer_hasher.update(inner_digest);
+    outer_hasher.finalize().into()
+}
+
 fn redact_routes(routes: Vec<Route>) -> Vec<Route> {
     routes.into_iter().map(redact_route).collect()
 }
@@ -1229,7 +1491,8 @@ fn query_value(query: &str, name: &str) -> Option<String> {
 }
 
 fn is_public_admin_path(method: &Method, path: &str) -> bool {
-    *method == Method::GET && matches!(path, "/healthz" | "/readyz")
+    (*method == Method::GET && matches!(path, "/healthz" | "/readyz"))
+        || (*method == Method::POST && path == "/v1/auth/login")
 }
 
 fn bearer_token(req: &Request<Incoming>) -> Option<&str> {
@@ -1363,5 +1626,19 @@ mod tests {
 
         assert_eq!(scopes, vec!["analytics:read", "routes:read"]);
         assert!(validate_token_scopes(vec!["root".to_string()]).is_err());
+    }
+
+    #[test]
+    fn verifies_initial_admin_account_password_hash() {
+        let account = AdminLoginAccount::new(
+            "Owner@Example.com",
+            "pbkdf2-sha256:200000:0011223344556677:b8902efe5e8915505b74f56b9ede5f79346e2ca7aefd413fcf1a3794feadbed7",
+        )
+        .unwrap();
+
+        assert_eq!(account.email(), "owner@example.com");
+        assert!(account.verify("owner@example.com", "test-password"));
+        assert!(!account.verify("owner@example.com", "wrong-password"));
+        assert!(!account.verify("other@example.com", "test-password"));
     }
 }

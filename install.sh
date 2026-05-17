@@ -83,6 +83,135 @@ ensure_env_var() {
   fi
 }
 
+set_env_var() {
+  key="$1"
+  value="$2"
+  file="$3"
+  tmp="$file.tmp.$$"
+  if [ -f "$file" ]; then
+    awk -v key="$key" -v value="$value" '
+      BEGIN { found = 0 }
+      index($0, key "=") == 1 { print key "=" value; found = 1; next }
+      { print }
+      END { if (!found) print key "=" value }
+    ' "$file" > "$tmp"
+  else
+    printf '%s=%s\n' "$key" "$value" > "$tmp"
+  fi
+  mv "$tmp" "$file"
+  chmod 600 "$file" || true
+}
+
+env_has_var() {
+  key="$1"
+  file="$2"
+  [ -f "$file" ] && grep -q "^$key=" "$file"
+}
+
+env_get_var() {
+  key="$1"
+  file="$2"
+  [ -f "$file" ] || return 0
+  grep "^$key=" "$file" | tail -n 1 | sed "s/^$key=//"
+}
+
+prompt_tty() {
+  prompt="$1"
+  [ -r /dev/tty ] || fail "interactive setup needs a terminal; set PXXL_ADMIN_EMAIL and PXXL_ADMIN_PASSWORD instead"
+  printf '%s' "$prompt" > /dev/tty
+  IFS= read -r value < /dev/tty
+  printf '%s' "$value"
+}
+
+prompt_secret_tty() {
+  prompt="$1"
+  [ -r /dev/tty ] || fail "interactive setup needs a terminal; set PXXL_ADMIN_EMAIL and PXXL_ADMIN_PASSWORD instead"
+  printf '%s' "$prompt" > /dev/tty
+  old_stty="$(stty -g < /dev/tty 2>/dev/null || true)"
+  stty -echo < /dev/tty 2>/dev/null || true
+  IFS= read -r value < /dev/tty
+  [ -n "$old_stty" ] && stty "$old_stty" < /dev/tty 2>/dev/null || true
+  printf '\n' > /dev/tty
+  printf '%s' "$value"
+}
+
+validate_admin_email() {
+  case "$1" in
+    *@*.*) ;;
+    *) return 1 ;;
+  esac
+  case "$1" in
+    *[[:space:]]*|*@|@*|"") return 1 ;;
+  esac
+  return 0
+}
+
+hash_admin_password() {
+  password="$1"
+  salt="$(random_hex 16)"
+  iterations="${PXXL_ADMIN_PASSWORD_ITERATIONS:-200000}"
+  derived="$(openssl kdf -keylen 32 \
+    -kdfopt digest:SHA256 \
+    -kdfopt "pass:$password" \
+    -kdfopt "salt:$salt" \
+    -kdfopt "iter:$iterations" \
+    PBKDF2 | tr -d ':' | tr 'A-F' 'a-f')"
+  printf 'pbkdf2-sha256:%s:%s:%s' "$iterations" "$salt" "$derived"
+}
+
+prepare_admin_account() {
+  file="$1"
+  if env_has_var "PXXL_ADMIN_EMAIL" "$file" && env_has_var "PXXL_ADMIN_PASSWORD_HASH" "$file"; then
+    ADMIN_EMAIL_VALUE="$(env_get_var "PXXL_ADMIN_EMAIL" "$file")"
+    info "keeping existing initial admin account: $ADMIN_EMAIL_VALUE"
+    return
+  fi
+
+  email="${PXXL_ADMIN_EMAIL:-}"
+  password="${PXXL_ADMIN_PASSWORD:-}"
+  password_hash="${PXXL_ADMIN_PASSWORD_HASH:-}"
+
+  if [ -z "$email" ]; then
+    email="$(prompt_tty "Initial admin email: ")"
+  fi
+  validate_admin_email "$email" || fail "admin email does not look valid: $email"
+
+  if [ -z "$password_hash" ]; then
+    if [ -z "$password" ]; then
+      password="$(prompt_secret_tty "Initial admin password: ")"
+      confirm="$(prompt_secret_tty "Confirm admin password: ")"
+      [ "$password" = "$confirm" ] || fail "admin passwords did not match"
+    fi
+    [ "${#password}" -ge 12 ] || fail "admin password must be at least 12 characters"
+    password_hash="$(hash_admin_password "$password")"
+  fi
+
+  set_env_var "PXXL_ADMIN_EMAIL" "$email" "$file"
+  set_env_var "PXXL_ADMIN_PASSWORD_HASH" "$password_hash" "$file"
+  ADMIN_EMAIL_VALUE="$email"
+  ADMIN_PASSWORD_FOR_LOGIN="$password"
+  info "stored initial admin account in .env"
+}
+
+prepare_bootstrap_token() {
+  file="$1"
+  BOOTSTRAP_TOKEN_CREATED=0
+  INITIAL_BOOTSTRAP_TOKEN=""
+  if env_has_var "PXXL_ADMIN_BOOTSTRAP_TOKEN" "$file"; then
+    info "keeping existing PXXL_ADMIN_BOOTSTRAP_TOKEN in .env"
+    return
+  fi
+
+  if [ -n "${PXXL_ADMIN_BOOTSTRAP_TOKEN:-}" ]; then
+    INITIAL_BOOTSTRAP_TOKEN="$PXXL_ADMIN_BOOTSTRAP_TOKEN"
+  else
+    INITIAL_BOOTSTRAP_TOKEN="$(random_hex 32)"
+  fi
+  set_env_var "PXXL_ADMIN_BOOTSTRAP_TOKEN" "$INITIAL_BOOTSTRAP_TOKEN" "$file"
+  BOOTSTRAP_TOKEN_CREATED=1
+  info "wrote one-time PXXL_ADMIN_BOOTSTRAP_TOKEN to .env"
+}
+
 prepare_repo() {
   caller_dir="$(script_dir)"
   if is_repo_dir "$caller_dir"; then
@@ -128,7 +257,7 @@ check_requirements() {
   ensure_command openssl
   ensure_command docker
   compose version >/dev/null
-  if ! docker info >/dev/null 2>&1; then
+  if [ "$NO_START" != "1" ] && ! docker info >/dev/null 2>&1; then
     fail "Docker is installed, but the daemon is not reachable. Start Docker Desktop or the Docker service and rerun this installer."
   fi
 }
@@ -143,7 +272,8 @@ prepare_env() {
     chmod 600 "$ENV_FILE" || true
   fi
 
-  ensure_env_var "PXXL_ADMIN_BOOTSTRAP_TOKEN" "$(random_hex 32)" "$ENV_FILE"
+  prepare_admin_account "$ENV_FILE"
+  prepare_bootstrap_token "$ENV_FILE"
   ensure_env_var "GRAFANA_ADMIN_PASSWORD" "$(random_hex 24)" "$ENV_FILE"
 
   if [ -S "/var/run/podman/podman.sock" ]; then
@@ -237,6 +367,50 @@ start_stack() {
   compose ps
 }
 
+json_escape() {
+  printf '%s' "$1" | sed 's/\\/\\\\/g; s/"/\\"/g'
+}
+
+issue_initial_login_token() {
+  INITIAL_LOGIN_TOKEN=""
+  if [ "$NO_START" = "1" ] || [ -z "${ADMIN_PASSWORD_FOR_LOGIN:-}" ]; then
+    return
+  fi
+  if ! have curl; then
+    warn "curl is not available; run pxxl login later to generate an account token"
+    return
+  fi
+
+  admin_url="${PXXL_ADMIN_URL:-http://127.0.0.1:8081}"
+  info "waiting for admin API to issue first account token"
+  attempt=0
+  while [ "$attempt" -lt 30 ]; do
+    if curl -fsS "$admin_url/healthz" >/dev/null 2>&1; then
+      break
+    fi
+    attempt=$((attempt + 1))
+    sleep 1
+  done
+
+  if [ "$attempt" -ge 30 ]; then
+    warn "admin API did not become reachable; run pxxl login after the stack is up"
+    return
+  fi
+
+  email_json="$(json_escape "$ADMIN_EMAIL_VALUE")"
+  password_json="$(json_escape "$ADMIN_PASSWORD_FOR_LOGIN")"
+  response="$(curl -sS -X POST "$admin_url/v1/auth/login" \
+    -H "content-type: application/json" \
+    --data "{\"email\":\"$email_json\",\"password\":\"$password_json\"}" 2>/dev/null || true)"
+  token="$(printf '%s' "$response" | sed -n 's/.*"token":"\([^"]*\)".*/\1/p')"
+  if [ -n "$token" ]; then
+    INITIAL_LOGIN_TOKEN="$token"
+    info "created first Redis-backed admin token"
+  else
+    warn "could not create first account token automatically; run pxxl login"
+  fi
+}
+
 print_summary() {
   cat <<EOF
 
@@ -260,6 +434,32 @@ Local host entries for .pxxlhost testing:
 Secrets were written to:
   $APP_DIR/.env
 
+Initial admin account:
+  Email: ${ADMIN_EMAIL_VALUE:-configured}
+EOF
+
+  if [ -n "${INITIAL_LOGIN_TOKEN:-}" ]; then
+    cat <<EOF
+  Admin token (shown once): $INITIAL_LOGIN_TOKEN
+EOF
+  else
+    cat <<EOF
+  Admin token: run pxxl login to generate one
+EOF
+  fi
+
+  if [ "${BOOTSTRAP_TOKEN_CREATED:-0}" = "1" ]; then
+    cat <<EOF
+  Bootstrap token (shown once): $INITIAL_BOOTSTRAP_TOKEN
+EOF
+  else
+    cat <<EOF
+  Bootstrap token: already exists in .env; run pxxl token refresh to rotate it
+EOF
+  fi
+
+  cat <<EOF
+
 Update later with:
   pxxl update
 
@@ -277,4 +477,5 @@ prepare_repo
 prepare_env
 install_cli
 start_stack
+issue_initial_login_token
 print_summary

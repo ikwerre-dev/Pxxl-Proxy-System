@@ -60,9 +60,9 @@ impl DockerDiscovery {
 
         let targets = containers
             .into_iter()
-            .filter_map(|container| {
+            .flat_map(|container| {
                 let name = container.primary_name();
-                route_target_from_container(&container, &name, self.published_port_host.as_deref())
+                route_targets_from_container(&container, &name, self.published_port_host.as_deref())
             })
             .collect::<Vec<_>>();
 
@@ -201,29 +201,52 @@ struct DockerRouteTarget {
 }
 
 pub fn route_from_labels(labels: &HashMap<String, String>, container_name: &str) -> Option<Route> {
-    route_target_from_labels(labels, container_name)
+    route_targets_from_labels(labels, container_name)
+        .into_iter()
+        .next()
         .and_then(|target| route_from_target(target, ContainerProvider::Docker).ok())
 }
 
+#[cfg(test)]
 fn route_target_from_labels(
     labels: &HashMap<String, String>,
     container_name: &str,
 ) -> Option<DockerRouteTarget> {
-    let label_config = label_route_config(labels)?;
-    let host = label_config.host.unwrap_or(container_name);
-    Some(route_target_from_label_config(
-        &label_config,
-        host,
-        label_config.port,
-    ))
+    route_targets_from_labels(labels, container_name)
+        .into_iter()
+        .next()
 }
 
+fn route_targets_from_labels(
+    labels: &HashMap<String, String>,
+    container_name: &str,
+) -> Vec<DockerRouteTarget> {
+    let Some(label_config) = label_route_config(labels) else {
+        return Vec::new();
+    };
+    let host = label_config.host.unwrap_or(container_name);
+    route_targets_from_label_config(&label_config, host, label_config.port)
+}
+
+#[cfg(test)]
 fn route_target_from_container(
     container: &DockerContainerSummary,
     container_name: &str,
     published_port_host: Option<&str>,
 ) -> Option<DockerRouteTarget> {
-    let label_config = label_route_config(&container.labels)?;
+    route_targets_from_container(container, container_name, published_port_host)
+        .into_iter()
+        .next()
+}
+
+fn route_targets_from_container(
+    container: &DockerContainerSummary,
+    container_name: &str,
+    published_port_host: Option<&str>,
+) -> Vec<DockerRouteTarget> {
+    let Some(label_config) = label_route_config(&container.labels) else {
+        return Vec::new();
+    };
     let (host, port) = match label_config.host {
         Some(host) => (host, label_config.port),
         None => match published_port_host {
@@ -237,11 +260,11 @@ fn route_target_from_container(
         },
     };
 
-    Some(route_target_from_label_config(&label_config, host, port))
+    route_targets_from_label_config(&label_config, host, port)
 }
 
 struct LabelRouteConfig<'a> {
-    domain: &'a str,
+    domains: Vec<&'a str>,
     path: &'a str,
     scheme: &'a str,
     host: Option<&'a str>,
@@ -256,7 +279,17 @@ fn label_route_config(labels: &HashMap<String, String>) -> Option<LabelRouteConf
         return None;
     }
 
-    let domain = labels.get("pxxl.domain")?;
+    let domain_label = labels
+        .get("pxxl.domains")
+        .or_else(|| labels.get("pxxl.domain"))?;
+    let domains = domain_label
+        .split(',')
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .collect::<Vec<_>>();
+    if domains.is_empty() {
+        return None;
+    }
     let port = labels.get("pxxl.port")?.parse::<u16>().ok()?;
     let path = labels.get("pxxl.path").map(String::as_str).unwrap_or("/");
     let scheme = labels
@@ -266,7 +299,7 @@ fn label_route_config(labels: &HashMap<String, String>) -> Option<LabelRouteConf
     let host = labels.get("pxxl.host").map(String::as_str);
 
     Some(LabelRouteConfig {
-        domain,
+        domains,
         path,
         scheme,
         host,
@@ -274,16 +307,20 @@ fn label_route_config(labels: &HashMap<String, String>) -> Option<LabelRouteConf
     })
 }
 
-fn route_target_from_label_config(
+fn route_targets_from_label_config(
     label_config: &LabelRouteConfig<'_>,
     host: &str,
     port: u16,
-) -> DockerRouteTarget {
-    DockerRouteTarget {
-        domain: normalize_domain(label_config.domain),
-        path: normalize_path_prefix(label_config.path),
-        upstream: Upstream::new(format!("{}://{}:{}", label_config.scheme, host, port)),
-    }
+) -> Vec<DockerRouteTarget> {
+    label_config
+        .domains
+        .iter()
+        .map(|domain| DockerRouteTarget {
+            domain: normalize_domain(domain),
+            path: normalize_path_prefix(label_config.path),
+            upstream: Upstream::new(format!("{}://{}:{}", label_config.scheme, host, port)),
+        })
+        .collect()
 }
 
 fn route_from_target(target: DockerRouteTarget, provider: ContainerProvider) -> Result<Route> {
@@ -480,6 +517,32 @@ mod tests {
         assert_eq!(route.domain, "app.pxxlhost");
         assert_eq!(route.paths[0].prefix, "/api");
         assert_eq!(route.paths[0].upstreams[0].url, "http://web:3000");
+    }
+
+    #[test]
+    fn parses_multiple_domains_from_labels() {
+        let labels = HashMap::from([
+            ("pxxl.enable".to_string(), "true".to_string()),
+            (
+                "pxxl.domains".to_string(),
+                "app.pxxlhost,www.app.pxxlhost".to_string(),
+            ),
+            ("pxxl.port".to_string(), "3000".to_string()),
+        ]);
+
+        let routes = routes_from_targets(
+            route_targets_from_labels(&labels, "web"),
+            ContainerProvider::Docker,
+        );
+
+        let domains = routes
+            .iter()
+            .map(|route| route.domain.as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(domains, vec!["app.pxxlhost", "www.app.pxxlhost"]);
+        assert!(routes
+            .iter()
+            .all(|route| route.paths[0].upstreams[0].url == "http://web:3000"));
     }
 
     #[test]
