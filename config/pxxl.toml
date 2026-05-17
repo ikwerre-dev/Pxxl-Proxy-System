@@ -43,8 +43,11 @@ timeout_ms = 1500
 path = "/"
 
 [security.rate_limits]
-requests_per_second = 120
-burst = 240
+# Local development frontends such as Vite/TanStack can request hundreds of
+# module files at once during a cold load. Keep this high in the sample config;
+# production installs should tune it per deployment.
+requests_per_second = 2000
+burst = 5000
 
 [security.blacklists]
 cidrs = []
