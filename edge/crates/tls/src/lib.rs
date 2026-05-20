@@ -29,6 +29,8 @@ pub enum TlsError {
         path: String,
         source: std::io::Error,
     },
+    #[error("static local certificate override requires both PXXL_STATIC_LOCAL_CERT and PXXL_STATIC_LOCAL_KEY")]
+    StaticOverrideIncomplete,
     #[error("failed to generate local certificate: {0}")]
     Generate(#[from] rcgen::Error),
     #[error("failed to parse PEM file: {0}")]
@@ -92,6 +94,13 @@ impl LocalCertificateStore {
 
         let cert_path = self.cert_path();
         let key_path = self.key_path();
+        if let Some(bundle) = self
+            .copy_static_certificate_override(domains, &cert_path, &key_path)
+            .await?
+        {
+            return Ok(bundle);
+        }
+
         let (cert_pem, key_pem, domains) = generate_certificate(domains)?;
 
         fs::write(&cert_path, cert_pem)
@@ -115,6 +124,57 @@ impl LocalCertificateStore {
             key_path,
             domains,
         })
+    }
+
+    async fn copy_static_certificate_override(
+        &self,
+        domains: &[String],
+        cert_path: &Path,
+        key_path: &Path,
+    ) -> Result<Option<CertificateBundle>> {
+        let cert_override = std::env::var("PXXL_STATIC_LOCAL_CERT").ok();
+        let key_override = std::env::var("PXXL_STATIC_LOCAL_KEY").ok();
+        let (Some(source_cert), Some(source_key)) =
+            (cert_override.as_deref(), key_override.as_deref())
+        else {
+            if cert_override.is_some() || key_override.is_some() {
+                return Err(TlsError::StaticOverrideIncomplete);
+            }
+            return Ok(None);
+        };
+
+        let cert_pem = fs::read(&source_cert)
+            .await
+            .map_err(|source| TlsError::Read {
+                path: source_cert.to_string(),
+                source,
+            })?;
+        let key_pem = fs::read(&source_key)
+            .await
+            .map_err(|source| TlsError::Read {
+                path: source_key.to_string(),
+                source,
+            })?;
+        fs::write(cert_path, cert_pem)
+            .await
+            .map_err(|source| TlsError::Write {
+                path: cert_path.display().to_string(),
+                source,
+            })?;
+        fs::write(key_path, key_pem)
+            .await
+            .map_err(|source| TlsError::Write {
+                path: key_path.display().to_string(),
+                source,
+            })?;
+        set_private_key_permissions(key_path).await?;
+        info!(cert = %cert_path.display(), "loaded static local development certificate");
+
+        Ok(Some(CertificateBundle {
+            cert_path: cert_path.to_path_buf(),
+            key_path: key_path.to_path_buf(),
+            domains: domains.to_vec(),
+        }))
     }
 
     pub fn server_config_from_bundle(
@@ -143,6 +203,12 @@ impl CertificateIssuer for LocalCertificateStore {
 
         let cert_path = self.cert_path();
         let key_path = self.key_path();
+        if let Some(bundle) = self
+            .copy_static_certificate_override(domains, &cert_path, &key_path)
+            .await?
+        {
+            return Ok(bundle);
+        }
 
         if cert_path.exists() && key_path.exists() {
             return Ok(CertificateBundle {
