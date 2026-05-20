@@ -1402,6 +1402,9 @@ async fn validate_api_upstream_network_safety(raw: &str) -> Result<(), String> {
     };
     let host = host.trim_end_matches('.').to_ascii_lowercase();
     if reserved_host_gateway(&host) {
+        if host_gateway_upstreams_allowed() {
+            return Ok(());
+        }
         return Err(format!(
             "reserved host-gateway upstream is not allowed: {host}"
         ));
@@ -1434,6 +1437,17 @@ async fn validate_api_upstream_network_safety(raw: &str) -> Result<(), String> {
         }
         Ok(Err(_)) | Err(_) => Ok(()),
     }
+}
+
+fn host_gateway_upstreams_allowed() -> bool {
+    std::env::var("PXXL_ALLOW_HOST_GATEWAY_UPSTREAMS")
+        .map(|value| {
+            matches!(
+                value.to_ascii_lowercase().as_str(),
+                "1" | "true" | "yes" | "on"
+            )
+        })
+        .unwrap_or(false)
 }
 
 fn reserved_host_gateway(host: &str) -> bool {

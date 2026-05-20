@@ -2398,7 +2398,7 @@ async fn runtime_upstream_network_allowed(raw: &str) -> bool {
     };
     let host = host.trim_end_matches('.').to_ascii_lowercase();
     if reserved_host_gateway(&host) {
-        return false;
+        return host_gateway_upstreams_allowed();
     }
     if let Ok(ip) = host.parse::<IpAddr>() {
         return ip_allowed_for_upstream(ip);
@@ -2421,6 +2421,17 @@ async fn runtime_upstream_network_allowed(raw: &str) -> bool {
 
 fn reserved_host_gateway(host: &str) -> bool {
     matches!(host, "host.docker.internal" | "gateway.docker.internal")
+}
+
+fn host_gateway_upstreams_allowed() -> bool {
+    std::env::var("PXXL_ALLOW_HOST_GATEWAY_UPSTREAMS")
+        .map(|value| {
+            matches!(
+                value.to_ascii_lowercase().as_str(),
+                "1" | "true" | "yes" | "on"
+            )
+        })
+        .unwrap_or(false)
 }
 
 fn canonical_forward_uri(
