@@ -20,6 +20,13 @@ socket_path = "/var/run/podman/podman.sock"
 published_host = "host.docker.internal"
 poll_seconds = 5
 
+[database_proxy]
+enabled = false
+
+[[database_proxy.listeners]]
+type = "postgres"
+listen = "0.0.0.0:5432"
+
 [error_pages]
 enabled = true
 dir = "config/error-pages"

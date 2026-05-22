@@ -37,6 +37,8 @@ pub struct PxxlConfig {
     #[serde(default)]
     pub podman: PodmanConfig,
     #[serde(default)]
+    pub database_proxy: DatabaseProxyConfig,
+    #[serde(default)]
     pub error_pages: ErrorPagesConfig,
     #[serde(default)]
     pub geoip: GeoIpConfig,
@@ -157,6 +159,41 @@ impl PodmanConfig {
     pub fn poll_interval(&self) -> Duration {
         Duration::from_secs(self.poll_seconds.max(1))
     }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DatabaseProxyConfig {
+    #[serde(default = "default_false")]
+    pub enabled: bool,
+    #[serde(default)]
+    pub listeners: Vec<DatabaseProxyListenerConfig>,
+    #[serde(default)]
+    pub routes: Vec<DatabaseProxyRouteConfig>,
+}
+
+impl Default for DatabaseProxyConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            listeners: Vec::new(),
+            routes: Vec::new(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DatabaseProxyListenerConfig {
+    #[serde(rename = "type", alias = "database_type")]
+    pub database_type: String,
+    pub listen: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DatabaseProxyRouteConfig {
+    #[serde(rename = "type", alias = "database_type")]
+    pub database_type: String,
+    pub key: String,
+    pub upstream: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -592,6 +629,29 @@ mod tests {
         assert_eq!(config.podman.socket_path, "/var/run/podman/podman.sock");
         assert_eq!(config.podman.published_host, "host.docker.internal");
         assert_eq!(config.podman.poll_interval(), Duration::from_secs(2));
+    }
+
+    #[test]
+    fn parses_database_proxy_config() {
+        let raw = r#"
+            [database_proxy]
+            enabled = true
+
+            [[database_proxy.listeners]]
+            type = "postgres"
+            listen = "0.0.0.0:5432"
+
+            [[database_proxy.routes]]
+            type = "postgres"
+            key = "pxxldb_abc"
+            upstream = "127.0.0.1:35001"
+        "#;
+
+        let config: PxxlConfig = toml::from_str(raw).unwrap();
+
+        assert!(config.database_proxy.enabled);
+        assert_eq!(config.database_proxy.listeners[0].database_type, "postgres");
+        assert_eq!(config.database_proxy.routes[0].key, "pxxldb_abc");
     }
 
     #[test]

@@ -1202,6 +1202,7 @@ dependencies = [
  "ipnet",
  "pxxl-common",
  "pxxl-core",
+ "pxxl-database-proxy",
  "pxxl-metrics",
  "pxxl-redis-sync",
  "serde",
@@ -1256,6 +1257,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "pxxl-database-proxy"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "parking_lot",
+ "serde",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
 name = "pxxl-ddos"
 version = "0.1.0"
 dependencies = [
@@ -1295,6 +1307,7 @@ dependencies = [
  "pxxl-common",
  "pxxl-config",
  "pxxl-core",
+ "pxxl-database-proxy",
  "pxxl-ddos",
  "pxxl-docker-discovery",
  "pxxl-geo",

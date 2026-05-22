@@ -10,6 +10,7 @@ use pxxl_api::{run_admin_api, run_metrics_server, AdminApiAuth, AdminLoginAccoun
 use pxxl_common::{ip_allowed_for_upstream, parse_ip_net, Route, RouteSource};
 use pxxl_config::{HealthCheckConfig, PxxlConfig};
 use pxxl_core::{route_allows_www_alias, EdgeState, RouteRegistry};
+use pxxl_database_proxy::{run_database_proxy, DatabaseProxyRoute, DatabaseRouteRegistry};
 use pxxl_ddos::{BlacklistEngine, RateLimitConfig, RateLimiter, SecurityEngine};
 use pxxl_docker_discovery::{run_docker_polling, DockerDiscovery};
 use pxxl_geo::GeoIpResolver;
@@ -132,6 +133,14 @@ async fn main() -> Result<()> {
     let https_addr = parse_addr("listeners.https", &config.listeners.https)?;
     let admin_addr = parse_addr("listeners.admin", &config.listeners.admin)?;
     let metrics_addr = parse_addr("listeners.metrics", &config.listeners.metrics)?;
+    let database_routes =
+        DatabaseRouteRegistry::new(config.database_proxy.routes.iter().map(|route| {
+            DatabaseProxyRoute {
+                database_type: route.database_type.clone(),
+                key: route.key.clone(),
+                upstream: route.upstream.clone(),
+            }
+        }));
 
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
     let token_store = RedisTokenStore::new(
@@ -172,6 +181,7 @@ async fn main() -> Result<()> {
             state.clone(),
             config.tls.cert_dir.clone(),
             Some(route_store.clone()),
+            Some(database_routes.clone()),
             admin_auth,
             shutdown_rx.clone(),
         )),
@@ -195,6 +205,18 @@ async fn main() -> Result<()> {
             analytics_rx,
             shutdown_rx.clone(),
         )));
+    }
+
+    if config.database_proxy.enabled {
+        for listener in &config.database_proxy.listeners {
+            let addr = parse_addr("database_proxy.listeners.listen", &listener.listen)?;
+            tasks.push(tokio::spawn(run_database_proxy(
+                listener.database_type.clone(),
+                addr,
+                database_routes.clone(),
+                shutdown_rx.clone(),
+            )));
+        }
     }
 
     if config.health_checks.enabled {
@@ -545,6 +567,12 @@ fn apply_env_overrides(config: &mut PxxlConfig) {
     if let Ok(value) = std::env::var("PXXL_PODMAN_PUBLISHED_HOST") {
         config.podman.published_host = value;
     }
+    if let Ok(value) = std::env::var("PXXL_DATABASE_PROXY_ENABLED") {
+        config.database_proxy.enabled = parse_bool(&value);
+    }
+    if let Ok(value) = std::env::var("PXXL_DATABASE_PROXY_POSTGRES_ADDR") {
+        upsert_database_proxy_listener(config, "postgres", value);
+    }
     if let Ok(value) = std::env::var("PXXL_ERROR_PAGES_DIR") {
         config.error_pages.dir = value;
     }
@@ -618,6 +646,25 @@ fn admin_login_account_from_env() -> Result<Option<AdminLoginAccount>> {
         _ => anyhow::bail!(
             "PXXL_ADMIN_EMAIL and PXXL_ADMIN_PASSWORD_HASH must be configured together"
         ),
+    }
+}
+
+fn upsert_database_proxy_listener(config: &mut PxxlConfig, database_type: &str, listen: String) {
+    if let Some(listener) = config
+        .database_proxy
+        .listeners
+        .iter_mut()
+        .find(|listener| listener.database_type.eq_ignore_ascii_case(database_type))
+    {
+        listener.listen = listen;
+    } else {
+        config
+            .database_proxy
+            .listeners
+            .push(pxxl_config::DatabaseProxyListenerConfig {
+                database_type: database_type.to_string(),
+                listen,
+            });
     }
 }
 

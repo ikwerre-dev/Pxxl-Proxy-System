@@ -13,6 +13,7 @@ use pxxl_common::{
     UpstreamTransport, MAX_ROUTES_PER_SOURCE,
 };
 use pxxl_core::EdgeState;
+use pxxl_database_proxy::{DatabaseProxyRoute, DatabaseRouteRegistry};
 use pxxl_metrics::PxxlMetrics;
 use pxxl_redis_sync::{RedisRouteStore, RedisTokenStore};
 use serde::{Deserialize, Serialize};
@@ -49,6 +50,7 @@ struct ApiServer {
     state: EdgeState,
     cert_dir: String,
     route_store: Option<RedisRouteStore>,
+    database_routes: Option<DatabaseRouteRegistry>,
     auth: AdminApiAuth,
 }
 
@@ -153,11 +155,20 @@ struct UpstreamView {
     weight: u32,
 }
 
+#[derive(Debug, Deserialize)]
+struct DatabaseRouteBody {
+    #[serde(rename = "type", alias = "database_type")]
+    database_type: String,
+    key: String,
+    upstream: String,
+}
+
 pub async fn run_admin_api(
     addr: SocketAddr,
     state: EdgeState,
     cert_dir: impl Into<String>,
     route_store: Option<RedisRouteStore>,
+    database_routes: Option<DatabaseRouteRegistry>,
     auth: AdminApiAuth,
     shutdown: watch::Receiver<bool>,
 ) -> anyhow::Result<()> {
@@ -166,6 +177,7 @@ pub async fn run_admin_api(
         state,
         cert_dir: cert_dir.into(),
         route_store,
+        database_routes,
         auth,
     };
     info!(%addr, "admin API listening");
@@ -824,6 +836,24 @@ impl ApiServer {
                     .collect::<Vec<_>>();
                 json_response(StatusCode::OK, json!({ "upstreams": upstreams }))
             }
+            (Method::GET, "/v1/database-routes") => {
+                if let Some(response) = require_scope(&principal, SCOPE_ROUTES_READ) {
+                    return response;
+                }
+                self.list_database_routes()
+            }
+            (Method::POST, "/v1/database-routes") => {
+                if let Some(response) = require_scope(&principal, SCOPE_ROUTES_WRITE) {
+                    return response;
+                }
+                self.upsert_database_route(req).await
+            }
+            (Method::DELETE, path) if path.starts_with("/v1/database-routes/") => {
+                if let Some(response) = require_scope(&principal, SCOPE_ROUTES_WRITE) {
+                    return response;
+                }
+                self.delete_database_route(path).await
+            }
             (Method::GET, "/v1/certs") => json_response(
                 StatusCode::OK,
                 json!({
@@ -896,6 +926,87 @@ impl ApiServer {
             }
             _ => json_response(StatusCode::NOT_FOUND, json!({"error": "not found"})),
         }
+    }
+
+    fn list_database_routes(&self) -> Response<BoxBody> {
+        let Some(registry) = &self.database_routes else {
+            return json_response(
+                StatusCode::SERVICE_UNAVAILABLE,
+                json!({"error": "database proxy is not configured"}),
+            );
+        };
+        json_response(StatusCode::OK, json!({ "routes": registry.list() }))
+    }
+
+    async fn upsert_database_route(&self, req: Request<Incoming>) -> Response<BoxBody> {
+        let Some(registry) = &self.database_routes else {
+            return json_response(
+                StatusCode::SERVICE_UNAVAILABLE,
+                json!({"error": "database proxy is not configured"}),
+            );
+        };
+        let collected = match collect_admin_body(req.into_body()).await {
+            Ok(collected) => collected,
+            Err(ApiBodyError::TooLarge) => {
+                return json_response(
+                    StatusCode::PAYLOAD_TOO_LARGE,
+                    json!({"error": "request body is too large"}),
+                );
+            }
+            Err(ApiBodyError::Body(error)) => {
+                return json_response(StatusCode::BAD_REQUEST, json!({"error": error}));
+            }
+        };
+        let body = match serde_json::from_slice::<DatabaseRouteBody>(&collected) {
+            Ok(body) => body,
+            Err(error) => {
+                return json_response(StatusCode::BAD_REQUEST, json!({"error": error.to_string()}));
+            }
+        };
+        if body.database_type.trim().is_empty()
+            || body.key.trim().is_empty()
+            || body.upstream.trim().is_empty()
+        {
+            return json_response(
+                StatusCode::BAD_REQUEST,
+                json!({"error": "database_type, key, and upstream are required"}),
+            );
+        }
+
+        let route = DatabaseProxyRoute {
+            database_type: body.database_type,
+            key: body.key,
+            upstream: body.upstream,
+        };
+        registry.upsert(route.clone());
+        json_response(
+            StatusCode::OK,
+            json!({ "status": "upserted", "route": route }),
+        )
+    }
+
+    async fn delete_database_route(&self, path: &str) -> Response<BoxBody> {
+        let Some(registry) = &self.database_routes else {
+            return json_response(
+                StatusCode::SERVICE_UNAVAILABLE,
+                json!({"error": "database proxy is not configured"}),
+            );
+        };
+        let parts = path
+            .trim_start_matches("/v1/database-routes/")
+            .split('/')
+            .collect::<Vec<_>>();
+        if parts.len() != 2 || parts[0].is_empty() || parts[1].is_empty() {
+            return json_response(
+                StatusCode::BAD_REQUEST,
+                json!({"error": "expected /v1/database-routes/{type}/{key}"}),
+            );
+        }
+        let deleted = registry.delete(parts[0], parts[1]);
+        json_response(
+            StatusCode::OK,
+            json!({"status": if deleted { "deleted" } else { "not_found" }}),
+        )
     }
 
     async fn create_domain(&self, req: Request<Incoming>) -> Response<BoxBody> {

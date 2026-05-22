@@ -12,6 +12,7 @@ pxxl-api = { path = "crates/api" }
 pxxl-common = { path = "crates/common" }
 pxxl-config = { path = "crates/config" }
 pxxl-core = { path = "crates/core" }
+pxxl-database-proxy = { path = "crates/database-proxy" }
 pxxl-ddos = { path = "crates/ddos" }
 pxxl-docker-discovery = { path = "crates/docker-discovery" }
 pxxl-geo = { path = "crates/geo" }
