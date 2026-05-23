@@ -51,7 +51,7 @@ services:
       - clickhouse
 
   redis:
-    image: redis:7-alpine
+    image: docker.io/library/redis:7-alpine
     container_name: pxxl-proxy-redis
     restart: unless-stopped
     command: redis-server --appendonly yes
@@ -59,7 +59,7 @@ services:
       - ./data/redis:/data
 
   postgres:
-    image: postgres:16-alpine
+    image: docker.io/library/postgres:16-alpine
     container_name: pxxl-proxy-postgres
     restart: unless-stopped
     environment:
@@ -70,7 +70,7 @@ services:
       - ./data/postgres:/var/lib/postgresql/data
 
   clickhouse:
-    image: clickhouse/clickhouse-server:24.8
+    image: docker.io/clickhouse/clickhouse-server:24.8
     container_name: pxxl-proxy-clickhouse
     restart: unless-stopped
     environment:
@@ -82,7 +82,7 @@ services:
       - ./data/clickhouse:/var/lib/clickhouse
 
   prometheus:
-    image: prom/prometheus:v2.55.0
+    image: docker.io/prom/prometheus:v2.55.0
     container_name: pxxl-proxy-prometheus
     restart: unless-stopped
     ports:
@@ -94,7 +94,7 @@ services:
       - edge
 
   loki:
-    image: grafana/loki:3.2.0
+    image: docker.io/grafana/loki:3.2.0
     container_name: pxxl-proxy-loki
     restart: unless-stopped
     command: -config.file=/etc/loki/local-config.yaml
@@ -103,7 +103,7 @@ services:
       - ./data/loki:/loki
 
   promtail:
-    image: grafana/promtail:3.2.0
+    image: docker.io/grafana/promtail:3.2.0
     container_name: pxxl-proxy-promtail
     profiles:
       - runtime-discovery
@@ -116,7 +116,7 @@ services:
       - loki
 
   grafana:
-    image: grafana/grafana:11.2.0
+    image: docker.io/grafana/grafana:11.2.0
     container_name: pxxl-proxy-grafana
     restart: unless-stopped
     environment:
