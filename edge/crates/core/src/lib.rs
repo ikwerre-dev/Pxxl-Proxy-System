@@ -363,6 +363,8 @@ struct DomainStatsCounters {
     responses_4xx: AtomicU64,
     responses_5xx: AtomicU64,
     total_latency_ms: AtomicU64,
+    total_bytes_sent: AtomicU64,
+    total_bytes_received: AtomicU64,
     last_status: AtomicU64,
     last_seen_unix_ms: AtomicU64,
     recent_visits: Mutex<VecDeque<VisitSnapshot>>,
@@ -377,6 +379,10 @@ impl DomainStatsCounters {
         self.requests_total.fetch_add(1, Ordering::Relaxed);
         self.total_latency_ms
             .fetch_add(event.latency_ms, Ordering::Relaxed);
+        self.total_bytes_sent
+            .fetch_add(event.bytes_sent, Ordering::Relaxed);
+        self.total_bytes_received
+            .fetch_add(event.bytes_received, Ordering::Relaxed);
         self.last_status
             .store(event.status as u64, Ordering::Relaxed);
         let timestamp_unix_ms = event.timestamp_unix_ms;
@@ -417,6 +423,8 @@ impl DomainStatsCounters {
             remote_ip: event.remote_ip.map(|ip| ip.to_string()),
             location: event.location,
             timestamp_unix_ms,
+            bytes_sent: event.bytes_sent,
+            bytes_received: event.bytes_received,
         };
 
         let mut recent = self.recent_visits.lock();
@@ -434,6 +442,8 @@ impl DomainStatsCounters {
         } else {
             total_latency_ms as f64 / requests_total as f64
         };
+        let total_bytes_sent = self.total_bytes_sent.load(Ordering::Relaxed);
+        let total_bytes_received = self.total_bytes_received.load(Ordering::Relaxed);
 
         DomainStatsSnapshot {
             domain: domain.to_string(),
@@ -443,6 +453,9 @@ impl DomainStatsCounters {
             responses_4xx: self.responses_4xx.load(Ordering::Relaxed),
             responses_5xx: self.responses_5xx.load(Ordering::Relaxed),
             average_latency_ms,
+            total_bytes_sent,
+            total_bytes_received,
+            total_bandwidth: total_bytes_sent + total_bytes_received,
             last_status: nonzero_u16(self.last_status.load(Ordering::Relaxed)),
             last_seen_unix_ms: nonzero_u64(self.last_seen_unix_ms.load(Ordering::Relaxed)),
             top_countries: top_location_counts(&self.country_counts, 10),
@@ -484,6 +497,8 @@ pub struct RequestObservation {
     pub remote_ip: Option<IpAddr>,
     pub location: GeoLocation,
     pub timestamp_unix_ms: u64,
+    pub bytes_sent: u64,
+    pub bytes_received: u64,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -495,6 +510,9 @@ pub struct DomainStatsSnapshot {
     pub responses_4xx: u64,
     pub responses_5xx: u64,
     pub average_latency_ms: f64,
+    pub total_bytes_sent: u64,
+    pub total_bytes_received: u64,
+    pub total_bandwidth: u64,
     pub last_status: Option<u16>,
     pub last_seen_unix_ms: Option<u64>,
     pub top_countries: Vec<LocationCount>,
@@ -515,6 +533,8 @@ pub struct VisitSnapshot {
     pub remote_ip: Option<String>,
     pub location: GeoLocation,
     pub timestamp_unix_ms: u64,
+    pub bytes_sent: u64,
+    pub bytes_received: u64,
 }
 
 #[derive(Debug, Clone, Serialize)]

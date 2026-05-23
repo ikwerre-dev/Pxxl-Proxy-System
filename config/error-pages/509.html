@@ -1,0 +1,179 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>509 Bandwidth Limit Exceeded</title>
+    <style>
+        * {
+            margin: 0;
+            padding: 0;
+            box-sizing: border-box;
+        }
+        body {
+            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Oxygen, Ubuntu, Cantarell, sans-serif;
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            min-height: 100vh;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            padding: 20px;
+        }
+        .container {
+            background: white;
+            border-radius: 16px;
+            box-shadow: 0 20px 60px rgba(0, 0, 0, 0.3);
+            max-width: 600px;
+            width: 100%;
+            padding: 48px;
+            text-align: center;
+        }
+        .error-code {
+            font-size: 72px;
+            font-weight: 800;
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            -webkit-background-clip: text;
+            -webkit-text-fill-color: transparent;
+            background-clip: text;
+            margin-bottom: 16px;
+        }
+        h1 {
+            font-size: 28px;
+            color: #1a202c;
+            margin-bottom: 16px;
+            font-weight: 700;
+        }
+        .domain {
+            font-size: 18px;
+            color: #4a5568;
+            margin-bottom: 24px;
+            font-weight: 600;
+            word-break: break-all;
+        }
+        .message {
+            font-size: 16px;
+            color: #718096;
+            line-height: 1.6;
+            margin-bottom: 32px;
+        }
+        .stats {
+            background: #f7fafc;
+            border-radius: 12px;
+            padding: 24px;
+            margin-bottom: 32px;
+        }
+        .stat-row {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            padding: 12px 0;
+            border-bottom: 1px solid #e2e8f0;
+        }
+        .stat-row:last-child {
+            border-bottom: none;
+        }
+        .stat-label {
+            font-size: 14px;
+            color: #718096;
+            font-weight: 500;
+        }
+        .stat-value {
+            font-size: 16px;
+            color: #2d3748;
+            font-weight: 700;
+        }
+        .progress-bar {
+            width: 100%;
+            height: 12px;
+            background: #e2e8f0;
+            border-radius: 6px;
+            overflow: hidden;
+            margin: 16px 0;
+        }
+        .progress-fill {
+            height: 100%;
+            background: linear-gradient(90deg, #f56565 0%, #c53030 100%);
+            transition: width 0.3s ease;
+        }
+        .reset-info {
+            background: #fff5f5;
+            border-left: 4px solid #f56565;
+            padding: 16px;
+            border-radius: 8px;
+            text-align: left;
+            margin-bottom: 24px;
+        }
+        .reset-info strong {
+            color: #c53030;
+            display: block;
+            margin-bottom: 8px;
+            font-size: 14px;
+        }
+        .reset-info p {
+            color: #742a2a;
+            font-size: 14px;
+            line-height: 1.5;
+        }
+        .footer {
+            font-size: 14px;
+            color: #a0aec0;
+            margin-top: 24px;
+        }
+        .icon {
+            font-size: 64px;
+            margin-bottom: 24px;
+        }
+        @media (max-width: 640px) {
+            .container {
+                padding: 32px 24px;
+            }
+            .error-code {
+                font-size: 56px;
+            }
+            h1 {
+                font-size: 24px;
+            }
+        }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <div class="icon">📊</div>
+        <div class="error-code">509</div>
+        <h1>Bandwidth Limit Exceeded</h1>
+        <div class="domain">{{domain}}</div>
+        
+        <div class="message">
+            <p>The domain has exceeded its allocated bandwidth limit for this billing period. Please upgrade your plan or wait for the limit to reset.</p>
+        </div>
+
+        <div class="stats">
+            <div class="stat-row">
+                <span class="stat-label">Bandwidth Used</span>
+                <span class="stat-value">{{bytes_used}}</span>
+            </div>
+            <div class="stat-row">
+                <span class="stat-label">Bandwidth Limit</span>
+                <span class="stat-value">{{bytes_limit}}</span>
+            </div>
+            <div class="stat-row">
+                <span class="stat-label">Usage Percentage</span>
+                <span class="stat-value">{{percentage_used}}%</span>
+            </div>
+        </div>
+
+        <div class="progress-bar">
+            <div class="progress-fill" style="width: {{percentage_used}}%"></div>
+        </div>
+
+        <div class="reset-info">
+            <strong>⏰ Limit Reset Date</strong>
+            <p>Your bandwidth limit will reset on <strong>{{reset_date}}</strong></p>
+        </div>
+
+        <div class="footer">
+            <p>Powered by Pxxl Proxy • Request ID: {{request_id}}</p>
+        </div>
+    </div>
+</body>
+</html>

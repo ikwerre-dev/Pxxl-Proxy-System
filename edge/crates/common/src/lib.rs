@@ -24,6 +24,13 @@ pub enum PxxlError {
     InvalidHost,
     #[error("invalid request path: {0}")]
     InvalidPath(String),
+    #[error("bandwidth limit exceeded for domain {domain}: used {used} bytes, limit {limit} bytes")]
+    BandwidthLimitExceeded {
+        domain: String,
+        used: u64,
+        limit: u64,
+        reset_date: String,
+    },
 }
 
 pub type Result<T> = std::result::Result<T, PxxlError>;
@@ -282,6 +289,60 @@ pub struct DomainRules {
     pub udp: UdpRoutingConfig,
     #[serde(default)]
     pub http3: Http3Config,
+    #[serde(default)]
+    pub bandwidth_limit: Option<BandwidthLimit>,
+    #[serde(default)]
+    pub proxy_mode: ProxyMode,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct BandwidthLimit {
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+    #[serde(default)]
+    pub max_bytes_per_month: Option<u64>,
+    #[serde(default)]
+    pub max_bytes_per_day: Option<u64>,
+    #[serde(default = "default_reset_day")]
+    pub reset_day_of_month: u8,
+    #[serde(default)]
+    pub exceeded_error_page: Option<String>,
+    #[serde(default)]
+    pub exceeded_status_code: Option<u16>,
+}
+
+impl Default for BandwidthLimit {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            max_bytes_per_month: None,
+            max_bytes_per_day: None,
+            reset_day_of_month: default_reset_day(),
+            exceeded_error_page: None,
+            exceeded_status_code: Some(509),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum ProxyMode {
+    Direct,
+    External {
+        proxy_url: String,
+        #[serde(default)]
+        max_connections: Option<u32>,
+        #[serde(default)]
+        auth_token: Option<String>,
+        #[serde(default = "default_true")]
+        forward_client_ip: bool,
+    },
+}
+
+impl Default for ProxyMode {
+    fn default() -> Self {
+        Self::Direct
+    }
 }
 
 impl Default for DomainRules {
@@ -340,6 +401,8 @@ impl Default for DomainRules {
             tcp: TcpRoutingConfig::default(),
             udp: UdpRoutingConfig::default(),
             http3: Http3Config::default(),
+            bandwidth_limit: None,
+            proxy_mode: ProxyMode::default(),
         }
     }
 }
@@ -1347,6 +1410,10 @@ fn default_mirror_percent() -> u8 {
 
 fn default_client_cert_header() -> String {
     "x-forwarded-tls-client-cert".to_string()
+}
+
+fn default_reset_day() -> u8 {
+    1
 }
 
 fn deserialize_ip_nets<'de, D>(deserializer: D) -> std::result::Result<Vec<IpNet>, D::Error>

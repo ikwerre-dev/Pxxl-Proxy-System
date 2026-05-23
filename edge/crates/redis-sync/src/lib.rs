@@ -1,4 +1,5 @@
 use anyhow::Result;
+use chrono::{Datelike, Utc};
 use futures_util::StreamExt;
 use pxxl_common::{normalize_domain, Route, RouteSource, MAX_ROUTES_PER_SOURCE};
 use pxxl_ddos::{BlacklistCommand, BlacklistEngine};
@@ -341,4 +342,92 @@ fn now_unix_ms() -> u64 {
         .duration_since(UNIX_EPOCH)
         .map(|duration| duration.as_millis() as u64)
         .unwrap_or_default()
+}
+
+#[derive(Debug, Clone)]
+pub struct RedisBandwidthTracker {
+    url: String,
+    key_prefix: String,
+}
+
+impl RedisBandwidthTracker {
+    pub fn new(url: impl Into<String>) -> Self {
+        Self {
+            url: url.into(),
+            key_prefix: "pxxl:bandwidth".to_string(),
+        }
+    }
+
+    fn get_monthly_key(&self, domain: &str) -> String {
+        let now = Utc::now();
+        format!(
+            "{}:{}:{}-{:02}",
+            self.key_prefix,
+            domain,
+            now.year(),
+            now.month()
+        )
+    }
+
+    fn get_daily_key(&self, domain: &str) -> String {
+        let now = Utc::now();
+        format!(
+            "{}:{}:{}-{:02}-{:02}",
+            self.key_prefix,
+            domain,
+            now.year(),
+            now.month(),
+            now.day()
+        )
+    }
+
+    pub async fn record_bandwidth(&self, domain: &str, bytes: u64) -> Result<()> {
+        let client = redis::Client::open(self.url.as_str())?;
+        let mut connection = client.get_multiplexed_async_connection().await?;
+
+        let monthly_key = self.get_monthly_key(domain);
+        let daily_key = self.get_daily_key(domain);
+
+        let _: u64 = connection.incr(&monthly_key, bytes).await?;
+        let _: u64 = connection.incr(&daily_key, bytes).await?;
+
+        let _: bool = connection.expire(&monthly_key, 90 * 24 * 3600).await?;
+        let _: bool = connection.expire(&daily_key, 7 * 24 * 3600).await?;
+
+        Ok(())
+    }
+
+    pub async fn get_monthly_usage(&self, domain: &str) -> Result<u64> {
+        let client = redis::Client::open(self.url.as_str())?;
+        let mut connection = client.get_multiplexed_async_connection().await?;
+        let monthly_key = self.get_monthly_key(domain);
+        let bytes: Option<u64> = connection.get(&monthly_key).await?;
+        Ok(bytes.unwrap_or(0))
+    }
+
+    pub async fn get_daily_usage(&self, domain: &str) -> Result<u64> {
+        let client = redis::Client::open(self.url.as_str())?;
+        let mut connection = client.get_multiplexed_async_connection().await?;
+        let daily_key = self.get_daily_key(domain);
+        let bytes: Option<u64> = connection.get(&daily_key).await?;
+        Ok(bytes.unwrap_or(0))
+    }
+
+    pub async fn check_limit(&self, domain: &str, monthly_limit: Option<u64>, daily_limit: Option<u64>) -> Result<bool> {
+        if let Some(limit) = monthly_limit {
+            let usage = self.get_monthly_usage(domain).await?;
+            if usage >= limit {
+                return Ok(false);
+            }
+        }
+
+        if let Some(limit) = daily_limit {
+            let usage = self.get_daily_usage(domain).await?;
+            if usage >= limit {
+                return Ok(false);
+            }
+        }
+
+        Ok(true)
+    }
 }
