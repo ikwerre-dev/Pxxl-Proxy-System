@@ -848,6 +848,60 @@ impl ApiServer {
                 }
                 self.upsert_database_route(req).await
             }
+            (Method::GET, path) if path.starts_with("/v1/domains/") && path.ends_with("/bandwidth") => {
+                if let Some(response) = require_scope(&principal, SCOPE_ANALYTICS_READ) {
+                    return response;
+                }
+                let domain = path
+                    .trim_start_matches("/v1/domains/")
+                    .trim_end_matches("/bandwidth")
+                    .trim_matches('/');
+                if domain.is_empty() {
+                    return json_response(
+                        StatusCode::BAD_REQUEST,
+                        json!({"error": "missing domain"}),
+                    );
+                }
+                self.get_bandwidth_usage(&normalize_domain(domain)).await
+            }
+            (Method::GET, path) if path.starts_with("/v1/domains/") && path.ends_with("/bandwidth/history") => {
+                if let Some(response) = require_scope(&principal, SCOPE_ANALYTICS_READ) {
+                    return response;
+                }
+                let domain = path
+                    .trim_start_matches("/v1/domains/")
+                    .trim_end_matches("/bandwidth/history")
+                    .trim_matches('/');
+                if domain.is_empty() {
+                    return json_response(
+                        StatusCode::BAD_REQUEST,
+                        json!({"error": "missing domain"}),
+                    );
+                }
+                let months = query_value(&query, "months")
+                    .and_then(|v| v.parse::<u32>().ok())
+                    .unwrap_or(6);
+                self.get_bandwidth_history(&normalize_domain(domain), months).await
+            }
+            (Method::GET, path) if path.starts_with("/v1/domains/") && path.ends_with("/bandwidth/realtime") => {
+                if let Some(response) = require_scope(&principal, SCOPE_ANALYTICS_READ) {
+                    return response;
+                }
+                let domain = path
+                    .trim_start_matches("/v1/domains/")
+                    .trim_end_matches("/bandwidth/realtime")
+                    .trim_matches('/');
+                if domain.is_empty() {
+                    return json_response(
+                        StatusCode::BAD_REQUEST,
+                        json!({"error": "missing domain"}),
+                    );
+                }
+                let hours = query_value(&query, "hours")
+                    .and_then(|v| v.parse::<u32>().ok())
+                    .unwrap_or(24);
+                self.get_bandwidth_realtime(&normalize_domain(domain), hours).await
+            }
             (Method::DELETE, path) if path.starts_with("/v1/database-routes/") => {
                 if let Some(response) = require_scope(&principal, SCOPE_ROUTES_WRITE) {
                     return response;
@@ -1647,6 +1701,92 @@ async fn collect_admin_body(mut body: Incoming) -> Result<Bytes, ApiBodyError> {
         }
     }
     Ok(collected.freeze())
+}
+
+impl ApiServer {
+    async fn get_bandwidth_usage(&self, domain: &str) -> Response<BoxBody> {
+        // Get current month bandwidth from in-memory stats
+        let stats = self.state.stats.snapshot_domain(domain);
+        
+        if let Some(stats) = stats {
+            json_response(
+                StatusCode::OK,
+                json!({
+                    "domain": domain,
+                    "current_month": chrono::Utc::now().format("%Y-%m").to_string(),
+                    "bytes_sent": stats.total_bytes_sent,
+                    "bytes_received": stats.total_bytes_received,
+                    "total_bandwidth": stats.total_bandwidth,
+                    "requests": stats.requests_total,
+                }),
+            )
+        } else {
+            json_response(
+                StatusCode::OK,
+                json!({
+                    "domain": domain,
+                    "current_month": chrono::Utc::now().format("%Y-%m").to_string(),
+                    "bytes_sent": 0,
+                    "bytes_received": 0,
+                    "total_bandwidth": 0,
+                    "requests": 0,
+                }),
+            )
+        }
+    }
+
+    async fn get_bandwidth_history(&self, domain: &str, _months: u32) -> Response<BoxBody> {
+        // For now, return current month data from in-memory stats
+        // In production, this would query ClickHouse for historical data
+        let stats = self.state.stats.snapshot_domain(domain);
+        
+        let history = if let Some(stats) = stats {
+            vec![json!({
+                "month": chrono::Utc::now().format("%Y-%m").to_string(),
+                "bytes_sent": stats.total_bytes_sent,
+                "bytes_received": stats.total_bytes_received,
+                "total_bandwidth": stats.total_bandwidth,
+                "requests": stats.requests_total,
+            })]
+        } else {
+            vec![]
+        };
+
+        json_response(
+            StatusCode::OK,
+            json!({
+                "domain": domain,
+                "history": history,
+            }),
+        )
+    }
+
+    async fn get_bandwidth_realtime(&self, domain: &str, _hours: u32) -> Response<BoxBody> {
+        // Return current stats from in-memory
+        // In production, this would query ClickHouse for hourly aggregates
+        let stats = self.state.stats.snapshot_domain(domain);
+        
+        let data = if let Some(stats) = stats {
+            vec![json!({
+                "timestamp": chrono::Utc::now().to_rfc3339(),
+                "bytes_sent": stats.total_bytes_sent,
+                "bytes_received": stats.total_bytes_received,
+                "total_bandwidth": stats.total_bandwidth,
+                "requests": stats.requests_total,
+            })]
+        } else {
+            vec![]
+        };
+
+        json_response(
+            StatusCode::OK,
+            json!({
+                "domain": domain,
+                "interval": "hourly",
+                "data": data,
+            }),
+        )
+    }
 }
 
 fn constant_time_eq(left: &[u8], right: &[u8]) -> bool {

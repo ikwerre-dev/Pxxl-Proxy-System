@@ -28,6 +28,7 @@ use pxxl_common::{
     PassiveHealthConfig, PxxlError, RateLimitScope, RetryConfig, RouteMatch, RouteSource,
     StickySessionConfig, TrafficMirrorConfig, TrafficSplitRule, Upstream,
 };
+use pxxl_redis_sync::RedisBandwidthTracker;
 use pxxl_core::{EdgeState, RequestObservation};
 use pxxl_ddos::SecurityDecision;
 use pxxl_geo::GeoIpResolver;
@@ -184,6 +185,57 @@ impl ErrorPageRenderer {
                 render_error_template(template.body.as_ref(), status, message, domain, path)
             })
             .unwrap_or_else(|| default_error_html(status, message, domain, path));
+
+        html_response(status, body)
+    }
+
+    pub fn bandwidth_exceeded_response(
+        &self,
+        status: StatusCode,
+        domain: &str,
+        path: &str,
+        request_id: &str,
+        bytes_used: u64,
+        bytes_limit: u64,
+        reset_day: u8,
+    ) -> Response<BoxBody> {
+        let percentage = if bytes_limit > 0 {
+            ((bytes_used as f64 / bytes_limit as f64) * 100.0).min(100.0)
+        } else {
+            100.0
+        };
+
+        let reset_date = bandwidth_reset_date(reset_day);
+
+        let body = if let Some(template) = self.pages.get(&status.as_u16()).or(self.default_page.as_ref()) {
+            template.body
+                .replace("{{domain}}", domain)
+                .replace("{{bytes_used}}", &format_bytes(bytes_used))
+                .replace("{{bytes_limit}}", &format_bytes(bytes_limit))
+                .replace("{{percentage_used}}", &format!("{:.1}", percentage))
+                .replace("{{reset_date}}", &reset_date)
+                .replace("{{request_id}}", request_id)
+                .replace("{{status_code}}", &status.as_u16().to_string())
+                .replace("{{status_text}}", status.canonical_reason().unwrap_or("Bandwidth Limit Exceeded"))
+                .replace("{{message}}", "Bandwidth limit exceeded")
+                .replace("{{path}}", path)
+        } else {
+            format!(
+                r#"<!DOCTYPE html><html><head><title>509 Bandwidth Limit Exceeded</title></head>
+<body><h1>509 Bandwidth Limit Exceeded</h1>
+<p>Domain <strong>{domain}</strong> has exceeded its bandwidth limit.</p>
+<p>Used: {used} / Limit: {limit} ({pct:.1}%)</p>
+<p>Resets: {reset}</p>
+<p>Request ID: {rid}</p>
+</body></html>"#,
+                domain = domain,
+                used = format_bytes(bytes_used),
+                limit = format_bytes(bytes_limit),
+                pct = percentage,
+                reset = reset_date,
+                rid = request_id,
+            )
+        };
 
         html_response(status, body)
     }
@@ -1030,6 +1082,7 @@ pub struct ProxyServer {
     error_pages: ErrorPageRenderer,
     policy: PolicyEnforcer,
     geoip: GeoIpResolver,
+    bandwidth_tracker: Option<Arc<RedisBandwidthTracker>>,
 }
 
 impl ProxyServer {
@@ -1073,7 +1126,13 @@ impl ProxyServer {
             error_pages,
             policy,
             geoip,
+            bandwidth_tracker: None,
         }
+    }
+
+    pub fn with_bandwidth_tracker(mut self, tracker: Arc<RedisBandwidthTracker>) -> Self {
+        self.bandwidth_tracker = Some(tracker);
+        self
     }
 
     pub async fn handle(
@@ -1115,7 +1174,7 @@ impl ProxyServer {
                     location: &unknown_location,
                     timestamp_unix_ms: now_unix_ms(),
                 };
-                self.observe_request(&context, StatusCode::BAD_REQUEST, started, None);
+                self.observe_request(&context, StatusCode::BAD_REQUEST, started, None, 0, 0);
                 finish_response!(self.error_response(
                     StatusCode::BAD_REQUEST,
                     "invalid request path",
@@ -1145,7 +1204,7 @@ impl ProxyServer {
                     location: &location,
                     timestamp_unix_ms,
                 };
-                self.observe_request(&context, StatusCode::BAD_REQUEST, started, None);
+                self.observe_request(&context, StatusCode::BAD_REQUEST, started, None, 0, 0);
                 finish_response!(self.error_response(
                     StatusCode::BAD_REQUEST,
                     "missing host header",
@@ -1175,7 +1234,7 @@ impl ProxyServer {
                         .blocked_total
                         .with_label_values(&[&domain, &reason])
                         .inc();
-                    self.observe_request(&context, StatusCode::FORBIDDEN, started, None);
+                    self.observe_request(&context, StatusCode::FORBIDDEN, started, None, 0, 0);
                     finish_response!(self.error_response(
                         StatusCode::FORBIDDEN,
                         "request blocked",
@@ -1189,7 +1248,7 @@ impl ProxyServer {
                         .rate_limited_total
                         .with_label_values(&[&domain])
                         .inc();
-                    self.observe_request(&context, StatusCode::TOO_MANY_REQUESTS, started, None);
+                    self.observe_request(&context, StatusCode::TOO_MANY_REQUESTS, started, None, 0, 0);
                     let mut response = self.error_response(
                         StatusCode::TOO_MANY_REQUESTS,
                         "rate limited",
@@ -1209,7 +1268,7 @@ impl ProxyServer {
         let matched = match self.state.routes.find(&host, &path) {
             Some(matched) => matched,
             None => {
-                self.observe_request(&context, StatusCode::NOT_FOUND, started, None);
+                self.observe_request(&context, StatusCode::NOT_FOUND, started, None, 0, 0);
                 finish_response!(self.error_response(
                     StatusCode::NOT_FOUND,
                     "no route matched this host/path",
@@ -1236,7 +1295,7 @@ impl ProxyServer {
                     .inc();
             }
 
-            self.observe_request(&context, rejection.status, started, None);
+            self.observe_request(&context, rejection.status, started, None, 0, 0);
             let mut response = if rejection.status == StatusCode::NO_CONTENT {
                 response_with_body(rejection.status, "text/plain; charset=utf-8", String::new())
             } else {
@@ -1265,6 +1324,44 @@ impl ProxyServer {
             EffectiveMiddleware::from_rules(&matched.route.rules, &matched.path.middlewares);
         let mut edge_authorization_consumed = false;
 
+        // Bandwidth limit check — async Redis lookup, non-blocking to hot path
+        if let Some(limit_config) = &matched.route.rules.bandwidth_limit {
+            if limit_config.enabled {
+                if let Some(tracker) = &self.bandwidth_tracker {
+                    let within_limit = tracker
+                        .check_limit(
+                            &domain,
+                            limit_config.max_bytes_per_month,
+                            limit_config.max_bytes_per_day,
+                        )
+                        .await
+                        .unwrap_or(true); // fail open: if Redis is down, allow the request
+                    if !within_limit {
+                        let monthly_used = tracker.get_monthly_usage(&domain).await.unwrap_or(0);
+                        let limit_bytes = limit_config
+                            .max_bytes_per_month
+                            .or(limit_config.max_bytes_per_day)
+                            .unwrap_or(0);
+                        let status_code = limit_config.exceeded_status_code.unwrap_or(509);
+                        let status = StatusCode::from_u16(status_code)
+                            .unwrap_or(StatusCode::BANDWIDTH_LIMIT_EXCEEDED);
+                        self.observe_request(&context, status, started, None, 0, 0);
+                        let mut response = self.error_pages.bandwidth_exceeded_response(
+                            status,
+                            &domain,
+                            &path,
+                            &request_id,
+                            monthly_used,
+                            limit_bytes,
+                            limit_config.reset_day_of_month,
+                        );
+                        attach_request_id_header(response.headers_mut(), &request_id);
+                        return response;
+                    }
+                }
+            }
+        }
+
         if let Some(basic_auth) = &middleware.basic_auth {
             if let Some(response) = self.evaluate_basic_auth(&req, basic_auth, &domain, &path) {
                 self.state
@@ -1272,7 +1369,7 @@ impl ProxyServer {
                     .middleware_executions_total
                     .with_label_values(&[&domain, "basic_auth", "rejected"])
                     .inc();
-                self.observe_request(&context, response.status(), started, None);
+                self.observe_request(&context, response.status(), started, None, 0, 0);
                 finish_response!(response);
             }
             self.state
@@ -1290,7 +1387,7 @@ impl ProxyServer {
                     .middleware_executions_total
                     .with_label_values(&[&domain, "digest_auth", "rejected"])
                     .inc();
-                self.observe_request(&context, response.status(), started, None);
+                self.observe_request(&context, response.status(), started, None, 0, 0);
                 finish_response!(response);
             }
             self.state
@@ -1318,7 +1415,7 @@ impl ProxyServer {
                         .middleware_executions_total
                         .with_label_values(&[&domain, "forward_auth", "rejected"])
                         .inc();
-                    self.observe_request(&context, StatusCode::UNAUTHORIZED, started, None);
+                    self.observe_request(&context, StatusCode::UNAUTHORIZED, started, None, 0, 0);
                     finish_response!(self.error_response(
                         StatusCode::UNAUTHORIZED,
                         "forward auth denied the request",
@@ -1333,7 +1430,7 @@ impl ProxyServer {
                         .middleware_executions_total
                         .with_label_values(&[&domain, "forward_auth", "error"])
                         .inc();
-                    self.observe_request(&context, StatusCode::BAD_GATEWAY, started, None);
+                    self.observe_request(&context, StatusCode::BAD_GATEWAY, started, None, 0, 0);
                     finish_response!(self.error_response(
                         StatusCode::BAD_GATEWAY,
                         "forward auth request failed",
@@ -1376,7 +1473,7 @@ impl ProxyServer {
             ) {
                 Some(upstream) => upstream,
                 None => {
-                    self.observe_request(&context, StatusCode::SERVICE_UNAVAILABLE, started, None);
+                    self.observe_request(&context, StatusCode::SERVICE_UNAVAILABLE, started, None, 0, 0);
                     finish_response!(self.error_response(
                         StatusCode::SERVICE_UNAVAILABLE,
                         "no healthy upstreams",
@@ -1398,7 +1495,7 @@ impl ProxyServer {
                         .in_flight_limited_total
                         .with_label_values(&[&domain, scope])
                         .inc();
-                    self.observe_request(&context, StatusCode::TOO_MANY_REQUESTS, started, None);
+                    self.observe_request(&context, StatusCode::TOO_MANY_REQUESTS, started, None, 0, 0);
                     finish_response!(self.error_response(
                         StatusCode::TOO_MANY_REQUESTS,
                         "too many in-flight requests",
@@ -1421,6 +1518,9 @@ impl ProxyServer {
                     &upstream.url,
                 ])
                 .inc();
+
+            // Capture request content-length before req is moved into forward_streaming
+            let req_content_length = content_length(req.headers()).unwrap_or(0);
 
             match self
                 .forward_streaming(
@@ -1485,7 +1585,9 @@ impl ProxyServer {
                         &upstream,
                     );
                     strip_hop_by_hop_response_headers(response.headers_mut());
-                    self.observe_request(&context, status, started, Some(&upstream.url));
+                    let stream_bytes_sent = req_content_length;
+                    let stream_bytes_received = content_length(response.headers()).unwrap_or(0);
+                    self.observe_request(&context, status, started, Some(&upstream.url), stream_bytes_sent, stream_bytes_received);
                     self.state
                         .metrics
                         .upstream_latency_seconds
@@ -1555,6 +1657,8 @@ impl ProxyServer {
                         StatusCode::BAD_GATEWAY,
                         started,
                         Some(&upstream.url),
+                        0,
+                        0,
                     );
                     finish_response!(self.error_response(
                         StatusCode::BAD_GATEWAY,
@@ -1580,7 +1684,7 @@ impl ProxyServer {
                 request
             }
             Err(BufferError::TooLarge) => {
-                self.observe_request(&context, StatusCode::PAYLOAD_TOO_LARGE, started, None);
+                self.observe_request(&context, StatusCode::PAYLOAD_TOO_LARGE, started, None, 0, 0);
                 finish_response!(self.error_response(
                     StatusCode::PAYLOAD_TOO_LARGE,
                     "request body is too large",
@@ -1590,7 +1694,7 @@ impl ProxyServer {
             }
             Err(BufferError::Body(error)) => {
                 warn!(%error, request_id = %request_id, domain = %domain, "failed to buffer request body");
-                self.observe_request(&context, StatusCode::BAD_REQUEST, started, None);
+                self.observe_request(&context, StatusCode::BAD_REQUEST, started, None, 0, 0);
                 finish_response!(self.error_response(
                     StatusCode::BAD_REQUEST,
                     "failed to read request body",
@@ -1622,7 +1726,7 @@ impl ProxyServer {
         ) {
             Some(upstream) => upstream,
             None => {
-                self.observe_request(&context, StatusCode::SERVICE_UNAVAILABLE, started, None);
+                self.observe_request(&context, StatusCode::SERVICE_UNAVAILABLE, started, None, 0, 0);
                 finish_response!(self.error_response(
                     StatusCode::SERVICE_UNAVAILABLE,
                     "no healthy upstreams",
@@ -1644,7 +1748,7 @@ impl ProxyServer {
                     .in_flight_limited_total
                     .with_label_values(&[&domain, scope])
                     .inc();
-                self.observe_request(&context, StatusCode::TOO_MANY_REQUESTS, started, None);
+                self.observe_request(&context, StatusCode::TOO_MANY_REQUESTS, started, None, 0, 0);
                 finish_response!(self.error_response(
                     StatusCode::TOO_MANY_REQUESTS,
                     "too many in-flight requests",
@@ -1734,7 +1838,7 @@ impl ProxyServer {
                     &middleware.sticky_sessions,
                     &upstream,
                 );
-                self.observe_request(&context, status, started, Some(&upstream.url));
+                self.observe_request(&context, status, started, Some(&upstream.url), buffered_request.body.len() as u64, response.body.len() as u64);
                 self.state
                     .metrics
                     .upstream_latency_seconds
@@ -1804,6 +1908,8 @@ impl ProxyServer {
                     StatusCode::BAD_GATEWAY,
                     started,
                     Some(&upstream.url),
+                    0,
+                    0,
                 );
                 finish_response!(self.error_response(
                     StatusCode::BAD_GATEWAY,
@@ -2009,6 +2115,8 @@ impl ProxyServer {
         status: StatusCode,
         started: Instant,
         upstream: Option<&str>,
+        bytes_sent: u64,
+        bytes_received: u64,
     ) {
         self.state
             .metrics
@@ -2026,6 +2134,8 @@ impl ProxyServer {
             remote_ip: context.remote_ip,
             location: context.location.clone(),
             timestamp_unix_ms: context.timestamp_unix_ms,
+            bytes_sent,
+            bytes_received,
         });
     }
 
@@ -3654,6 +3764,41 @@ fn boxed_full(body: Bytes) -> BoxBody {
 
 fn default_error_html(status: StatusCode, message: &str, domain: &str, path: &str) -> String {
     render_error_template(DEFAULT_ERROR_TEMPLATE, status, message, domain, path)
+}
+
+fn format_bytes(bytes: u64) -> String {
+    const KB: u64 = 1024;
+    const MB: u64 = KB * 1024;
+    const GB: u64 = MB * 1024;
+    const TB: u64 = GB * 1024;
+    if bytes >= TB {
+        format!("{:.2} TB", bytes as f64 / TB as f64)
+    } else if bytes >= GB {
+        format!("{:.2} GB", bytes as f64 / GB as f64)
+    } else if bytes >= MB {
+        format!("{:.2} MB", bytes as f64 / MB as f64)
+    } else if bytes >= KB {
+        format!("{:.2} KB", bytes as f64 / KB as f64)
+    } else {
+        format!("{bytes} B")
+    }
+}
+
+fn bandwidth_reset_date(reset_day: u8) -> String {
+    use std::time::{SystemTime, UNIX_EPOCH};
+    // Simple calculation: next occurrence of reset_day
+    let now_secs = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    // Approximate: 30 days from now if we can't compute exactly
+    let approx_reset = now_secs + (30 * 24 * 3600);
+    let days = approx_reset / 86400;
+    // Convert days since epoch to a rough date string
+    let year = 1970 + days / 365;
+    let month = ((days % 365) / 30) + 1;
+    let day = reset_day.min(28);
+    format!("{year}-{month:02}-{day:02}")
 }
 
 fn render_error_template(

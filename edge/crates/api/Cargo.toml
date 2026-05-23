@@ -12,6 +12,7 @@ pxxl-metrics = { path = "../metrics" }
 pxxl-redis-sync = { path = "../redis-sync" }
 anyhow = { workspace = true }
 bytes = { workspace = true }
+chrono = { workspace = true }
 http = { workspace = true }
 http-body-util = { workspace = true }
 hyper = { workspace = true }
