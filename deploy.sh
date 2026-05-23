@@ -8,10 +8,10 @@ log() { printf '[%s] %s\n' "$APP_NAME" "$*"; }
 die() { printf '[%s] ERROR: %s\n' "$APP_NAME" "$*" >&2; exit 1; }
 
 compose_cmd() {
-  if command -v podman >/dev/null 2>&1 && podman compose version >/dev/null 2>&1; then
-    printf 'podman compose'
-  elif command -v podman-compose >/dev/null 2>&1; then
+  if command -v podman-compose >/dev/null 2>&1; then
     printf 'podman-compose'
+  elif command -v podman >/dev/null 2>&1 && podman compose version >/dev/null 2>&1; then
+    printf 'podman compose'
   elif command -v docker >/dev/null 2>&1 && docker compose version >/dev/null 2>&1; then
     printf 'docker compose'
   elif command -v docker-compose >/dev/null 2>&1; then
