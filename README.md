@@ -525,7 +525,7 @@ Defaults are permissive: if a field is missing, Pxxl keeps current proxy behavio
 
 Location rules use ISO-style country codes such as `US` or `NG` and continent codes such as `NA`, `AF`, and `EU`. Allow/block checks happen before upstream selection. `traffic_splits` are evaluated first for matching country/continent constraints, then `location_routes`; the selected upstream pool uses the domain's configured load-balancing algorithm.
 
-WAF checks are substring-pattern based and intentionally lightweight: path traversal, common SQLi/XSS markers, known scanner user agents, and custom user-agent/path/query patterns.
+WAF checks are intentionally lightweight: path traversal, common SQLi/XSS markers, known scanner user agents, and custom user-agent/path/query patterns. When `waf.block_bad_bots` is enabled, Pxxl also applies bot scoring from GeoIP/ASN source, user-agent quality, short-window request rate, and path entropy/random-looking path segments.
 
 Protocol-oriented options are accepted in the route schema under `rules.tls_options`, `rules.acme`, `rules.tcp`, `rules.udp`, and `rules.http3`. Today the production runtime is still HTTP/HTTPS reverse proxying; these fields are present so configs and API clients can be built against the intended Traefik-style shape while ACME, TCP, UDP, and HTTP/3 listeners are completed.
 

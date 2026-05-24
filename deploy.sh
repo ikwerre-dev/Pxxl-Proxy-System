@@ -3,6 +3,7 @@ set -Eeuo pipefail
 
 APP_NAME="Pxxl Proxy"
 DEFAULT_BRANCH="${DEPLOY_BRANCH:-main}"
+PULL_LATEST=true
 
 log() { printf '[%s] %s\n' "$APP_NAME" "$*"; }
 die() { printf '[%s] ERROR: %s\n' "$APP_NAME" "$*" >&2; exit 1; }
@@ -12,14 +13,17 @@ compose_cmd() {
     printf 'podman-compose'
   elif command -v podman >/dev/null 2>&1 && podman compose version >/dev/null 2>&1; then
     printf 'podman compose'
-  elif command -v docker >/dev/null 2>&1 && docker compose version >/dev/null 2>&1; then
-    printf 'docker compose'
-  elif command -v docker-compose >/dev/null 2>&1; then
-    printf 'docker-compose'
   else
-    die "No compose implementation found. Install podman-compose, podman compose, or docker compose pointed at Podman."
+    die "No Podman compose implementation found. Install podman-compose or podman compose."
   fi
 }
+
+for arg in "$@"; do
+  case "$arg" in
+    --no-pull) PULL_LATEST=false ;;
+    *) die "unknown argument: $arg" ;;
+  esac
+done
 
 cd "$(dirname "$0")"
 
@@ -31,11 +35,13 @@ set -a
 . ./.env
 set +a
 
-if git rev-parse --is-inside-work-tree >/dev/null 2>&1; then
+if [ "$PULL_LATEST" = true ] && git rev-parse --is-inside-work-tree >/dev/null 2>&1; then
   branch="$(git rev-parse --abbrev-ref HEAD)"
   log "Pulling latest code on ${branch:-$DEFAULT_BRANCH}"
   git fetch --prune
   git pull --ff-only origin "${branch:-$DEFAULT_BRANCH}"
+elif [ "$PULL_LATEST" = false ]; then
+  log "Skipping git pull because --no-pull was provided"
 fi
 
 COMPOSE="$(compose_cmd)"

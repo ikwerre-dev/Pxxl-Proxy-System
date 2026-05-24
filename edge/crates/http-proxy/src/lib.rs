@@ -294,6 +294,7 @@ pub struct PolicyEnforcer {
     circuit_breakers: Arc<DashMap<String, Mutex<CircuitBreakerState>>>,
     in_flight_limits: Arc<DashMap<String, AtomicUsize>>,
     passive_health: Arc<DashMap<String, Mutex<PassiveHealthState>>>,
+    bot_score_buckets: Arc<DashMap<BotScoreKey, Mutex<BotScoreBucket>>>,
     digest_secret: Arc<str>,
     digest_replays: Arc<DashMap<String, Instant>>,
 }
@@ -305,6 +306,7 @@ impl Default for PolicyEnforcer {
             circuit_breakers: Arc::new(DashMap::new()),
             in_flight_limits: Arc::new(DashMap::new()),
             passive_health: Arc::new(DashMap::new()),
+            bot_score_buckets: Arc::new(DashMap::new()),
             digest_secret: Arc::<str>::from(format!("{}:{}", Uuid::new_v4(), Uuid::new_v4())),
             digest_replays: Arc::new(DashMap::new()),
         }
@@ -328,6 +330,24 @@ struct PolicyRateKey {
 struct PolicyRateBucket {
     tokens: f64,
     last_refill: Instant,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct BotScoreKey {
+    domain: String,
+    ip: IpAddr,
+}
+
+#[derive(Debug)]
+struct BotScoreBucket {
+    window_started: Instant,
+    requests: u32,
+}
+
+#[derive(Debug)]
+struct BotAssessment {
+    score: u16,
+    reasons: Vec<&'static str>,
 }
 
 #[derive(Debug, Default)]
@@ -663,7 +683,7 @@ impl PolicyEnforcer {
             }
         }
 
-        if let Some(reason) = waf_rejection_reason(req, rules, context.path) {
+        if let Some(reason) = self.waf_rejection_reason(req, rules, context) {
             return Some(policy_rejection(
                 StatusCode::FORBIDDEN,
                 "request blocked by waf rules",
@@ -769,6 +789,189 @@ impl PolicyEnforcer {
         }
 
         None
+    }
+
+    fn waf_rejection_reason(
+        &self,
+        req: &Request<Incoming>,
+        rules: &DomainRules,
+        context: &ProxyRequestContext<'_>,
+    ) -> Option<&'static str> {
+        let waf = &rules.waf;
+        if !waf.enabled {
+            return None;
+        }
+
+        if let Some(reason) = static_waf_rejection_reason(req, rules, context.path) {
+            return Some(reason);
+        }
+
+        if waf.block_bad_bots {
+            let assessment = self.assess_bot_request(req, context);
+            if assessment.score >= 60 {
+                debug!(
+                    request_id = %context.request_id,
+                    domain = %context.domain,
+                    score = assessment.score,
+                    reasons = ?assessment.reasons,
+                    "request blocked by bot score"
+                );
+                return Some("waf_bot_score");
+            }
+        }
+
+        None
+    }
+
+    fn assess_bot_request(
+        &self,
+        req: &Request<Incoming>,
+        context: &ProxyRequestContext<'_>,
+    ) -> BotAssessment {
+        let mut score = 0u16;
+        let mut reasons = Vec::new();
+        let user_agent = req
+            .headers()
+            .get("user-agent")
+            .and_then(|value| value.to_str().ok())
+            .unwrap_or_default();
+        let user_agent_lower = user_agent.to_ascii_lowercase();
+
+        if user_agent.trim().is_empty() {
+            score += 20;
+            reasons.push("missing_user_agent");
+        } else if user_agent.len() < 8 {
+            score += 10;
+            reasons.push("short_user_agent");
+        }
+
+        if contains_any(
+            &user_agent_lower,
+            &[
+                "sqlmap",
+                "nikto",
+                "masscan",
+                "zgrab",
+                "nmap",
+                "dirbuster",
+                "gobuster",
+                "ffuf",
+                "acunetix",
+                "nessus",
+                "wpscan",
+            ],
+        ) {
+            score += 70;
+            reasons.push("scanner_user_agent");
+        } else if contains_any(
+            &user_agent_lower,
+            &[
+                "python-requests",
+                "aiohttp",
+                "httpx",
+                "libwww-perl",
+                "scrapy",
+                "go-http-client",
+                "java/",
+                "okhttp",
+                "curl",
+                "wget",
+            ],
+        ) {
+            score += 20;
+            reasons.push("automation_user_agent");
+        }
+
+        if let Some(ip) = context.remote_ip {
+            let rate_points = self.bot_rate_points(context.domain, ip);
+            if rate_points > 0 {
+                score += rate_points;
+                reasons.push("request_rate");
+            }
+        }
+
+        let entropy = shannon_entropy(context.path);
+        if context.path.len() >= 48 && entropy >= 4.25 {
+            score += 20;
+            reasons.push("path_entropy");
+        }
+        if path_has_long_random_segment(context.path) {
+            score += 20;
+            reasons.push("random_path_segment");
+        }
+
+        let source_lower = context.location.source.to_ascii_lowercase();
+        if source_lower == "unknown" {
+            score += 5;
+            reasons.push("unknown_geo");
+        }
+        if source_lower.contains("asn") {
+            score += 5;
+            reasons.push("asn_seen");
+            if contains_any(
+                &source_lower,
+                &[
+                    "hosting",
+                    "cloud",
+                    "digitalocean",
+                    "linode",
+                    "vultr",
+                    "hetzner",
+                    "ovh",
+                    "contabo",
+                    "amazon",
+                    "aws",
+                    "google",
+                    "microsoft",
+                    "azure",
+                    "leaseweb",
+                    "colo",
+                    "datacenter",
+                ],
+            ) {
+                score += 15;
+                reasons.push("hosting_asn");
+            }
+        }
+
+        BotAssessment { score, reasons }
+    }
+
+    fn bot_rate_points(&self, domain: &str, ip: IpAddr) -> u16 {
+        const BOT_WINDOW: Duration = Duration::from_secs(10);
+        const BOT_BUCKET_EVICT_AT: usize = 100_000;
+
+        if self.bot_score_buckets.len() >= BOT_BUCKET_EVICT_AT {
+            let now = Instant::now();
+            self.bot_score_buckets.retain(|_, bucket| {
+                now.duration_since(bucket.lock().window_started) <= BOT_WINDOW * 6
+            });
+        }
+
+        let key = BotScoreKey {
+            domain: domain.to_string(),
+            ip,
+        };
+        let entry = self.bot_score_buckets.entry(key).or_insert_with(|| {
+            Mutex::new(BotScoreBucket {
+                window_started: Instant::now(),
+                requests: 0,
+            })
+        });
+        let mut bucket = entry.lock();
+        let now = Instant::now();
+        if now.duration_since(bucket.window_started) > BOT_WINDOW {
+            bucket.window_started = now;
+            bucket.requests = 0;
+        }
+        bucket.requests = bucket.requests.saturating_add(1);
+
+        match bucket.requests {
+            0..=40 => 0,
+            41..=120 => 15,
+            121..=300 => 30,
+            _ => 45,
+        }
     }
 
     fn location_upstreams<'a>(
@@ -3261,7 +3464,7 @@ fn cors_origin_allowed(origin: &HeaderValue, allowed_origins: &[String]) -> bool
         .any(|allowed| allowed == "*" || allowed.eq_ignore_ascii_case(origin))
 }
 
-fn waf_rejection_reason(
+fn static_waf_rejection_reason(
     req: &Request<Incoming>,
     rules: &DomainRules,
     canonical_path: &str,
@@ -3344,6 +3547,48 @@ fn waf_rejection_reason(
     }
 
     None
+}
+
+fn shannon_entropy(value: &str) -> f64 {
+    if value.is_empty() {
+        return 0.0;
+    }
+
+    let mut counts = [0u16; 256];
+    for byte in value.bytes() {
+        counts[byte as usize] = counts[byte as usize].saturating_add(1);
+    }
+
+    let len = value.len() as f64;
+    counts
+        .into_iter()
+        .filter(|count| *count > 0)
+        .map(|count| {
+            let probability = count as f64 / len;
+            -probability * probability.log2()
+        })
+        .sum()
+}
+
+fn path_has_long_random_segment(path: &str) -> bool {
+    path.split('/')
+        .filter(|segment| segment.len() >= 20)
+        .any(|segment| {
+            let alphanumeric = segment
+                .bytes()
+                .filter(|byte| byte.is_ascii_alphanumeric())
+                .count();
+            let digit_count = segment.bytes().filter(|byte| byte.is_ascii_digit()).count();
+            let letter_count = segment
+                .bytes()
+                .filter(|byte| byte.is_ascii_alphabetic())
+                .count();
+
+            alphanumeric >= segment.len() * 9 / 10
+                && digit_count >= 3
+                && letter_count >= 8
+                && shannon_entropy(segment) >= 4.0
+        })
 }
 
 fn contains_any(value: &str, patterns: &[&str]) -> bool {
@@ -4129,5 +4374,15 @@ mod tests {
         assert!(rendered.contains("upstream &lt;failed&gt;"));
         assert!(rendered.contains("app.pxxlhost/users?name=&lt;x&gt;"));
         assert!(rendered.contains("17"));
+    }
+
+    #[test]
+    fn bot_path_entropy_flags_random_segments() {
+        assert!(path_has_long_random_segment(
+            "/assets/a8F91bcD77E2ghIJ992kLmNopQrStUv"
+        ));
+        assert!(!path_has_long_random_segment(
+            "/blog/how-to-deploy-a-normal-project"
+        ));
     }
 }

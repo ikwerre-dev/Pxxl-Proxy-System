@@ -15,7 +15,7 @@ generate_secret() {
 install_podman_debian() {
   log "Installing Podman and compose helpers with apt"
   sudo apt-get update
-  sudo apt-get install -y podman podman-docker podman-compose curl git openssl slirp4netns fuse-overlayfs uidmap
+  sudo apt-get install -y podman podman-compose curl git openssl slirp4netns fuse-overlayfs uidmap
 }
 
 ensure_line() {
@@ -27,6 +27,40 @@ ensure_line() {
     mv "$tmp" "$file"
   else
     printf '%s=%s\n' "$key" "$value" >> "$file"
+  fi
+}
+
+install_user_service() {
+  if ! command -v systemctl >/dev/null 2>&1; then
+    log "systemctl is not available; skipping user service install"
+    return
+  fi
+
+  service_dir="${HOME}/.config/systemd/user"
+  service_file="${service_dir}/pxxl-proxy.service"
+  mkdir -p "$service_dir"
+  cat > "$service_file" <<EOF
+[Unit]
+Description=Pxxl Proxy Podman stack
+Wants=network-online.target podman.socket
+After=network-online.target podman.socket
+
+[Service]
+Type=oneshot
+WorkingDirectory=$(pwd)
+ExecStart=$(pwd)/deploy.sh --no-pull
+ExecStop=/bin/sh -lc 'cd "$(pwd)" && $(command -v podman-compose || printf "podman compose") -f docker-compose.yml -f docker-compose.discovery.yml down'
+RemainAfterExit=yes
+TimeoutStartSec=0
+
+[Install]
+WantedBy=default.target
+EOF
+
+  if systemctl --user daemon-reload && systemctl --user enable pxxl-proxy.service; then
+    log "Installed user service pxxl-proxy.service. It will start the proxy stack after reboot."
+  else
+    log "Could not enable the user service yet. After login, run: systemctl --user enable pxxl-proxy.service"
   fi
 }
 
@@ -51,7 +85,7 @@ fi
 
 if command -v systemctl >/dev/null 2>&1; then
   log "Starting rootless Podman socket"
-  systemctl --user enable --now podman.socket
+  systemctl --user enable --now podman.socket || log "Could not start podman.socket yet; run systemctl --user enable --now podman.socket after login"
 fi
 
 socket_path="/run/user/$(id -u)/podman/podman.sock"
@@ -80,5 +114,7 @@ if command -v sudo >/dev/null 2>&1; then
   echo 'net.ipv4.ip_unprivileged_port_start=80' | sudo tee /etc/sysctl.d/99-pxxl-rootless-ports.conf >/dev/null || true
   sudo sysctl --system >/dev/null || true
 fi
+
+install_user_service
 
 log "Proxy Podman setup complete. Review .env, then run ./deploy.sh"

@@ -239,7 +239,7 @@ Dynamic routes are validated before they enter the registry. API, Redis-loaded, 
 
 `www_alias = true` lets `www.<domain>` match the base route. Location rules use offline GeoIP data. Pxxl reads `config/geoip/geoip.csv` at startup and does not call the internet while handling requests. `country_*` fields match country codes like `US` or `NG`; `continent_*` fields match continent codes like `NA`, `AF`, or `EU`. `traffic_splits` provide weighted canary pools and may also be scoped by country/continent. If no traffic split matches, `location_routes` are evaluated in order and the first matching rule with upstreams replaces the normal path upstreams for that request.
 
-WAF rules are lightweight substring checks for path traversal, common SQL injection/XSS markers, scanner user agents, and custom user-agent/path/query patterns. Route matching and WAF checks use a canonicalized request path, and the canonical path is what Pxxl forwards upstream. `max_body_bytes` pre-checks `Content-Length` and also caps collected streaming/chunked request bodies.
+WAF rules are lightweight checks for path traversal, common SQL injection/XSS markers, scanner user agents, and custom user-agent/path/query patterns. When `waf.block_bad_bots` is enabled, Pxxl also scores requests using GeoIP/ASN source, user-agent quality, short-window request rate, and path entropy/random-looking path segments. Route matching and WAF checks use a canonicalized request path, and the canonical path is what Pxxl forwards upstream. `max_body_bytes` pre-checks `Content-Length` and also caps collected streaming/chunked request bodies.
 
 Supported algorithms are `round_robin`, `weighted_round_robin`, `ip_hash`, `least_connections`, `p2c`, `hrw`, `ewma_latency`, and `latency_aware`.
 
