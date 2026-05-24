@@ -326,9 +326,10 @@ impl Default for BandwidthLimit {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum ProxyMode {
+    #[default]
     Direct,
     External {
         proxy_url: String,
@@ -339,12 +340,6 @@ pub enum ProxyMode {
         #[serde(default = "default_true")]
         forward_client_ip: bool,
     },
-}
-
-impl Default for ProxyMode {
-    fn default() -> Self {
-        Self::Direct
-    }
 }
 
 impl Default for DomainRules {

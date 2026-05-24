@@ -161,7 +161,7 @@ impl PodmanConfig {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct DatabaseProxyConfig {
     #[serde(default = "default_false")]
     pub enabled: bool,
@@ -169,16 +169,6 @@ pub struct DatabaseProxyConfig {
     pub listeners: Vec<DatabaseProxyListenerConfig>,
     #[serde(default)]
     pub routes: Vec<DatabaseProxyRouteConfig>,
-}
-
-impl Default for DatabaseProxyConfig {
-    fn default() -> Self {
-        Self {
-            enabled: false,
-            listeners: Vec::new(),
-            routes: Vec::new(),
-        }
-    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

@@ -80,6 +80,17 @@ struct ErrorPageTemplate {
     body: Arc<str>,
 }
 
+#[derive(Clone, Debug)]
+pub struct BandwidthExceededContext<'a> {
+    status: StatusCode,
+    domain: &'a str,
+    path: &'a str,
+    request_id: &'a str,
+    bytes_used: u64,
+    bytes_limit: u64,
+    reset_day: u8,
+}
+
 impl Default for ErrorPageRenderer {
     fn default() -> Self {
         Self {
@@ -199,14 +210,16 @@ impl ErrorPageRenderer {
 
     pub fn bandwidth_exceeded_response(
         &self,
-        status: StatusCode,
-        domain: &str,
-        path: &str,
-        request_id: &str,
-        bytes_used: u64,
-        bytes_limit: u64,
-        reset_day: u8,
+        context: BandwidthExceededContext<'_>,
     ) -> Response<BoxBody> {
+        let status = context.status;
+        let domain = context.domain;
+        let path = context.path;
+        let request_id = context.request_id;
+        let bytes_used = context.bytes_used;
+        let bytes_limit = context.bytes_limit;
+        let reset_day = context.reset_day;
+
         let percentage = if bytes_limit > 0 {
             ((bytes_used as f64 / bytes_limit as f64) * 100.0).min(100.0)
         } else {
@@ -1388,13 +1401,15 @@ impl ProxyServer {
                             .unwrap_or(StatusCode::TOO_MANY_REQUESTS);
                         self.observe_request(&context, status, started, None, 0, 0);
                         let mut response = self.error_pages.bandwidth_exceeded_response(
-                            status,
-                            &domain,
-                            &path,
-                            &request_id,
-                            monthly_used,
-                            limit_bytes,
-                            limit_config.reset_day_of_month,
+                            BandwidthExceededContext {
+                                status,
+                                domain: &domain,
+                                path: &path,
+                                request_id: &request_id,
+                                bytes_used: monthly_used,
+                                bytes_limit: limit_bytes,
+                                reset_day: limit_config.reset_day_of_month,
+                            },
                         );
                         attach_request_id_header(response.headers_mut(), &request_id);
                         return response;
