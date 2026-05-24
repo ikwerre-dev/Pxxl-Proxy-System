@@ -1042,13 +1042,28 @@ impl PolicyEnforcer {
         request_origin: Option<&HeaderValue>,
     ) {
         if rules.add_security_headers {
+            insert_static_header(
+                headers,
+                "strict-transport-security",
+                "max-age=31536000; includeSubDomains; preload",
+            );
+            insert_static_header(
+                headers,
+                "cross-origin-opener-policy",
+                "same-origin-allow-popups",
+            );
             insert_static_header(headers, "x-frame-options", "DENY");
             insert_static_header(headers, "x-content-type-options", "nosniff");
-            insert_static_header(headers, "referrer-policy", "no-referrer");
+            insert_static_header(headers, "referrer-policy", "origin-when-cross-origin");
             insert_static_header(
                 headers,
                 "permissions-policy",
                 "camera=(), microphone=(), geolocation=()",
+            );
+            insert_static_header(
+                headers,
+                "content-security-policy",
+                "default-src 'self'; base-uri 'self'; object-src 'none'; frame-ancestors 'none'; script-src 'self' 'unsafe-inline' https:; style-src 'self' 'unsafe-inline'; img-src 'self' data: blob: https:; font-src 'self' data:; connect-src 'self' https: wss:; frame-src 'self' https:; upgrade-insecure-requests",
             );
         }
 
@@ -1887,6 +1902,7 @@ impl ProxyServer {
                         &matched.route.rules,
                         request_origin.as_ref(),
                     );
+                    apply_default_cache_headers(response.headers_mut(), context.path);
                     apply_sticky_cookie(
                         response.headers_mut(),
                         &middleware.sticky_sessions,
@@ -2161,6 +2177,7 @@ impl ProxyServer {
                     &matched.route.rules,
                     request_origin.as_ref(),
                 );
+                apply_default_cache_headers(&mut response.headers, context.path);
                 apply_response_middleware(
                     &mut response,
                     &middleware,
@@ -3740,6 +3757,58 @@ fn attach_request_id_header(headers: &mut HeaderMap, request_id: &str) {
     if let Ok(value) = HeaderValue::from_str(request_id) {
         headers.insert(HeaderName::from_static(REQUEST_ID_HEADER), value);
     }
+}
+
+fn apply_default_cache_headers(headers: &mut HeaderMap, path: &str) {
+    const LONG_LIVED_EXPIRES: &str = "Thu, 31 Dec 2037 23:55:55 GMT";
+
+    if is_static_asset_path(path) {
+        headers.insert(
+            CACHE_CONTROL,
+            HeaderValue::from_static("public, max-age=31536000, immutable"),
+        );
+        headers.insert(
+            HeaderName::from_static("expires"),
+            HeaderValue::from_static(LONG_LIVED_EXPIRES),
+        );
+        return;
+    }
+
+    if is_html_document_path(path) {
+        headers.insert(CACHE_CONTROL, HeaderValue::from_static("no-cache"));
+    }
+}
+
+fn is_static_asset_path(path: &str) -> bool {
+    let lower = path_without_query(path).to_ascii_lowercase();
+    lower.starts_with("/assets/")
+        || lower.starts_with("/fonts/")
+        || lower.starts_with("/generated/website-assets/")
+        || lower.starts_with("/_build/")
+        || lower.ends_with(".avif")
+        || lower.ends_with(".webp")
+        || lower.ends_with(".png")
+        || lower.ends_with(".jpg")
+        || lower.ends_with(".jpeg")
+        || lower.ends_with(".svg")
+        || lower.ends_with(".gif")
+        || lower.ends_with(".ico")
+        || lower.ends_with(".css")
+        || lower.ends_with(".js")
+        || lower.ends_with(".mjs")
+        || lower.ends_with(".woff")
+        || lower.ends_with(".woff2")
+        || lower.ends_with(".ttf")
+        || lower.ends_with(".otf")
+        || lower.ends_with(".wasm")
+        || lower.ends_with(".map")
+}
+
+fn is_html_document_path(path: &str) -> bool {
+    let clean = path_without_query(path);
+    clean == "/"
+        || clean.ends_with(".html")
+        || (!clean.starts_with("/api/") && !clean.contains('.'))
 }
 
 fn monotonic_nanos() -> u128 {

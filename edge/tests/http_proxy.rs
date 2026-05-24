@@ -171,6 +171,67 @@ async fn strips_hop_by_hop_response_headers() {
 }
 
 #[tokio::test]
+async fn applies_static_cache_and_security_headers() {
+    let upstream_addr = spawn_upstream("console.log('ok')").await;
+    let proxy_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let proxy_addr = proxy_listener.local_addr().unwrap();
+    let (shutdown_tx, shutdown_rx) = watch::channel(false);
+
+    let mut route = Route::new(
+        "assets.pxxlhost",
+        vec![PathRoute::new(
+            "/",
+            vec![Upstream::new(format!("http://{upstream_addr}"))],
+        )],
+        RouteSource::Static,
+    );
+    route.rules = DomainRules {
+        add_security_headers: true,
+        ..DomainRules::default()
+    };
+    let state = test_state(vec![route]);
+    let server = tokio::spawn(run_http_proxy_on_listener(
+        proxy_listener,
+        state,
+        shutdown_rx,
+    ));
+
+    let client: Client<HttpConnector, Empty<Bytes>> =
+        Client::builder(TokioExecutor::new()).build_http();
+    let req = Request::builder()
+        .method("GET")
+        .uri(format!("http://{proxy_addr}/assets/main-abc123.js"))
+        .header("host", "assets.pxxlhost")
+        .body(Empty::<Bytes>::new())
+        .unwrap();
+
+    let response = client.request(req).await.unwrap();
+    let headers = response.headers().clone();
+
+    shutdown_tx.send(true).unwrap();
+    server.await.unwrap().unwrap();
+
+    assert_eq!(
+        headers
+            .get("cache-control")
+            .and_then(|value| value.to_str().ok()),
+        Some("public, max-age=31536000, immutable")
+    );
+    assert_eq!(
+        headers.get("expires").and_then(|value| value.to_str().ok()),
+        Some("Thu, 31 Dec 2037 23:55:55 GMT")
+    );
+    assert!(headers.get("strict-transport-security").is_some());
+    assert_eq!(
+        headers
+            .get("cross-origin-opener-policy")
+            .and_then(|value| value.to_str().ok()),
+        Some("same-origin-allow-popups")
+    );
+    assert!(headers.get("content-security-policy").is_some());
+}
+
+#[tokio::test]
 async fn rejects_websocket_when_domain_rule_disables_it() {
     let upstream_addr = spawn_upstream("should not proxy").await;
     let proxy_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
