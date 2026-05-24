@@ -13,6 +13,7 @@
 !/data/secrets/.gitkeep
 .env
 .DS_Store
+config/geoip/*.mmdb
 *.swp
 *.swo
 .ai-context/
