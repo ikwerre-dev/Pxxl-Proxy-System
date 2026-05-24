@@ -134,6 +134,7 @@ services:
       - loki
 
 networks:
+  default: {}
   frontend_default:
     external: true
   gateway_default:
