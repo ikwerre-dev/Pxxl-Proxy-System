@@ -27,6 +27,10 @@ services:
     volumes:
       - ./config:/app/config:ro
       - ./data:/data
+    networks:
+      - default
+      - frontend_default
+      - gateway_default
     read_only: true
     tmpfs:
       - /tmp
@@ -128,3 +132,9 @@ services:
     depends_on:
       - prometheus
       - loki
+
+networks:
+  frontend_default:
+    external: true
+  gateway_default:
+    external: true
