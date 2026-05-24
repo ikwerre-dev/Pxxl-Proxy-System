@@ -1344,7 +1344,7 @@ impl ProxyServer {
                             .unwrap_or(0);
                         let status_code = limit_config.exceeded_status_code.unwrap_or(509);
                         let status = StatusCode::from_u16(status_code)
-                            .unwrap_or(StatusCode::BANDWIDTH_LIMIT_EXCEEDED);
+                            .unwrap_or(StatusCode::TOO_MANY_REQUESTS);
                         self.observe_request(&context, status, started, None, 0, 0);
                         let mut response = self.error_pages.bandwidth_exceeded_response(
                             status,
@@ -1772,6 +1772,7 @@ impl ProxyServer {
             ])
             .inc();
 
+        let request_body_len = buffered_request.body.len() as u64;
         match self
             .forward_with_retry(
                 buffered_request,
@@ -1838,7 +1839,7 @@ impl ProxyServer {
                     &middleware.sticky_sessions,
                     &upstream,
                 );
-                self.observe_request(&context, status, started, Some(&upstream.url), buffered_request.body.len() as u64, response.body.len() as u64);
+                self.observe_request(&context, status, started, Some(&upstream.url), request_body_len, response.body.len() as u64);
                 self.state
                     .metrics
                     .upstream_latency_seconds

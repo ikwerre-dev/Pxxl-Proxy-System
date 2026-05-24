@@ -10,6 +10,7 @@ pxxl-core = { path = "../core" }
 pxxl-ddos = { path = "../ddos" }
 pxxl-geo = { path = "../geo" }
 pxxl-metrics = { path = "../metrics" }
+pxxl-redis-sync = { path = "../redis-sync" }
 pxxl-tls = { path = "../tls" }
 anyhow = { workspace = true }
 arc-swap = { workspace = true }
