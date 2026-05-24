@@ -121,10 +121,14 @@ ORDER BY (domain, timestamp_unix_ms, request_id)
         .await?;
         self.post_sql("ALTER TABLE pxxl_access_logs ADD COLUMN IF NOT EXISTS request_id String")
             .await?;
-        self.post_sql("ALTER TABLE pxxl_access_logs ADD COLUMN IF NOT EXISTS bytes_sent UInt64 DEFAULT 0")
-            .await?;
-        self.post_sql("ALTER TABLE pxxl_access_logs ADD COLUMN IF NOT EXISTS bytes_received UInt64 DEFAULT 0")
-            .await
+        self.post_sql(
+            "ALTER TABLE pxxl_access_logs ADD COLUMN IF NOT EXISTS bytes_sent UInt64 DEFAULT 0",
+        )
+        .await?;
+        self.post_sql(
+            "ALTER TABLE pxxl_access_logs ADD COLUMN IF NOT EXISTS bytes_received UInt64 DEFAULT 0",
+        )
+        .await
     }
 
     pub async fn insert_request(&self, event: RequestObservation) -> Result<()> {
@@ -334,9 +338,7 @@ ORDER BY period DESC
         let result = self.query_json(&query).await?;
         result
             .into_iter()
-            .map(|row| {
-                serde_json::from_value(row).context("failed to parse bandwidth history row")
-            })
+            .map(|row| serde_json::from_value(row).context("failed to parse bandwidth history row"))
             .collect()
     }
 
@@ -415,14 +417,15 @@ pub fn calculate_bandwidth_quota(
 ) -> BandwidthQuota {
     let now = Utc::now();
     let current_month = format!("{}-{:02}", now.year(), now.month());
-    
+
     let next_reset = if now.day() >= reset_day as u32 {
         let next_month = if now.month() == 12 {
             chrono::NaiveDate::from_ymd_opt(now.year() + 1, 1, reset_day as u32)
         } else {
             chrono::NaiveDate::from_ymd_opt(now.year(), now.month() + 1, reset_day as u32)
         };
-        next_month.unwrap_or_else(|| chrono::NaiveDate::from_ymd_opt(now.year(), now.month(), 1).unwrap())
+        next_month
+            .unwrap_or_else(|| chrono::NaiveDate::from_ymd_opt(now.year(), now.month(), 1).unwrap())
     } else {
         chrono::NaiveDate::from_ymd_opt(now.year(), now.month(), reset_day as u32)
             .unwrap_or_else(|| chrono::NaiveDate::from_ymd_opt(now.year(), now.month(), 1).unwrap())

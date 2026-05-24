@@ -413,7 +413,12 @@ impl RedisBandwidthTracker {
         Ok(bytes.unwrap_or(0))
     }
 
-    pub async fn check_limit(&self, domain: &str, monthly_limit: Option<u64>, daily_limit: Option<u64>) -> Result<bool> {
+    pub async fn check_limit(
+        &self,
+        domain: &str,
+        monthly_limit: Option<u64>,
+        daily_limit: Option<u64>,
+    ) -> Result<bool> {
         if let Some(limit) = monthly_limit {
             let usage = self.get_monthly_usage(domain).await?;
             if usage >= limit {

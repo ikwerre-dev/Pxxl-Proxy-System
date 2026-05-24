@@ -24,7 +24,9 @@ pub enum PxxlError {
     InvalidHost,
     #[error("invalid request path: {0}")]
     InvalidPath(String),
-    #[error("bandwidth limit exceeded for domain {domain}: used {used} bytes, limit {limit} bytes")]
+    #[error(
+        "bandwidth limit exceeded for domain {domain}: used {used} bytes, limit {limit} bytes"
+    )]
     BandwidthLimitExceeded {
         domain: String,
         used: u64,
