@@ -86,6 +86,7 @@ pub struct BandwidthExceededContext<'a> {
     domain: &'a str,
     path: &'a str,
     request_id: &'a str,
+    processing_time_ms: u128,
     bytes_used: u64,
     bytes_limit: u64,
     reset_day: u8,
@@ -184,6 +185,7 @@ impl ErrorPageRenderer {
         domain: &str,
         path: &str,
         request_id: &str,
+        processing_time_ms: u128,
     ) -> Response<BoxBody> {
         if !self.enabled {
             return text_response(status, message);
@@ -201,9 +203,19 @@ impl ErrorPageRenderer {
                     domain,
                     path,
                     request_id,
+                    processing_time_ms,
                 )
             })
-            .unwrap_or_else(|| default_error_html(status, message, domain, path, request_id));
+            .unwrap_or_else(|| {
+                default_error_html(
+                    status,
+                    message,
+                    domain,
+                    path,
+                    request_id,
+                    processing_time_ms,
+                )
+            });
 
         html_response(status, body)
     }
@@ -216,6 +228,7 @@ impl ErrorPageRenderer {
         let domain = context.domain;
         let path = context.path;
         let request_id = context.request_id;
+        let processing_time_ms = context.processing_time_ms;
         let bytes_used = context.bytes_used;
         let bytes_limit = context.bytes_limit;
         let reset_day = context.reset_day;
@@ -241,6 +254,7 @@ impl ErrorPageRenderer {
                 .replace("{{percentage_used}}", &format!("{:.1}", percentage))
                 .replace("{{reset_date}}", &reset_date)
                 .replace("{{request_id}}", request_id)
+                .replace("{{processing_time_ms}}", &processing_time_ms.to_string())
                 .replace("{{status_code}}", &status.as_u16().to_string())
                 .replace(
                     "{{status_text}}",
@@ -258,6 +272,7 @@ impl ErrorPageRenderer {
 <p>Used: {used} / Limit: {limit} ({pct:.1}%)</p>
 <p>Resets: {reset}</p>
 <p>Request ID: {rid}</p>
+<p>Processing time: {processing_time_ms} ms</p>
 </body></html>"#,
                 domain = domain,
                 used = format_bytes(bytes_used),
@@ -265,6 +280,7 @@ impl ErrorPageRenderer {
                 pct = percentage,
                 reset = reset_date,
                 rid = request_id,
+                processing_time_ms = processing_time_ms,
             )
         };
 
@@ -1212,6 +1228,7 @@ impl ProxyServer {
                     "unknown",
                     &raw_path,
                     &request_id,
+                    started,
                 ));
             }
         };
@@ -1248,6 +1265,7 @@ impl ProxyServer {
                     "unknown",
                     &path,
                     &request_id,
+                    started,
                 ));
             }
         };
@@ -1279,6 +1297,7 @@ impl ProxyServer {
                         &domain,
                         &path,
                         &request_id,
+                        started,
                     ));
                 }
                 SecurityDecision::RateLimited { retry_after } => {
@@ -1301,6 +1320,7 @@ impl ProxyServer {
                         &domain,
                         &path,
                         &request_id,
+                        started,
                     );
                     if let Ok(value) =
                         HeaderValue::from_str(&retry_after.as_secs().max(1).to_string())
@@ -1322,6 +1342,7 @@ impl ProxyServer {
                     &domain,
                     &path,
                     &request_id,
+                    started,
                 ));
             }
         };
@@ -1353,6 +1374,7 @@ impl ProxyServer {
                     &domain,
                     &path,
                     &request_id,
+                    started,
                 )
             };
             if let Some(location) = rejection.location {
@@ -1406,6 +1428,7 @@ impl ProxyServer {
                                 domain: &domain,
                                 path: &path,
                                 request_id: &request_id,
+                                processing_time_ms: started.elapsed().as_millis(),
                                 bytes_used: monthly_used,
                                 bytes_limit: limit_bytes,
                                 reset_day: limit_config.reset_day_of_month,
@@ -1420,7 +1443,7 @@ impl ProxyServer {
 
         if let Some(basic_auth) = &middleware.basic_auth {
             if let Some(response) =
-                self.evaluate_basic_auth(&req, basic_auth, &domain, &path, &request_id)
+                self.evaluate_basic_auth(&req, basic_auth, &domain, &path, &request_id, started)
             {
                 self.state
                     .metrics
@@ -1440,7 +1463,7 @@ impl ProxyServer {
 
         if let Some(digest_auth) = &middleware.digest_auth {
             if let Some(response) =
-                self.evaluate_digest_auth(&req, digest_auth, &domain, &path, &request_id)
+                self.evaluate_digest_auth(&req, digest_auth, &domain, &path, &request_id, started)
             {
                 self.state
                     .metrics
@@ -1482,6 +1505,7 @@ impl ProxyServer {
                         &domain,
                         &path,
                         &request_id,
+                        started,
                     ));
                 }
                 Err(error) => {
@@ -1498,6 +1522,7 @@ impl ProxyServer {
                         &domain,
                         &path,
                         &request_id,
+                        started,
                     ));
                 }
             }
@@ -1549,6 +1574,7 @@ impl ProxyServer {
                         &domain,
                         &path,
                         &request_id,
+                        started,
                     ));
                 }
             };
@@ -1579,6 +1605,7 @@ impl ProxyServer {
                         &domain,
                         &path,
                         &request_id,
+                        started,
                     ));
                 }
             };
@@ -1751,6 +1778,7 @@ impl ProxyServer {
                         &domain,
                         &path,
                         &request_id,
+                        started,
                     ));
                 }
             }
@@ -1777,6 +1805,7 @@ impl ProxyServer {
                     &domain,
                     &path,
                     &request_id,
+                    started,
                 ));
             }
             Err(BufferError::Body(error)) => {
@@ -1788,6 +1817,7 @@ impl ProxyServer {
                     &domain,
                     &path,
                     &request_id,
+                    started,
                 ));
             }
         };
@@ -1828,6 +1858,7 @@ impl ProxyServer {
                     &domain,
                     &path,
                     &request_id,
+                    started,
                 ));
             }
         };
@@ -1851,6 +1882,7 @@ impl ProxyServer {
                     &domain,
                     &path,
                     &request_id,
+                    started,
                 ));
             }
         };
@@ -2022,6 +2054,7 @@ impl ProxyServer {
                     &domain,
                     &path,
                     &request_id,
+                    started,
                 ));
             }
         }
@@ -2213,9 +2246,16 @@ impl ProxyServer {
         domain: &str,
         path: &str,
         request_id: &str,
+        started: Instant,
     ) -> Response<BoxBody> {
-        self.error_pages
-            .response(status, message, domain, path, request_id)
+        self.error_pages.response(
+            status,
+            message,
+            domain,
+            path,
+            request_id,
+            started.elapsed().as_millis(),
+        )
     }
 
     fn observe_request(
@@ -2351,6 +2391,7 @@ impl ProxyServer {
         domain: &str,
         path: &str,
         request_id: &str,
+        started: Instant,
     ) -> Option<Response<BoxBody>> {
         if !config.enabled {
             return None;
@@ -2388,6 +2429,7 @@ impl ProxyServer {
             domain,
             path,
             request_id,
+            started,
         );
         if let Ok(value) = HeaderValue::from_str(&format!("Basic realm=\"{}\"", config.realm)) {
             response.headers_mut().insert(WWW_AUTHENTICATE, value);
@@ -2402,6 +2444,7 @@ impl ProxyServer {
         domain: &str,
         path: &str,
         request_id: &str,
+        started: Instant,
     ) -> Option<Response<BoxBody>> {
         if !config.enabled {
             return None;
@@ -2436,6 +2479,7 @@ impl ProxyServer {
             domain,
             path,
             request_id,
+            started,
         );
         if let Ok(value) = HeaderValue::from_str(&format!(
             "Digest realm=\"{}\", qop=\"auth\", algorithm=SHA-256, nonce=\"{}\"",
@@ -3881,6 +3925,7 @@ fn default_error_html(
     domain: &str,
     path: &str,
     request_id: &str,
+    processing_time_ms: u128,
 ) -> String {
     render_error_template(
         DEFAULT_ERROR_TEMPLATE,
@@ -3889,6 +3934,7 @@ fn default_error_html(
         domain,
         path,
         request_id,
+        processing_time_ms,
     )
 }
 
@@ -3934,11 +3980,13 @@ fn render_error_template(
     domain: &str,
     path: &str,
     request_id: &str,
+    processing_time_ms: u128,
 ) -> String {
     let status_code = status.as_u16().to_string();
     let status_text = status.canonical_reason().unwrap_or("Proxy Error");
     let domain = if domain.is_empty() { "unknown" } else { domain };
     let path = if path.is_empty() { "/" } else { path };
+    let processing_time_ms = processing_time_ms.to_string();
 
     template
         .replace("{{status_code}}", &escape_html(&status_code))
@@ -3947,6 +3995,7 @@ fn render_error_template(
         .replace("{{domain}}", &escape_html(domain))
         .replace("{{path}}", &escape_html(path))
         .replace("{{request_id}}", &escape_html(request_id))
+        .replace("{{processing_time_ms}}", &escape_html(&processing_time_ms))
 }
 
 fn escape_html(input: &str) -> String {
@@ -4042,6 +4091,8 @@ const DEFAULT_ERROR_TEMPLATE: &str = r#"<!doctype html>
 	      <dd>{{path}}</dd>
 	      <dt>Request ID</dt>
 	      <dd>{{request_id}}</dd>
+	      <dt>Processing time</dt>
+	      <dd>{{processing_time_ms}} ms</dd>
 	    </dl>
 	  </main>
 	</body>
@@ -4065,16 +4116,18 @@ mod tests {
     #[test]
     fn renders_custom_error_page_template() {
         let rendered = render_error_template(
-            "<h1>{{status_code}} {{status_text}}</h1><p>{{message}}</p><span>{{domain}}{{path}}</span>",
+            "<h1>{{status_code}} {{status_text}}</h1><p>{{message}}</p><span>{{domain}}{{path}}</span><em>{{processing_time_ms}} ms</em>",
             StatusCode::BAD_GATEWAY,
             "upstream <failed>",
             "app.pxxlhost",
             "/users?name=<x>",
             "request-123",
+            17,
         );
 
         assert!(rendered.contains("502 Bad Gateway"));
         assert!(rendered.contains("upstream &lt;failed&gt;"));
         assert!(rendered.contains("app.pxxlhost/users?name=&lt;x&gt;"));
+        assert!(rendered.contains("17"));
     }
 }
