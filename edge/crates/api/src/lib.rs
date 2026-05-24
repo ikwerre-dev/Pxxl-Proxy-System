@@ -1697,6 +1697,9 @@ async fn validate_api_upstream_network_safety(raw: &str) -> Result<(), String> {
             "reserved host-gateway upstream is not allowed: {host}"
         ));
     }
+    if private_upstreams_allowed() {
+        return Ok(());
+    }
     if let Ok(ip) = host.parse::<IpAddr>() {
         if !ip_allowed_for_upstream(ip) {
             return Err("unsafe upstream IP is not allowed".to_string());
@@ -1729,6 +1732,17 @@ async fn validate_api_upstream_network_safety(raw: &str) -> Result<(), String> {
 
 fn host_gateway_upstreams_allowed() -> bool {
     std::env::var("PXXL_ALLOW_HOST_GATEWAY_UPSTREAMS")
+        .map(|value| {
+            matches!(
+                value.to_ascii_lowercase().as_str(),
+                "1" | "true" | "yes" | "on"
+            )
+        })
+        .unwrap_or(false)
+}
+
+fn private_upstreams_allowed() -> bool {
+    std::env::var("PXXL_ALLOW_PRIVATE_UPSTREAMS")
         .map(|value| {
             matches!(
                 value.to_ascii_lowercase().as_str(),
