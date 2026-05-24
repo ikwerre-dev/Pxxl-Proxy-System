@@ -1191,8 +1191,10 @@ impl ProxyServer {
             .headers()
             .get(HOST)
             .and_then(|value| value.to_str().ok())
+            .map(str::to_owned)
+            .or_else(|| req.uri().authority().map(|authority| authority.as_str().to_owned()))
         {
-            Some(host) => host.to_string(),
+            Some(host) => host,
             None => {
                 let context = ProxyRequestContext {
                     request_id: &request_id,
