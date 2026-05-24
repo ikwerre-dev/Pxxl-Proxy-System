@@ -424,9 +424,14 @@ Returns flattened upstreams by route and path.
 
 ```http
 GET /v1/certs
+GET /v1/domains/{domain}/cert
 ```
 
-Returns local certificate metadata for the Phase 1 issuer.
+Returns local certificate metadata for the Phase 1 issuer. The proxy keeps a local multi-SAN certificate bundle in the configured certificate directory and hot-reloads it when registered TLS domains change.
+
+`GET /v1/certs` returns the bundle paths, generation state, last certificate write time, and per-domain coverage for registered routes. `GET /v1/domains/{domain}/cert` returns the same shape filtered to one normalized domain and reports `not_found` when the domain is not registered.
+
+`POST /v1/domains` also includes a `certificate` object in the response so callers can immediately see whether the domain is already covered, pending the next local bundle generation, or has TLS disabled.
 
 ## Blacklist
 

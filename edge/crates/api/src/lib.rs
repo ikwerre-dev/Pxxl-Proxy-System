@@ -22,8 +22,9 @@ use sha2::{Digest, Sha256};
 use std::{
     convert::Infallible,
     net::{IpAddr, SocketAddr},
+    path::PathBuf,
     sync::Arc,
-    time::Duration,
+    time::{Duration, UNIX_EPOCH},
 };
 use tokio::{
     net::TcpListener,
@@ -153,6 +154,26 @@ struct UpstreamView {
     url: String,
     healthy: bool,
     weight: u32,
+}
+
+#[derive(Debug, Serialize)]
+struct CertificateDomainStatus {
+    domain: String,
+    tls_enabled: bool,
+    covered: bool,
+    status: &'static str,
+    reason: &'static str,
+}
+
+#[derive(Debug, Serialize)]
+struct CertificateStatusResponse {
+    mode: &'static str,
+    cert_dir: String,
+    cert_path: String,
+    key_path: String,
+    generated: bool,
+    cert_modified_unix_ms: Option<u128>,
+    domains: Vec<CertificateDomainStatus>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -752,6 +773,25 @@ impl ApiServer {
                     }),
                 )
             }
+            (Method::GET, path) if path.starts_with("/v1/domains/") && path.ends_with("/cert") => {
+                if let Some(response) = require_scope(&principal, SCOPE_ROUTES_READ) {
+                    return response;
+                }
+                let domain = path
+                    .trim_start_matches("/v1/domains/")
+                    .trim_end_matches("/cert")
+                    .trim_matches('/');
+                if domain.is_empty() {
+                    return json_response(
+                        StatusCode::BAD_REQUEST,
+                        json!({"error": "missing domain"}),
+                    );
+                }
+                json_response(
+                    StatusCode::OK,
+                    json!({ "certificate": self.certificate_status(Some(domain)).await }),
+                )
+            }
             (Method::GET, path) if path.starts_with("/v1/domains/") => {
                 if let Some(response) = require_scope(&principal, SCOPE_ROUTES_READ) {
                     return response;
@@ -848,7 +888,9 @@ impl ApiServer {
                 }
                 self.upsert_database_route(req).await
             }
-            (Method::GET, path) if path.starts_with("/v1/domains/") && path.ends_with("/bandwidth") => {
+            (Method::GET, path)
+                if path.starts_with("/v1/domains/") && path.ends_with("/bandwidth") =>
+            {
                 if let Some(response) = require_scope(&principal, SCOPE_ANALYTICS_READ) {
                     return response;
                 }
@@ -864,7 +906,9 @@ impl ApiServer {
                 }
                 self.get_bandwidth_usage(&normalize_domain(domain)).await
             }
-            (Method::GET, path) if path.starts_with("/v1/domains/") && path.ends_with("/bandwidth/history") => {
+            (Method::GET, path)
+                if path.starts_with("/v1/domains/") && path.ends_with("/bandwidth/history") =>
+            {
                 if let Some(response) = require_scope(&principal, SCOPE_ANALYTICS_READ) {
                     return response;
                 }
@@ -881,9 +925,12 @@ impl ApiServer {
                 let months = query_value(&query, "months")
                     .and_then(|v| v.parse::<u32>().ok())
                     .unwrap_or(6);
-                self.get_bandwidth_history(&normalize_domain(domain), months).await
+                self.get_bandwidth_history(&normalize_domain(domain), months)
+                    .await
             }
-            (Method::GET, path) if path.starts_with("/v1/domains/") && path.ends_with("/bandwidth/realtime") => {
+            (Method::GET, path)
+                if path.starts_with("/v1/domains/") && path.ends_with("/bandwidth/realtime") =>
+            {
                 if let Some(response) = require_scope(&principal, SCOPE_ANALYTICS_READ) {
                     return response;
                 }
@@ -900,7 +947,8 @@ impl ApiServer {
                 let hours = query_value(&query, "hours")
                     .and_then(|v| v.parse::<u32>().ok())
                     .unwrap_or(24);
-                self.get_bandwidth_realtime(&normalize_domain(domain), hours).await
+                self.get_bandwidth_realtime(&normalize_domain(domain), hours)
+                    .await
             }
             (Method::DELETE, path) if path.starts_with("/v1/database-routes/") => {
                 if let Some(response) = require_scope(&principal, SCOPE_ROUTES_WRITE) {
@@ -910,10 +958,7 @@ impl ApiServer {
             }
             (Method::GET, "/v1/certs") => json_response(
                 StatusCode::OK,
-                json!({
-                    "mode": "local",
-                    "cert_dir": self.cert_dir.clone()
-                }),
+                json!({ "certificate": self.certificate_status(None).await }),
             ),
             (Method::POST, path) if path.starts_with("/v1/blacklist/") => {
                 if let Some(response) = require_scope(&principal, SCOPE_ROUTES_WRITE) {
@@ -1116,13 +1161,54 @@ impl ApiServer {
         }
 
         self.state.upsert_api_route(route.clone());
+        let certificate = self.certificate_status(Some(&route.domain)).await;
         json_response(
             StatusCode::CREATED,
             json!({
                 "status": "created",
-                "domain": redact_route(route)
+                "domain": redact_route(route),
+                "certificate": certificate
             }),
         )
+    }
+
+    async fn certificate_status(&self, domain_filter: Option<&str>) -> CertificateStatusResponse {
+        let cert_path = PathBuf::from(&self.cert_dir).join("local-dev-cert.pem");
+        let key_path = PathBuf::from(&self.cert_dir).join("local-dev-key.pem");
+        let cert_meta = tokio::fs::metadata(&cert_path).await.ok();
+        let key_exists = tokio::fs::metadata(&key_path).await.is_ok();
+        let generated = cert_meta.is_some() && key_exists;
+        let cert_modified_unix_ms = cert_meta
+            .as_ref()
+            .and_then(|metadata| metadata.modified().ok())
+            .and_then(|modified| modified.duration_since(UNIX_EPOCH).ok())
+            .map(|duration| duration.as_millis());
+
+        let routes = self.state.routes.snapshot();
+        let domains = match domain_filter.map(normalize_domain) {
+            Some(domain) => {
+                let maybe_route = routes.into_iter().find(|route| route.domain == domain);
+                vec![certificate_domain_status(
+                    &domain,
+                    maybe_route.as_ref(),
+                    generated,
+                )]
+            }
+            None => routes
+                .iter()
+                .map(|route| certificate_domain_status(&route.domain, Some(route), generated))
+                .collect(),
+        };
+
+        CertificateStatusResponse {
+            mode: "local_multi_san",
+            cert_dir: self.cert_dir.clone(),
+            cert_path: cert_path.display().to_string(),
+            key_path: key_path.display().to_string(),
+            generated,
+            cert_modified_unix_ms,
+            domains,
+        }
     }
 
     async fn login(&self, req: Request<Incoming>) -> Response<BoxBody> {
@@ -1492,6 +1578,43 @@ fn redact_routes(routes: Vec<Route>) -> Vec<Route> {
     routes.into_iter().map(redact_route).collect()
 }
 
+fn certificate_domain_status(
+    domain: &str,
+    route: Option<&Route>,
+    generated: bool,
+) -> CertificateDomainStatus {
+    match route {
+        Some(route) if !route.tls => CertificateDomainStatus {
+            domain: domain.to_string(),
+            tls_enabled: false,
+            covered: false,
+            status: "disabled",
+            reason: "route_tls_disabled",
+        },
+        Some(_) if generated => CertificateDomainStatus {
+            domain: domain.to_string(),
+            tls_enabled: true,
+            covered: true,
+            status: "covered",
+            reason: "active_local_certificate_bundle",
+        },
+        Some(_) => CertificateDomainStatus {
+            domain: domain.to_string(),
+            tls_enabled: true,
+            covered: false,
+            status: "pending",
+            reason: "certificate_bundle_not_generated_yet",
+        },
+        None => CertificateDomainStatus {
+            domain: domain.to_string(),
+            tls_enabled: false,
+            covered: false,
+            status: "not_found",
+            reason: "domain_not_registered",
+        },
+    }
+}
+
 fn redact_route(mut route: Route) -> Route {
     redact_rules(&mut route.rules);
     route
@@ -1707,7 +1830,7 @@ impl ApiServer {
     async fn get_bandwidth_usage(&self, domain: &str) -> Response<BoxBody> {
         // Get current month bandwidth from in-memory stats
         let stats = self.state.stats.snapshot_domain(domain);
-        
+
         if let Some(stats) = stats {
             json_response(
                 StatusCode::OK,
@@ -1739,7 +1862,7 @@ impl ApiServer {
         // For now, return current month data from in-memory stats
         // In production, this would query ClickHouse for historical data
         let stats = self.state.stats.snapshot_domain(domain);
-        
+
         let history = if let Some(stats) = stats {
             vec![json!({
                 "month": chrono::Utc::now().format("%Y-%m").to_string(),
@@ -1765,7 +1888,7 @@ impl ApiServer {
         // Return current stats from in-memory
         // In production, this would query ClickHouse for hourly aggregates
         let stats = self.state.stats.snapshot_domain(domain);
-        
+
         let data = if let Some(stats) = stats {
             vec![json!({
                 "timestamp": chrono::Utc::now().to_rfc3339(),

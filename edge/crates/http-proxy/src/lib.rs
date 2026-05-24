@@ -28,10 +28,10 @@ use pxxl_common::{
     PassiveHealthConfig, PxxlError, RateLimitScope, RetryConfig, RouteMatch, RouteSource,
     StickySessionConfig, TrafficMirrorConfig, TrafficSplitRule, Upstream,
 };
-use pxxl_redis_sync::RedisBandwidthTracker;
 use pxxl_core::{EdgeState, RequestObservation};
 use pxxl_ddos::SecurityDecision;
 use pxxl_geo::GeoIpResolver;
+use pxxl_redis_sync::RedisBandwidthTracker;
 use rustls::ServerConfig;
 use sha2::{Digest, Sha256};
 use std::{
@@ -172,6 +172,7 @@ impl ErrorPageRenderer {
         message: &str,
         domain: &str,
         path: &str,
+        request_id: &str,
     ) -> Response<BoxBody> {
         if !self.enabled {
             return text_response(status, message);
@@ -182,9 +183,16 @@ impl ErrorPageRenderer {
             .get(&status.as_u16())
             .or(self.default_page.as_ref())
             .map(|template| {
-                render_error_template(template.body.as_ref(), status, message, domain, path)
+                render_error_template(
+                    template.body.as_ref(),
+                    status,
+                    message,
+                    domain,
+                    path,
+                    request_id,
+                )
             })
-            .unwrap_or_else(|| default_error_html(status, message, domain, path));
+            .unwrap_or_else(|| default_error_html(status, message, domain, path, request_id));
 
         html_response(status, body)
     }
@@ -207,8 +215,13 @@ impl ErrorPageRenderer {
 
         let reset_date = bandwidth_reset_date(reset_day);
 
-        let body = if let Some(template) = self.pages.get(&status.as_u16()).or(self.default_page.as_ref()) {
-            template.body
+        let body = if let Some(template) = self
+            .pages
+            .get(&status.as_u16())
+            .or(self.default_page.as_ref())
+        {
+            template
+                .body
                 .replace("{{domain}}", domain)
                 .replace("{{bytes_used}}", &format_bytes(bytes_used))
                 .replace("{{bytes_limit}}", &format_bytes(bytes_limit))
@@ -216,7 +229,12 @@ impl ErrorPageRenderer {
                 .replace("{{reset_date}}", &reset_date)
                 .replace("{{request_id}}", request_id)
                 .replace("{{status_code}}", &status.as_u16().to_string())
-                .replace("{{status_text}}", status.canonical_reason().unwrap_or("Bandwidth Limit Exceeded"))
+                .replace(
+                    "{{status_text}}",
+                    status
+                        .canonical_reason()
+                        .unwrap_or("Bandwidth Limit Exceeded"),
+                )
                 .replace("{{message}}", "Bandwidth limit exceeded")
                 .replace("{{path}}", path)
         } else {
@@ -1180,6 +1198,7 @@ impl ProxyServer {
                     "invalid request path",
                     "unknown",
                     &raw_path,
+                    &request_id,
                 ));
             }
         };
@@ -1192,8 +1211,11 @@ impl ProxyServer {
             .get(HOST)
             .and_then(|value| value.to_str().ok())
             .map(str::to_owned)
-            .or_else(|| req.uri().authority().map(|authority| authority.as_str().to_owned()))
-        {
+            .or_else(|| {
+                req.uri()
+                    .authority()
+                    .map(|authority| authority.as_str().to_owned())
+            }) {
             Some(host) => host,
             None => {
                 let context = ProxyRequestContext {
@@ -1212,6 +1234,7 @@ impl ProxyServer {
                     "missing host header",
                     "unknown",
                     &path,
+                    &request_id,
                 ));
             }
         };
@@ -1242,6 +1265,7 @@ impl ProxyServer {
                         "request blocked",
                         &domain,
                         &path,
+                        &request_id,
                     ));
                 }
                 SecurityDecision::RateLimited { retry_after } => {
@@ -1250,12 +1274,20 @@ impl ProxyServer {
                         .rate_limited_total
                         .with_label_values(&[&domain])
                         .inc();
-                    self.observe_request(&context, StatusCode::TOO_MANY_REQUESTS, started, None, 0, 0);
+                    self.observe_request(
+                        &context,
+                        StatusCode::TOO_MANY_REQUESTS,
+                        started,
+                        None,
+                        0,
+                        0,
+                    );
                     let mut response = self.error_response(
                         StatusCode::TOO_MANY_REQUESTS,
                         "rate limited",
                         &domain,
                         &path,
+                        &request_id,
                     );
                     if let Ok(value) =
                         HeaderValue::from_str(&retry_after.as_secs().max(1).to_string())
@@ -1276,6 +1308,7 @@ impl ProxyServer {
                     "no route matched this host/path",
                     &domain,
                     &path,
+                    &request_id,
                 ));
             }
         };
@@ -1301,7 +1334,13 @@ impl ProxyServer {
             let mut response = if rejection.status == StatusCode::NO_CONTENT {
                 response_with_body(rejection.status, "text/plain; charset=utf-8", String::new())
             } else {
-                self.error_response(rejection.status, rejection.message, &domain, &path)
+                self.error_response(
+                    rejection.status,
+                    rejection.message,
+                    &domain,
+                    &path,
+                    &request_id,
+                )
             };
             if let Some(location) = rejection.location {
                 if let Ok(value) = HeaderValue::from_str(&location) {
@@ -1365,7 +1404,9 @@ impl ProxyServer {
         }
 
         if let Some(basic_auth) = &middleware.basic_auth {
-            if let Some(response) = self.evaluate_basic_auth(&req, basic_auth, &domain, &path) {
+            if let Some(response) =
+                self.evaluate_basic_auth(&req, basic_auth, &domain, &path, &request_id)
+            {
                 self.state
                     .metrics
                     .middleware_executions_total
@@ -1383,7 +1424,9 @@ impl ProxyServer {
         }
 
         if let Some(digest_auth) = &middleware.digest_auth {
-            if let Some(response) = self.evaluate_digest_auth(&req, digest_auth, &domain, &path) {
+            if let Some(response) =
+                self.evaluate_digest_auth(&req, digest_auth, &domain, &path, &request_id)
+            {
                 self.state
                     .metrics
                     .middleware_executions_total
@@ -1423,6 +1466,7 @@ impl ProxyServer {
                         "forward auth denied the request",
                         &domain,
                         &path,
+                        &request_id,
                     ));
                 }
                 Err(error) => {
@@ -1438,6 +1482,7 @@ impl ProxyServer {
                         "forward auth request failed",
                         &domain,
                         &path,
+                        &request_id,
                     ));
                 }
             }
@@ -1475,12 +1520,20 @@ impl ProxyServer {
             ) {
                 Some(upstream) => upstream,
                 None => {
-                    self.observe_request(&context, StatusCode::SERVICE_UNAVAILABLE, started, None, 0, 0);
+                    self.observe_request(
+                        &context,
+                        StatusCode::SERVICE_UNAVAILABLE,
+                        started,
+                        None,
+                        0,
+                        0,
+                    );
                     finish_response!(self.error_response(
                         StatusCode::SERVICE_UNAVAILABLE,
                         "no healthy upstreams",
                         &domain,
                         &path,
+                        &request_id,
                     ));
                 }
             };
@@ -1497,12 +1550,20 @@ impl ProxyServer {
                         .in_flight_limited_total
                         .with_label_values(&[&domain, scope])
                         .inc();
-                    self.observe_request(&context, StatusCode::TOO_MANY_REQUESTS, started, None, 0, 0);
+                    self.observe_request(
+                        &context,
+                        StatusCode::TOO_MANY_REQUESTS,
+                        started,
+                        None,
+                        0,
+                        0,
+                    );
                     finish_response!(self.error_response(
                         StatusCode::TOO_MANY_REQUESTS,
                         "too many in-flight requests",
                         &domain,
                         &path,
+                        &request_id,
                     ));
                 }
             };
@@ -1589,7 +1650,14 @@ impl ProxyServer {
                     strip_hop_by_hop_response_headers(response.headers_mut());
                     let stream_bytes_sent = req_content_length;
                     let stream_bytes_received = content_length(response.headers()).unwrap_or(0);
-                    self.observe_request(&context, status, started, Some(&upstream.url), stream_bytes_sent, stream_bytes_received);
+                    self.observe_request(
+                        &context,
+                        status,
+                        started,
+                        Some(&upstream.url),
+                        stream_bytes_sent,
+                        stream_bytes_received,
+                    );
                     self.state
                         .metrics
                         .upstream_latency_seconds
@@ -1667,6 +1735,7 @@ impl ProxyServer {
                         "upstream request failed",
                         &domain,
                         &path,
+                        &request_id,
                     ));
                 }
             }
@@ -1692,6 +1761,7 @@ impl ProxyServer {
                     "request body is too large",
                     &domain,
                     &path,
+                    &request_id,
                 ));
             }
             Err(BufferError::Body(error)) => {
@@ -1702,6 +1772,7 @@ impl ProxyServer {
                     "failed to read request body",
                     &domain,
                     &path,
+                    &request_id,
                 ));
             }
         };
@@ -1728,12 +1799,20 @@ impl ProxyServer {
         ) {
             Some(upstream) => upstream,
             None => {
-                self.observe_request(&context, StatusCode::SERVICE_UNAVAILABLE, started, None, 0, 0);
+                self.observe_request(
+                    &context,
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    started,
+                    None,
+                    0,
+                    0,
+                );
                 finish_response!(self.error_response(
                     StatusCode::SERVICE_UNAVAILABLE,
                     "no healthy upstreams",
                     &domain,
                     &path,
+                    &request_id,
                 ));
             }
         };
@@ -1756,6 +1835,7 @@ impl ProxyServer {
                     "too many in-flight requests",
                     &domain,
                     &path,
+                    &request_id,
                 ));
             }
         };
@@ -1841,7 +1921,14 @@ impl ProxyServer {
                     &middleware.sticky_sessions,
                     &upstream,
                 );
-                self.observe_request(&context, status, started, Some(&upstream.url), request_body_len, response.body.len() as u64);
+                self.observe_request(
+                    &context,
+                    status,
+                    started,
+                    Some(&upstream.url),
+                    request_body_len,
+                    response.body.len() as u64,
+                );
                 self.state
                     .metrics
                     .upstream_latency_seconds
@@ -1919,6 +2006,7 @@ impl ProxyServer {
                     "upstream request failed",
                     &domain,
                     &path,
+                    &request_id,
                 ));
             }
         }
@@ -2109,8 +2197,10 @@ impl ProxyServer {
         message: &str,
         domain: &str,
         path: &str,
+        request_id: &str,
     ) -> Response<BoxBody> {
-        self.error_pages.response(status, message, domain, path)
+        self.error_pages
+            .response(status, message, domain, path, request_id)
     }
 
     fn observe_request(
@@ -2245,6 +2335,7 @@ impl ProxyServer {
         config: &BasicAuthConfig,
         domain: &str,
         path: &str,
+        request_id: &str,
     ) -> Option<Response<BoxBody>> {
         if !config.enabled {
             return None;
@@ -2281,6 +2372,7 @@ impl ProxyServer {
             "authentication required",
             domain,
             path,
+            request_id,
         );
         if let Ok(value) = HeaderValue::from_str(&format!("Basic realm=\"{}\"", config.realm)) {
             response.headers_mut().insert(WWW_AUTHENTICATE, value);
@@ -2294,6 +2386,7 @@ impl ProxyServer {
         config: &DigestAuthConfig,
         domain: &str,
         path: &str,
+        request_id: &str,
     ) -> Option<Response<BoxBody>> {
         if !config.enabled {
             return None;
@@ -2327,6 +2420,7 @@ impl ProxyServer {
             "digest authentication required",
             domain,
             path,
+            request_id,
         );
         if let Ok(value) = HeaderValue::from_str(&format!(
             "Digest realm=\"{}\", qop=\"auth\", algorithm=SHA-256, nonce=\"{}\"",
@@ -3766,8 +3860,21 @@ fn boxed_full(body: Bytes) -> BoxBody {
     Full::new(body).map_err(|never| match never {}).boxed()
 }
 
-fn default_error_html(status: StatusCode, message: &str, domain: &str, path: &str) -> String {
-    render_error_template(DEFAULT_ERROR_TEMPLATE, status, message, domain, path)
+fn default_error_html(
+    status: StatusCode,
+    message: &str,
+    domain: &str,
+    path: &str,
+    request_id: &str,
+) -> String {
+    render_error_template(
+        DEFAULT_ERROR_TEMPLATE,
+        status,
+        message,
+        domain,
+        path,
+        request_id,
+    )
 }
 
 fn format_bytes(bytes: u64) -> String {
@@ -3811,6 +3918,7 @@ fn render_error_template(
     message: &str,
     domain: &str,
     path: &str,
+    request_id: &str,
 ) -> String {
     let status_code = status.as_u16().to_string();
     let status_text = status.canonical_reason().unwrap_or("Proxy Error");
@@ -3823,6 +3931,7 @@ fn render_error_template(
         .replace("{{message}}", &escape_html(message))
         .replace("{{domain}}", &escape_html(domain))
         .replace("{{path}}", &escape_html(path))
+        .replace("{{request_id}}", &escape_html(request_id))
 }
 
 fn escape_html(input: &str) -> String {
@@ -3914,11 +4023,13 @@ const DEFAULT_ERROR_TEMPLATE: &str = r#"<!doctype html>
     <dl>
       <dt>Domain</dt>
       <dd>{{domain}}</dd>
-      <dt>Path</dt>
-      <dd>{{path}}</dd>
-    </dl>
-  </main>
-</body>
+	      <dt>Path</dt>
+	      <dd>{{path}}</dd>
+	      <dt>Request ID</dt>
+	      <dd>{{request_id}}</dd>
+	    </dl>
+	  </main>
+	</body>
 </html>
 "#;
 
@@ -3944,6 +4055,7 @@ mod tests {
             "upstream <failed>",
             "app.pxxlhost",
             "/users?name=<x>",
+            "request-123",
         );
 
         assert!(rendered.contains("502 Bad Gateway"));

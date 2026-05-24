@@ -1,0 +1,202 @@
+openapi: 3.1.0
+info:
+  title: Pxxl Proxy Admin API
+  version: 0.1.0
+  description: Admin API for dynamic proxy routes, analytics, and local TLS certificate coverage.
+servers:
+  - url: http://127.0.0.1:8081
+    description: Local admin listener
+security:
+  - BearerAuth: []
+paths:
+  /v1/certs:
+    get:
+      summary: List certificate coverage
+      description: Returns the active local multi-SAN certificate bundle metadata and coverage for registered route domains.
+      tags:
+        - Certificates
+      responses:
+        "200":
+          description: Certificate bundle status.
+          content:
+            application/json:
+              schema:
+                type: object
+                required:
+                  - certificate
+                properties:
+                  certificate:
+                    $ref: "#/components/schemas/CertificateStatus"
+  /v1/domains/{domain}/cert:
+    get:
+      summary: Get domain certificate coverage
+      description: Returns certificate coverage for one normalized domain. A missing route is returned as a not_found domain status.
+      tags:
+        - Certificates
+      parameters:
+        - name: domain
+          in: path
+          required: true
+          schema:
+            type: string
+          example: pxxl.space
+      responses:
+        "200":
+          description: Certificate status for the requested domain.
+          content:
+            application/json:
+              schema:
+                type: object
+                required:
+                  - certificate
+                properties:
+                  certificate:
+                    $ref: "#/components/schemas/CertificateStatus"
+        "400":
+          description: Missing domain.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+  /v1/domains:
+    post:
+      summary: Register or update a proxy domain route
+      description: Creates an API-managed route and returns the route plus current certificate coverage for that domain.
+      tags:
+        - Domains
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/DomainRouteRequest"
+      responses:
+        "201":
+          description: Domain route created.
+          content:
+            application/json:
+              schema:
+                type: object
+                required:
+                  - status
+                  - domain
+                  - certificate
+                properties:
+                  status:
+                    type: string
+                    example: created
+                  domain:
+                    type: object
+                    additionalProperties: true
+                  certificate:
+                    $ref: "#/components/schemas/CertificateStatus"
+        "400":
+          description: Invalid route request.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+components:
+  securitySchemes:
+    BearerAuth:
+      type: http
+      scheme: bearer
+  schemas:
+    CertificateStatus:
+      type: object
+      required:
+        - mode
+        - cert_dir
+        - cert_path
+        - key_path
+        - generated
+        - cert_modified_unix_ms
+        - domains
+      properties:
+        mode:
+          type: string
+          enum:
+            - local_multi_san
+        cert_dir:
+          type: string
+          example: /data/certs
+        cert_path:
+          type: string
+          example: /data/certs/local-dev-cert.pem
+        key_path:
+          type: string
+          example: /data/certs/local-dev-key.pem
+        generated:
+          type: boolean
+          description: True when both local certificate and key files exist.
+        cert_modified_unix_ms:
+          type:
+            - integer
+            - "null"
+          format: int64
+          description: Unix epoch milliseconds for the current certificate file mtime.
+        domains:
+          type: array
+          items:
+            $ref: "#/components/schemas/CertificateDomainStatus"
+    CertificateDomainStatus:
+      type: object
+      required:
+        - domain
+        - tls_enabled
+        - covered
+        - status
+        - reason
+      properties:
+        domain:
+          type: string
+          example: pxxl.space
+        tls_enabled:
+          type: boolean
+        covered:
+          type: boolean
+          description: True when TLS is enabled for the route and the local bundle exists.
+        status:
+          type: string
+          enum:
+            - covered
+            - pending
+            - disabled
+            - not_found
+        reason:
+          type: string
+          example: active_local_certificate_bundle
+    DomainRouteRequest:
+      type: object
+      required:
+        - domain
+      properties:
+        domain:
+          type: string
+          example: pxxl.space
+        tls:
+          type: boolean
+          default: true
+        upstreams:
+          type: array
+          items:
+            type: object
+            required:
+              - url
+            properties:
+              url:
+                type: string
+                example: http://frontend:3000
+              weight:
+                type: integer
+                default: 1
+              backup:
+                type: boolean
+                default: false
+    ErrorResponse:
+      type: object
+      required:
+        - error
+      properties:
+        error:
+          type: string

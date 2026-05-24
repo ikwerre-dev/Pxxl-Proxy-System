@@ -553,6 +553,7 @@ For true wildcard resolution, use dnsmasq or CoreDNS.
 - `GET /v1/domains`
 - `POST /v1/domains`
 - `GET /v1/domains/{domain}`
+- `GET /v1/domains/{domain}/cert`
 - `DELETE /v1/domains/{domain}`
 - `GET /v1/stats/domains`
 - `GET /v1/domains/{domain}/stats`
@@ -571,7 +572,7 @@ For true wildcard resolution, use dnsmasq or CoreDNS.
 - `POST /v1/blacklist/{domain_id}` with `{"ip":"203.0.113.10"}`
 - `DELETE /v1/blacklist/{domain_id}/{ip}`
 
-API-created domains are persisted in Redis and immediately loaded into the in-memory route registry. The proxy hot path does not query Redis.
+API-created domains are persisted in Redis and immediately loaded into the in-memory route registry. The proxy hot path does not query Redis. TLS-enabled domains are included in the local multi-SAN certificate bundle that the edge process regenerates and hot-reloads as route domains change; use `GET /v1/certs` or `GET /v1/domains/{domain}/cert` to confirm current certificate coverage.
 
 Postman collection:
 
