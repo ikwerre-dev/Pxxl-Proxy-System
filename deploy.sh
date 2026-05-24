@@ -8,6 +8,13 @@ PULL_LATEST=true
 log() { printf '[%s] %s\n' "$APP_NAME" "$*"; }
 die() { printf '[%s] ERROR: %s\n' "$APP_NAME" "$*" >&2; exit 1; }
 
+bool_enabled() {
+  case "${1:-}" in
+    1|true|TRUE|yes|YES|on|ON) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
 compose_cmd() {
   if command -v podman-compose >/dev/null 2>&1; then
     printf 'podman-compose'
@@ -24,6 +31,14 @@ proxy_admin_token() {
     token="${PXXL_ADMIN_BOOTSTRAP_TOKEN:-}"
   fi
   printf '%s' "$token"
+}
+
+prune_after_build() {
+  bool_enabled "${PXXL_PRUNE_AFTER_BUILD:-true}" || return 0
+  command -v podman >/dev/null 2>&1 || return 0
+
+  log "Pruning unused Podman build/container/image data"
+  podman system prune -af >/dev/null 2>&1 || log "Podman prune skipped or failed; continuing"
 }
 
 active_gateway_upstream() {
@@ -157,3 +172,4 @@ done
 sync_control_plane_routes
 
 log "Proxy is healthy"
+prune_after_build
