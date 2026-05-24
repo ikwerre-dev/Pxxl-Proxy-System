@@ -68,6 +68,8 @@ sync_control_plane_routes() {
   local token gateway_upstream frontend_upstream domain payload
   local gateway_domains="${PXXL_GATEWAY_PROXY_DOMAINS:-gateway.pxxl.app}"
   local frontend_domains="${PXXL_FRONTEND_PROXY_DOMAINS:-v3.pxxl.app}"
+  local posthog_api_upstream="${PXXL_POSTHOG_API_UPSTREAM:-https://us.i.posthog.com}"
+  local posthog_assets_upstream="${PXXL_POSTHOG_ASSETS_UPSTREAM:-https://us-assets.i.posthog.com}"
   local -a curl_args
 
   token="$(proxy_admin_token)"
@@ -97,10 +99,10 @@ sync_control_plane_routes() {
     [ -n "$gateway_upstream" ] || continue
     [ -n "$frontend_upstream" ] || continue
     payload=$(
-      printf '{"domain":"%s","id":"frontend-%s","tls":true,"paths":[{"prefix":"/api","upstreams":[{"url":"%s","weight":1}]},{"prefix":"/","upstreams":[{"url":"%s","weight":1}]}]}' \
-        "$domain" "$domain" "$gateway_upstream" "$frontend_upstream"
+      printf '{"domain":"%s","id":"frontend-%s","tls":true,"paths":[{"prefix":"/api","upstreams":[{"url":"%s","weight":1}]},{"prefix":"/e","upstreams":[{"url":"%s","weight":1}]},{"prefix":"/batch","upstreams":[{"url":"%s","weight":1}]},{"prefix":"/decide","upstreams":[{"url":"%s","weight":1}]},{"prefix":"/flags","upstreams":[{"url":"%s","weight":1}]},{"prefix":"/array","upstreams":[{"url":"%s","weight":1}]},{"prefix":"/static","upstreams":[{"url":"%s","weight":1}]},{"prefix":"/","upstreams":[{"url":"%s","weight":1}]}]}' \
+        "$domain" "$domain" "$gateway_upstream" "$posthog_api_upstream" "$posthog_api_upstream" "$posthog_api_upstream" "$posthog_api_upstream" "$posthog_assets_upstream" "$posthog_assets_upstream" "$frontend_upstream"
     )
-    log "Syncing proxy route $domain -> /api $gateway_upstream, / $frontend_upstream"
+    log "Syncing proxy route $domain -> /api $gateway_upstream, PostHog first-party, / $frontend_upstream"
     curl_args=(-fsS -X POST "$admin_url/v1/domains" -H 'Content-Type: application/json')
     if [ -n "$token" ]; then
       curl_args+=(-H "Authorization: Bearer $token")
