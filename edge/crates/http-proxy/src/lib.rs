@@ -2887,6 +2887,9 @@ async fn runtime_upstream_network_allowed(raw: &str) -> bool {
     if reserved_host_gateway(&host) {
         return host_gateway_upstreams_allowed();
     }
+    if private_upstreams_allowed() {
+        return true;
+    }
     if let Ok(ip) = host.parse::<IpAddr>() {
         return ip_allowed_for_upstream(ip);
     }
@@ -2912,6 +2915,17 @@ fn reserved_host_gateway(host: &str) -> bool {
 
 fn host_gateway_upstreams_allowed() -> bool {
     std::env::var("PXXL_ALLOW_HOST_GATEWAY_UPSTREAMS")
+        .map(|value| {
+            matches!(
+                value.to_ascii_lowercase().as_str(),
+                "1" | "true" | "yes" | "on"
+            )
+        })
+        .unwrap_or(false)
+}
+
+fn private_upstreams_allowed() -> bool {
+    std::env::var("PXXL_ALLOW_PRIVATE_UPSTREAMS")
         .map(|value| {
             matches!(
                 value.to_ascii_lowercase().as_str(),
