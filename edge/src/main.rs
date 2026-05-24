@@ -462,24 +462,63 @@ async fn run_tls_reloader(
     local_subject_alt_names: Vec<String>,
     mut shutdown: watch::Receiver<bool>,
 ) -> Result<()> {
-    let mut interval = time::interval(Duration::from_secs(5));
+    const TLS_RELOAD_INTERVAL: Duration = Duration::from_secs(5);
+    const TLS_RELOAD_MAX_ATTEMPTS: u8 = 10;
+
+    let mut interval = time::interval(TLS_RELOAD_INTERVAL);
     let mut current_domains = certificate_domains(&local_subject_alt_names, &state);
+    let mut pending_domains: Option<Vec<String>> = None;
+    let mut exhausted_domains: Option<Vec<String>> = None;
+    let mut attempts = 0_u8;
 
     loop {
         tokio::select! {
             _ = interval.tick() => {
                 let domains = certificate_domains(&local_subject_alt_names, &state);
-                if domains != current_domains {
+                if domains != current_domains
+                    && pending_domains.as_ref() != Some(&domains)
+                    && exhausted_domains.as_ref() != Some(&domains)
+                {
+                    pending_domains = Some(domains);
+                    attempts = 0;
+                }
+
+                if let Some(domains) = pending_domains.clone() {
+                    if attempts >= TLS_RELOAD_MAX_ATTEMPTS {
+                        warn!(
+                            max_attempts = TLS_RELOAD_MAX_ATTEMPTS,
+                            domains = ?domains,
+                            "exhausted local TLS certificate reload attempts for dynamic route domains"
+                        );
+                        exhausted_domains = Some(domains);
+                        pending_domains = None;
+                        continue;
+                    }
+
+                    attempts += 1;
                     match cert_store.regenerate_certificate(&domains).await {
                         Ok(bundle) => match cert_store.server_config_from_bundle(&bundle) {
                             Ok(config) => {
                                 tls_config.store(config);
+                                exhausted_domains = None;
+                                pending_domains = None;
+                                attempts = 0;
                                 current_domains = domains;
                                 info!("reloaded local TLS certificate for dynamic route domains");
                             }
-                            Err(error) => warn!(%error, "failed to rebuild TLS server config"),
+                            Err(error) => warn!(
+                                %error,
+                                attempt = attempts,
+                                max_attempts = TLS_RELOAD_MAX_ATTEMPTS,
+                                "failed to rebuild TLS server config"
+                            ),
                         },
-                        Err(error) => warn!(%error, "failed to regenerate local TLS certificate"),
+                        Err(error) => warn!(
+                            %error,
+                            attempt = attempts,
+                            max_attempts = TLS_RELOAD_MAX_ATTEMPTS,
+                            "failed to regenerate local TLS certificate"
+                        ),
                     }
                 }
             }
