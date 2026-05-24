@@ -75,7 +75,7 @@ impl GeoIpResolver {
                 records = records.len(),
                 "loaded offline GeoIP database"
             );
-        } else {
+        } else if !path.exists() {
             warn!(
                 path = %path.display(),
                 "GeoIP database not found; using built-in private/local ranges only"
