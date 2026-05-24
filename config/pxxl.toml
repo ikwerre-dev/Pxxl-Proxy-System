@@ -33,7 +33,7 @@ dir = "config/error-pages"
 
 [geoip]
 enabled = true
-database_path = "config/geoip/geoip.csv"
+database_path = "config/geoip/GeoLite2-City.mmdb"
 
 [admin]
 auth_enabled = true

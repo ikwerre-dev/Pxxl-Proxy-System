@@ -388,7 +388,7 @@ latency_aware
 
 The runtime currently proxies HTTP and HTTPS entrypoints to HTTP upstreams. API-created routes reject `https://` upstream URLs until upstream TLS verification, SNI, custom CA, and mTLS handling are implemented. ACME, TCP, UDP, HTTP/3, per-router TLS cipher/client-auth selection, and HTTPS upstream mTLS fields are accepted in the route schema for control-plane compatibility, but production listener/transport implementations are still in progress.
 
-The GeoIP resolver is fully offline. It reads `config/geoip/geoip.csv` by default. The built-in seed only knows localhost and private ranges, so add a licensed CIDR database if you need real public-country accuracy.
+The GeoIP resolver is fully offline. It reads `config/geoip/GeoLite2-City.mmdb` by default and also loads sibling Country and ASN MMDB files when present. CSV seed files are still supported for small CIDR tables. The built-in seed only knows localhost and private ranges, so add licensed MaxMind data if you need real public-country, city, ASN, bot, and hosting-provider accuracy.
 
 ## Analytics and Stats
 

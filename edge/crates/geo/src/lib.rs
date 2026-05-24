@@ -1,9 +1,11 @@
 use anyhow::{Context, Result};
 use ipnet::{IpNet, Ipv4Net, Ipv6Net};
+use maxminddb::{geoip2, Reader};
 use pxxl_common::GeoLocation;
 use std::{
+    collections::BTreeMap,
     net::{IpAddr, Ipv4Addr, Ipv6Addr},
-    path::Path,
+    path::{Path, PathBuf},
     sync::Arc,
 };
 use tracing::{info, warn};
@@ -11,6 +13,7 @@ use tracing::{info, warn};
 #[derive(Debug, Clone)]
 pub struct GeoIpResolver {
     records: Arc<Vec<GeoIpRecord>>,
+    mmdb: Option<Arc<MmdbDatabases>>,
     enabled: bool,
 }
 
@@ -20,10 +23,18 @@ struct GeoIpRecord {
     location: GeoLocation,
 }
 
+#[derive(Debug)]
+struct MmdbDatabases {
+    city: Option<Reader<Vec<u8>>>,
+    country: Option<Reader<Vec<u8>>>,
+    asn: Option<Reader<Vec<u8>>>,
+}
+
 impl Default for GeoIpResolver {
     fn default() -> Self {
         Self {
             records: Arc::new(builtin_records()),
+            mmdb: None,
             enabled: true,
         }
     }
@@ -33,6 +44,7 @@ impl GeoIpResolver {
     pub fn disabled() -> Self {
         Self {
             records: Arc::new(Vec::new()),
+            mmdb: None,
             enabled: false,
         }
     }
@@ -45,7 +57,16 @@ impl GeoIpResolver {
         let path = path.as_ref();
         let mut records = builtin_records();
 
-        if path.exists() {
+        let mmdb = if path
+            .extension()
+            .is_some_and(|extension| extension == "mmdb")
+        {
+            Some(Arc::new(load_mmdb_databases(path)?))
+        } else {
+            None
+        };
+
+        if path.exists() && mmdb.is_none() {
             let content = std::fs::read_to_string(path)
                 .with_context(|| format!("reading GeoIP database {}", path.display()))?;
             records.extend(parse_database(&content)?);
@@ -63,6 +84,7 @@ impl GeoIpResolver {
 
         Ok(Self {
             records: Arc::new(records),
+            mmdb,
             enabled: true,
         })
     }
@@ -72,6 +94,10 @@ impl GeoIpResolver {
             return GeoLocation::unknown();
         }
 
+        if let Some(location) = self.lookup_mmdb(ip) {
+            return location;
+        }
+
         self.records
             .iter()
             .filter(|record| record.network.contains(&ip))
@@ -79,6 +105,174 @@ impl GeoIpResolver {
             .map(|record| record.location.clone())
             .unwrap_or_else(GeoLocation::unknown)
     }
+
+    fn lookup_mmdb(&self, ip: IpAddr) -> Option<GeoLocation> {
+        let mmdb = self.mmdb.as_ref()?;
+
+        if let Some(reader) = &mmdb.city {
+            if let Ok(city) = reader.lookup::<geoip2::City>(ip) {
+                let location = location_from_city(city, mmdb.asn.as_ref(), ip);
+                if location.country_code.is_some()
+                    || location.continent_code.is_some()
+                    || location.city.is_some()
+                {
+                    return Some(location);
+                }
+            }
+        }
+
+        if let Some(reader) = &mmdb.country {
+            if let Ok(country) = reader.lookup::<geoip2::Country>(ip) {
+                let location = location_from_country(country, mmdb.asn.as_ref(), ip);
+                if location.country_code.is_some() || location.continent_code.is_some() {
+                    return Some(location);
+                }
+            }
+        }
+
+        None
+    }
+}
+
+fn load_mmdb_databases(path: &Path) -> Result<MmdbDatabases> {
+    let dir = path.parent().unwrap_or_else(|| Path::new("."));
+    let city_path = pick_existing(path, dir, &["GeoLite2-City.mmdb", "GeoIP2-City.mmdb"]);
+    let country_path = pick_existing(path, dir, &["GeoLite2-Country.mmdb", "GeoIP2-Country.mmdb"]);
+    let asn_path = pick_existing(
+        path,
+        dir,
+        &["GeoLite2-ASN.mmdb", "GeoIP2-ISP.mmdb", "GeoIP2-ASN.mmdb"],
+    );
+
+    let city = load_mmdb_reader(city_path.as_ref(), "city")?;
+    let country = load_mmdb_reader(country_path.as_ref(), "country")?;
+    let asn = load_mmdb_reader(asn_path.as_ref(), "asn")?;
+
+    info!(
+        path = %path.display(),
+        city = city.is_some(),
+        country = country.is_some(),
+        asn = asn.is_some(),
+        "loaded MaxMind GeoIP MMDB databases"
+    );
+
+    Ok(MmdbDatabases { city, country, asn })
+}
+
+fn pick_existing(path: &Path, dir: &Path, candidates: &[&str]) -> Option<PathBuf> {
+    if path.exists() {
+        return Some(path.to_path_buf());
+    }
+
+    candidates
+        .iter()
+        .map(|candidate| dir.join(candidate))
+        .find(|candidate| candidate.exists())
+}
+
+fn load_mmdb_reader(path: Option<&PathBuf>, label: &str) -> Result<Option<Reader<Vec<u8>>>> {
+    let Some(path) = path else {
+        return Ok(None);
+    };
+
+    Reader::open_readfile(path)
+        .map(Some)
+        .with_context(|| format!("opening {label} MMDB {}", path.display()))
+}
+
+fn location_from_city(
+    city: geoip2::City<'_>,
+    asn: Option<&Reader<Vec<u8>>>,
+    ip: IpAddr,
+) -> GeoLocation {
+    let mut location = GeoLocation {
+        country_code: city
+            .country
+            .as_ref()
+            .and_then(|country| country.iso_code)
+            .map(str::to_ascii_uppercase),
+        country_name: city
+            .country
+            .as_ref()
+            .and_then(|country| localized_name(country.names.as_ref())),
+        continent_code: city
+            .continent
+            .as_ref()
+            .and_then(|continent| continent.code)
+            .map(str::to_ascii_uppercase),
+        continent_name: city
+            .continent
+            .as_ref()
+            .and_then(|continent| localized_name(continent.names.as_ref())),
+        region: city.subdivisions.as_ref().and_then(|subdivisions| {
+            subdivisions
+                .first()
+                .and_then(|subdivision| localized_name(subdivision.names.as_ref()))
+        }),
+        city: city
+            .city
+            .as_ref()
+            .and_then(|city| localized_name(city.names.as_ref())),
+        source: "mmdb_city".to_string(),
+    };
+
+    if let Some(asn_summary) = lookup_asn_summary(asn, ip) {
+        location.source = format!("{}:{asn_summary}", location.source);
+    }
+
+    location
+}
+
+fn location_from_country(
+    country: geoip2::Country<'_>,
+    asn: Option<&Reader<Vec<u8>>>,
+    ip: IpAddr,
+) -> GeoLocation {
+    let mut location = GeoLocation {
+        country_code: country
+            .country
+            .as_ref()
+            .and_then(|country| country.iso_code)
+            .map(str::to_ascii_uppercase),
+        country_name: country
+            .country
+            .as_ref()
+            .and_then(|country| localized_name(country.names.as_ref())),
+        continent_code: country
+            .continent
+            .as_ref()
+            .and_then(|continent| continent.code)
+            .map(str::to_ascii_uppercase),
+        continent_name: country
+            .continent
+            .as_ref()
+            .and_then(|continent| localized_name(continent.names.as_ref())),
+        region: None,
+        city: None,
+        source: "mmdb_country".to_string(),
+    };
+
+    if let Some(asn_summary) = lookup_asn_summary(asn, ip) {
+        location.source = format!("{}:{asn_summary}", location.source);
+    }
+
+    location
+}
+
+fn localized_name(names: Option<&BTreeMap<&str, &str>>) -> Option<String> {
+    names.and_then(|names| {
+        names
+            .get("en")
+            .or_else(|| names.values().next())
+            .map(|name| (*name).to_string())
+    })
+}
+
+fn lookup_asn_summary(reader: Option<&Reader<Vec<u8>>>, ip: IpAddr) -> Option<String> {
+    let asn = reader?.lookup::<geoip2::Asn>(ip).ok()?;
+    let number = asn.autonomous_system_number?;
+    let organization = asn.autonomous_system_organization.unwrap_or("unknown");
+    Some(format!("asn{number}:{organization}"))
 }
 
 fn parse_database(content: &str) -> Result<Vec<GeoIpRecord>> {
@@ -250,6 +444,7 @@ mod tests {
         .unwrap();
         let resolver = GeoIpResolver {
             records: Arc::new(records),
+            mmdb: None,
             enabled: true,
         };
 

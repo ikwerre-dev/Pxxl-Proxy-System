@@ -52,7 +52,7 @@ No database, internet GeoIP API, Redis lookup, ClickHouse write, health-check pr
 - Admin API mutates in-memory blacklist state and exposes operational views.
 - Admin API can require bearer tokens stored in Redis and optional client IP allowlists.
 - API-created routes are persisted in Redis and loaded into the in-memory registry.
-- Offline GeoIP records load from `config/geoip/geoip.csv` at startup.
+- Offline GeoIP records load from `config/geoip/GeoLite2-City.mmdb` at startup when present, with sibling Country/ASN MMDB files used for richer detection. CSV seed files remain supported.
 - ClickHouse analytics writer consumes a best-effort queue and creates `pxxl_access_logs`.
 - TLS reloader regenerates the local certificate when route domains change.
 - Health checker periodically updates upstream `healthy` flags from HTTP probes.

@@ -192,24 +192,26 @@ You can also override this at runtime with `PXXL_ERROR_PAGES_DIR` or disable cus
 
 ## Offline GeoIP
 
-Pxxl does not call an internet API for location detection. It loads a local CSV database at startup and does longest-prefix CIDR matching in memory.
+Pxxl does not call an internet API for location detection. It loads local MaxMind MMDB or CSV data at startup. MMDB lookups are used directly; CSV data uses longest-prefix CIDR matching in memory.
 
 Default config:
 
 ```toml
 [geoip]
 enabled = true
-database_path = "config/geoip/geoip.csv"
+database_path = "config/geoip/GeoLite2-City.mmdb"
 ```
 
-CSV format:
+When `database_path` ends in `.mmdb`, point it at `GeoLite2-City.mmdb`. If sibling `GeoLite2-Country.mmdb` and `GeoLite2-ASN.mmdb` files are present in the same directory, they are loaded too. City/Country data powers country, continent, region, and city routing/analytics; ASN is added to the location source for richer bot and hosting-provider investigation.
+
+CSV remains supported for small offline seed files:
 
 ```csv
 cidr,country_code,country_name,continent_code,continent_name,region,city
 203.0.113.0/24,US,United States,NA,North America,California,Los Angeles
 ```
 
-The repo includes seed records for localhost and private networks only. For real public-country detection, replace or extend `config/geoip/geoip.csv` with a licensed offline CIDR database. You can override the path with `PXXL_GEOIP_DATABASE` or disable lookups with `PXXL_GEOIP_ENABLED=false`.
+The repo includes seed records for localhost and private networks only. For real public-country detection, provide licensed MaxMind MMDB files under `config/geoip`. You can override the path with `PXXL_GEOIP_DATABASE` or disable lookups with `PXXL_GEOIP_ENABLED=false`.
 
 ## Admin Auth
 

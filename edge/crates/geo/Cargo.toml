@@ -8,5 +8,5 @@ license = "MIT"
 pxxl-common = { path = "../common" }
 anyhow = { workspace = true }
 ipnet = { workspace = true }
+maxminddb = { workspace = true }
 tracing = { workspace = true }
-
