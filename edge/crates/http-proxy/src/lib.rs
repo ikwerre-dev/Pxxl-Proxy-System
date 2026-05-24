@@ -10,7 +10,7 @@ use http::{
         AUTHORIZATION, CACHE_CONTROL, CONNECTION, CONTENT_ENCODING, CONTENT_LENGTH, CONTENT_TYPE,
         COOKIE, HOST, LOCATION, ORIGIN, SET_COOKIE, UPGRADE, VARY, WWW_AUTHENTICATE,
     },
-    Method, Request, Response, StatusCode, Uri,
+    Method, Request, Response, StatusCode, Uri, Version,
 };
 use http_body_util::{BodyExt, Full, Limited};
 use hyper::{body::Incoming, service::service_fn};
@@ -2042,6 +2042,7 @@ impl ProxyServer {
         let (parts, body) = req.into_parts();
         let limited_body = Limited::new(body, limit_to_usize(max_request_bytes)).boxed();
         let mut req = Request::from_parts(parts, limited_body);
+        *req.version_mut() = Version::HTTP_11;
         let upstream_uri = build_upstream_uri(context.upstream, req.uri())?;
         *req.uri_mut() = upstream_uri;
         strip_forwarded_request_headers(req.headers_mut());
