@@ -1195,6 +1195,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "bytes",
+ "chrono",
  "http",
  "http-body-util",
  "hyper",
@@ -1355,6 +1356,7 @@ dependencies = [
  "pxxl-ddos",
  "pxxl-geo",
  "pxxl-metrics",
+ "pxxl-redis-sync",
  "pxxl-tls",
  "rustls",
  "sha2",
@@ -1387,6 +1389,7 @@ name = "pxxl-redis-sync"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "chrono",
  "futures-util",
  "pxxl-common",
  "pxxl-ddos",
@@ -1406,6 +1409,7 @@ dependencies = [
  "anyhow",
  "base64",
  "bytes",
+ "chrono",
  "http",
  "http-body-util",
  "hyper",
