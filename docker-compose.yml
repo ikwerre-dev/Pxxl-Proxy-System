@@ -3,7 +3,7 @@ services:
     build:
       context: .
       dockerfile: edge/docker/Dockerfile
-    image: pxxl/edge:local
+    image: localhost/pxxl-edge:local
     container_name: pxxl-proxy-edge
     restart: unless-stopped
     environment:
@@ -111,7 +111,7 @@ services:
     command: -config.file=/etc/promtail/config.yml
     volumes:
       - ./monitoring/promtail/promtail-config.yml:/etc/promtail/config.yml:ro
-      - /var/run/docker.sock:/var/run/docker.sock:ro
+      - ${PXXL_PROMTAIL_SOCKET:-/dev/null}:/var/run/docker.sock:ro
     depends_on:
       - loki
 
@@ -123,7 +123,7 @@ services:
       GF_SECURITY_ADMIN_USER: admin
       GF_SECURITY_ADMIN_PASSWORD: ${GRAFANA_ADMIN_PASSWORD:?set GRAFANA_ADMIN_PASSWORD}
     ports:
-      - "127.0.0.1:${GRAFANA_PORT:-3000}:3000"
+      - "127.0.0.1:${GRAFANA_PORT:-13000}:3000"
     volumes:
       - ./data/grafana:/var/lib/grafana
       - ./monitoring/grafana/provisioning:/etc/grafana/provisioning:ro
