@@ -14,6 +14,7 @@ use http::{
 };
 use http_body_util::{BodyExt, Full, Limited};
 use hyper::{body::Incoming, service::service_fn};
+use hyper_rustls::HttpsConnector;
 use hyper_util::{
     client::legacy::{connect::HttpConnector, Client},
     rt::{TokioExecutor, TokioIo, TokioTimer},
@@ -1343,11 +1344,24 @@ impl PolicyRateKey {
 #[derive(Clone)]
 pub struct ProxyServer {
     state: EdgeState,
-    client: Client<HttpConnector, BoxBody>,
+    client: Client<HttpsConnector<HttpConnector>, BoxBody>,
     error_pages: ErrorPageRenderer,
     policy: PolicyEnforcer,
     geoip: GeoIpResolver,
     bandwidth_tracker: Option<Arc<RedisBandwidthTracker>>,
+}
+
+fn https_connector() -> HttpsConnector<HttpConnector> {
+    let mut http = HttpConnector::new();
+    http.enforce_http(false);
+
+    hyper_rustls::HttpsConnectorBuilder::new()
+        .with_native_roots()
+        .expect("native TLS roots should be available")
+        .https_or_http()
+        .enable_http1()
+        .enable_http2()
+        .wrap_connector(http)
 }
 
 impl ProxyServer {
@@ -1382,9 +1396,7 @@ impl ProxyServer {
         policy: PolicyEnforcer,
         geoip: GeoIpResolver,
     ) -> Self {
-        let mut connector = HttpConnector::new();
-        connector.enforce_http(false);
-        let client = Client::builder(TokioExecutor::new()).build(connector);
+        let client = Client::builder(TokioExecutor::new()).build(https_connector());
         Self {
             state,
             client,

@@ -1153,9 +1153,8 @@ pub fn validate_upstream_url(raw: &str) -> std::result::Result<(), String> {
     }
     let parsed = Url::parse(raw).map_err(|error| format!("invalid upstream URL: {error}"))?;
     match parsed.scheme() {
-        "http" => {}
-        "https" => return Err("HTTPS upstream transport is not enforced yet".to_string()),
-        _ => return Err("upstream URL scheme must be http".to_string()),
+        "http" | "https" => {}
+        _ => return Err("upstream URL scheme must be http or https".to_string()),
     }
     if !parsed.username().is_empty() || parsed.password().is_some() {
         return Err("upstream URL must not contain credentials".to_string());

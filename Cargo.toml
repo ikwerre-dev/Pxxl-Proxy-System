@@ -16,6 +16,7 @@ futures-util = "0.3"
 http = "1.1"
 http-body-util = "0.1"
 hyper = { version = "1.5", features = ["client", "http1", "http2", "server"] }
+hyper-rustls = { version = "0.27", features = ["http1", "http2", "native-tokio"] }
 hyper-util = { version = "0.1", features = ["client", "client-legacy", "http1", "http2", "server", "server-auto", "tokio"] }
 ipnet = { version = "2.10", features = ["serde"] }
 jsonwebtoken = "9.3"

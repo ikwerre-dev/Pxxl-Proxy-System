@@ -2,6 +2,7 @@ use anyhow::{Context, Result};
 use bytes::Bytes;
 use http::{Request, Uri};
 use http_body_util::Empty;
+use hyper_rustls::HttpsConnector;
 use hyper_util::{
     client::legacy::{connect::HttpConnector, Client},
     rt::TokioExecutor,
@@ -306,10 +307,8 @@ async fn run_health_checks(
     config: HealthCheckConfig,
     mut shutdown: watch::Receiver<bool>,
 ) -> Result<()> {
-    let mut connector = HttpConnector::new();
-    connector.enforce_http(false);
-    let client: Client<HttpConnector, Empty<Bytes>> =
-        Client::builder(TokioExecutor::new()).build(connector);
+    let client: Client<HttpsConnector<HttpConnector>, Empty<Bytes>> =
+        Client::builder(TokioExecutor::new()).build(https_connector());
     let mut interval = time::interval(Duration::from_secs(config.interval_seconds.max(1)));
     let timeout = Duration::from_millis(config.timeout_ms.max(100));
 
@@ -336,7 +335,7 @@ async fn run_health_checks(
 }
 
 async fn check_upstream(
-    client: &Client<HttpConnector, Empty<Bytes>>,
+    client: &Client<HttpsConnector<HttpConnector>, Empty<Bytes>>,
     upstream: &UpstreamCheck,
     health_path: &str,
     timeout: Duration,
@@ -361,6 +360,19 @@ async fn check_upstream(
         Ok(Ok(response)) => response.status().as_u16() < 500,
         _ => false,
     }
+}
+
+fn https_connector() -> HttpsConnector<HttpConnector> {
+    let mut http = HttpConnector::new();
+    http.enforce_http(false);
+
+    hyper_rustls::HttpsConnectorBuilder::new()
+        .with_native_roots()
+        .expect("native TLS roots should be available")
+        .https_or_http()
+        .enable_http1()
+        .enable_http2()
+        .wrap_connector(http)
 }
 
 fn build_health_uri(upstream: &str, health_path: &str) -> Option<Uri> {

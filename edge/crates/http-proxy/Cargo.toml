@@ -21,6 +21,7 @@ flate2 = { workspace = true }
 http = { workspace = true }
 http-body-util = { workspace = true }
 hyper = { workspace = true }
+hyper-rustls = { workspace = true }
 hyper-util = { workspace = true }
 parking_lot = { workspace = true }
 rustls = { workspace = true }
