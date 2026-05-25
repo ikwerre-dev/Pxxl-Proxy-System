@@ -128,7 +128,15 @@ ORDER BY (domain, timestamp_unix_ms, request_id)
         self.post_sql(
             "ALTER TABLE pxxl_access_logs ADD COLUMN IF NOT EXISTS bytes_received UInt64 DEFAULT 0",
         )
-        .await
+        .await?;
+        self.post_sql("ALTER TABLE pxxl_access_logs ADD INDEX IF NOT EXISTS idx_status status TYPE set(256) GRANULARITY 4")
+            .await?;
+        self.post_sql("ALTER TABLE pxxl_access_logs ADD INDEX IF NOT EXISTS idx_path path TYPE tokenbf_v1(32768, 3, 0) GRANULARITY 4")
+            .await?;
+        self.post_sql("ALTER TABLE pxxl_access_logs ADD INDEX IF NOT EXISTS idx_remote_ip remote_ip TYPE bloom_filter(0.01) GRANULARITY 4")
+            .await?;
+        self.post_sql("ALTER TABLE pxxl_access_logs ADD INDEX IF NOT EXISTS idx_country_code country_code TYPE set(512) GRANULARITY 4")
+            .await
     }
 
     pub async fn insert_request(&self, event: RequestObservation) -> Result<()> {

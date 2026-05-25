@@ -2737,6 +2737,10 @@ impl ProxyServer {
             if let Ok(name) = HeaderName::from_bytes(header.as_bytes()) {
                 if let Some(value) = req.headers().get(&name) {
                     builder = builder.header(name, value.clone());
+                } else if name.as_str().eq_ignore_ascii_case("x-forwarded-host") {
+                    if let Some(value) = req.headers().get(HOST) {
+                        builder = builder.header(name, value.clone());
+                    }
                 }
             }
         }
