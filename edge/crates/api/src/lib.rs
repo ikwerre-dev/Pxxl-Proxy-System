@@ -263,8 +263,14 @@ impl AdminApiAuth {
             ));
         }
 
-        if !self.enabled || is_public_admin_path(req.method(), req.uri().path()) {
+        if is_public_admin_path(req.method(), req.uri().path()) {
             return Ok(AdminPrincipal::admin());
+        }
+        if !self.enabled {
+            return Err(json_response(
+                StatusCode::SERVICE_UNAVAILABLE,
+                json!({"error": "admin auth is disabled"}),
+            ));
         }
 
         let Some(token) = bearer_token(req) else {
@@ -1452,6 +1458,9 @@ fn require_scope(principal: &AdminPrincipal, scope: &str) -> Option<Response<Box
 
 fn validate_token_scopes(scopes: Vec<String>) -> Result<Vec<String>, String> {
     let scopes = normalize_scopes(scopes);
+    if scopes.is_empty() {
+        return Err("at least one token scope is required".to_string());
+    }
     for scope in &scopes {
         if !matches!(
             scope.as_str(),
@@ -1476,11 +1485,7 @@ fn normalize_scopes(scopes: Vec<String>) -> Vec<String> {
         .collect::<Vec<_>>();
     scopes.sort();
     scopes.dedup();
-    if scopes.is_empty() {
-        vec![SCOPE_ADMIN.to_string()]
-    } else {
-        scopes
-    }
+    scopes
 }
 
 fn normalize_login_email(email: &str) -> Option<String> {

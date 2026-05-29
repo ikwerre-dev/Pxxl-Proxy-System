@@ -3,6 +3,7 @@ use parking_lot::RwLock;
 use serde::{Deserialize, Serialize};
 use std::{
     collections::{BTreeMap, HashMap},
+    env,
     net::SocketAddr,
     sync::Arc,
     time::Duration,
@@ -158,6 +159,7 @@ async fn handle_database_connection(
     let route_key = match database_type.as_str() {
         "postgres" | "postgresql" => {
             let startup = read_postgres_startup_packet(&mut inbound, &mut prelude).await?;
+            require_database_proxy_token(&startup)?;
             startup.route_key()
         }
         _ => None,
@@ -183,6 +185,21 @@ async fn handle_database_connection(
     }
     debug!(%peer, %database_type, ?route_key, %upstream, "database proxy connected");
     let _ = io::copy_bidirectional(&mut inbound, &mut outbound).await?;
+    Ok(())
+}
+
+fn require_database_proxy_token(startup: &PostgresStartup) -> Result<()> {
+    let expected = env::var("PXXL_DATABASE_PROXY_TOKEN")
+        .context("PXXL_DATABASE_PROXY_TOKEN is required for database proxy auth")?;
+    let provided = startup
+        .parameters
+        .get("pxxl_proxy_token")
+        .map(|value| value.trim())
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| anyhow!("missing database proxy token"))?;
+    if provided != expected {
+        bail!("invalid database proxy token");
+    }
     Ok(())
 }
 

@@ -12,6 +12,9 @@
 !/data/certs/.gitkeep
 !/data/secrets/.gitkeep
 .env
+.env*
+*.env
+*.prod
 .DS_Store
 config/geoip/*.mmdb
 *.swp
