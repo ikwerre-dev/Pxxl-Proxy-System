@@ -115,6 +115,7 @@ struct RateBucket {
 pub struct RateLimiter {
     config: RateLimitConfig,
     buckets: DashMap<IpAddr, Mutex<RateBucket>>,
+    last_eviction: Mutex<Instant>,
 }
 
 const RATE_BUCKET_TTL_SECONDS: u64 = 600;
@@ -125,10 +126,12 @@ impl RateLimiter {
         Self {
             config,
             buckets: DashMap::new(),
+            last_eviction: Mutex::new(Instant::now()),
         }
     }
 
     pub fn allow(&self, ip: IpAddr) -> SecurityDecision {
+        self.evict_if_due();
         self.evict_stale();
         let entry = self.buckets.entry(ip).or_insert_with(|| {
             Mutex::new(RateBucket {
@@ -167,6 +170,18 @@ impl RateLimiter {
             return;
         }
         let now = Instant::now();
+        let ttl = Duration::from_secs(RATE_BUCKET_TTL_SECONDS);
+        self.buckets
+            .retain(|_, bucket| now.duration_since(bucket.lock().last_refill) <= ttl);
+    }
+
+    fn evict_if_due(&self) {
+        let now = Instant::now();
+        let mut last = self.last_eviction.lock();
+        if now.duration_since(*last) < Duration::from_secs(30) {
+            return;
+        }
+        *last = now;
         let ttl = Duration::from_secs(RATE_BUCKET_TTL_SECONDS);
         self.buckets
             .retain(|_, bucket| now.duration_since(bucket.lock().last_refill) <= ttl);

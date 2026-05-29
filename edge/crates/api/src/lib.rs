@@ -20,10 +20,11 @@ use serde::{Deserialize, Serialize};
 use serde_json::json;
 use sha2::{Digest, Sha256};
 use std::{
+    collections::HashMap,
     convert::Infallible,
     net::{IpAddr, SocketAddr},
     path::PathBuf,
-    sync::Arc,
+    sync::{Arc, Mutex, OnceLock},
     time::{Duration, UNIX_EPOCH},
 };
 use tokio::{
@@ -45,6 +46,8 @@ const SCOPE_ROUTES_WRITE: &str = "routes:write";
 const SCOPE_TOKENS_READ: &str = "tokens:read";
 const SCOPE_TOKENS_WRITE: &str = "tokens:write";
 const SCOPE_ANALYTICS_READ: &str = "analytics:read";
+const ADMIN_LOGIN_MAX_ATTEMPTS: u32 = 5;
+const ADMIN_LOGIN_WINDOW: Duration = Duration::from_secs(10 * 60);
 
 #[derive(Clone)]
 struct ApiServer {
@@ -105,6 +108,14 @@ struct LoginBody {
     email: String,
     password: String,
 }
+
+#[derive(Clone, Debug)]
+struct LoginAttemptWindow {
+    failures: u32,
+    expires_at: std::time::Instant,
+}
+
+static ADMIN_LOGIN_ATTEMPTS: OnceLock<Mutex<HashMap<String, LoginAttemptWindow>>> = OnceLock::new();
 
 #[derive(Debug, Deserialize)]
 struct DomainRouteBody {
@@ -564,6 +575,18 @@ async fn run_metrics_listener(
 
 impl ApiServer {
     async fn handle(&self, req: Request<Incoming>, remote_ip: IpAddr) -> Response<BoxBody> {
+        if req
+            .headers()
+            .get(http::header::CONTENT_LENGTH)
+            .and_then(|value| value.to_str().ok())
+            .and_then(|value| value.parse::<u64>().ok())
+            .is_some_and(|length| length > ADMIN_BODY_LIMIT_BYTES)
+        {
+            return json_response(
+                StatusCode::PAYLOAD_TOO_LARGE,
+                json!({"error": "request body is too large"}),
+            );
+        }
         let method = req.method().clone();
         let path = req.uri().path().to_string();
         let query = req.uri().query().unwrap_or("").to_string();
@@ -609,7 +632,7 @@ impl ApiServer {
                 }
                 self.create_domain(req).await
             }
-            (Method::POST, "/v1/auth/login") => self.login(req).await,
+            (Method::POST, "/v1/auth/login") => self.login(req, remote_ip).await,
             (Method::POST, "/v1/auth/tokens") => {
                 if let Some(response) = require_scope(&principal, SCOPE_TOKENS_WRITE) {
                     return response;
@@ -1217,7 +1240,7 @@ impl ApiServer {
         }
     }
 
-    async fn login(&self, req: Request<Incoming>) -> Response<BoxBody> {
+    async fn login(&self, req: Request<Incoming>, remote_ip: IpAddr) -> Response<BoxBody> {
         let Some(account) = &self.auth.login_account else {
             return json_response(
                 StatusCode::NOT_FOUND,
@@ -1230,6 +1253,13 @@ impl ApiServer {
                 json!({"error": "admin token store is not configured"}),
             );
         };
+
+        if login_attempts_exceeded(remote_ip) {
+            return json_response(
+                StatusCode::TOO_MANY_REQUESTS,
+                json!({"error": "too many failed login attempts"}),
+            );
+        }
 
         let collected = match collect_admin_body(req.into_body()).await {
             Ok(collected) => collected,
@@ -1251,11 +1281,14 @@ impl ApiServer {
         };
 
         if !account.verify(&body.email, &body.password) {
+            tokio::time::sleep(Duration::from_millis(300)).await;
+            record_failed_login_attempt(remote_ip);
             return json_response(
                 StatusCode::UNAUTHORIZED,
                 json!({"error": "invalid email or password"}),
             );
         }
+        clear_login_attempts(remote_ip);
 
         let token_name = account.token_name();
         if let Err(error) = store.revoke_tokens_by_name(&token_name).await {
@@ -1799,16 +1832,13 @@ fn query_limit(query: &str, default: usize, max: usize) -> usize {
 }
 
 fn query_value(query: &str, name: &str) -> Option<String> {
-    query
-        .split('&')
-        .filter_map(|part| part.split_once('='))
-        .find_map(|(key, value)| {
-            if key == name && !value.is_empty() {
-                Some(value.to_string())
-            } else {
-                None
-            }
-        })
+    url::form_urlencoded::parse(query.as_bytes()).find_map(|(key, value)| {
+        if key == name && !value.is_empty() {
+            Some(value.into_owned())
+        } else {
+            None
+        }
+    })
 }
 
 fn is_public_admin_path(method: &Method, path: &str) -> bool {
@@ -1932,14 +1962,54 @@ impl ApiServer {
 }
 
 fn constant_time_eq(left: &[u8], right: &[u8]) -> bool {
-    if left.len() != right.len() {
-        return false;
-    }
-
+    let left = Sha256::digest(left);
+    let right = Sha256::digest(right);
     left.iter()
         .zip(right)
         .fold(0_u8, |acc, (left, right)| acc | (left ^ right))
         == 0
+}
+
+fn login_attempts() -> &'static Mutex<HashMap<String, LoginAttemptWindow>> {
+    ADMIN_LOGIN_ATTEMPTS.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+fn login_attempts_exceeded(remote_ip: IpAddr) -> bool {
+    let key = remote_ip.to_string();
+    let now = std::time::Instant::now();
+    let mut attempts = login_attempts()
+        .lock()
+        .expect("login attempts lock poisoned");
+    attempts.retain(|_, window| now < window.expires_at);
+    attempts
+        .get(&key)
+        .is_some_and(|window| window.failures >= ADMIN_LOGIN_MAX_ATTEMPTS)
+}
+
+fn record_failed_login_attempt(remote_ip: IpAddr) {
+    let key = remote_ip.to_string();
+    let now = std::time::Instant::now();
+    let mut attempts = login_attempts()
+        .lock()
+        .expect("login attempts lock poisoned");
+    attempts.retain(|_, window| now < window.expires_at);
+    let window = attempts.entry(key).or_insert(LoginAttemptWindow {
+        failures: 0,
+        expires_at: now + ADMIN_LOGIN_WINDOW,
+    });
+    if now >= window.expires_at {
+        window.failures = 0;
+        window.expires_at = now + ADMIN_LOGIN_WINDOW;
+    }
+    window.failures += 1;
+}
+
+fn clear_login_attempts(remote_ip: IpAddr) {
+    let key = remote_ip.to_string();
+    let mut attempts = login_attempts()
+        .lock()
+        .expect("login attempts lock poisoned");
+    attempts.remove(&key);
 }
 
 fn json_response(status: StatusCode, value: serde_json::Value) -> Response<BoxBody> {

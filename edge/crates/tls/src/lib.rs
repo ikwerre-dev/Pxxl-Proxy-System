@@ -211,11 +211,22 @@ impl CertificateIssuer for LocalCertificateStore {
         }
 
         if cert_path.exists() && key_path.exists() {
-            return Ok(CertificateBundle {
-                cert_path,
-                key_path,
-                domains: domains.to_vec(),
-            });
+            if let Ok(metadata) = fs::metadata(&cert_path).await {
+                if let Ok(modified) = metadata.modified() {
+                    if modified
+                        .elapsed()
+                        .map(|elapsed| elapsed < std::time::Duration::from_secs(335 * 24 * 60 * 60))
+                        .unwrap_or(true)
+                    {
+                        return Ok(CertificateBundle {
+                            cert_path,
+                            key_path,
+                            domains: domains.to_vec(),
+                        });
+                    }
+                }
+            }
+            return self.regenerate_certificate(domains).await;
         }
 
         let (cert_pem, key_pem, sans) = generate_certificate(domains)?;

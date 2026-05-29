@@ -238,6 +238,8 @@ pub struct DomainRules {
     #[serde(default)]
     pub maintenance_mode: bool,
     #[serde(default)]
+    pub maintenance_status_code: Option<u16>,
+    #[serde(default)]
     pub preserve_host_header: bool,
     #[serde(default)]
     pub add_security_headers: bool,
@@ -371,6 +373,7 @@ impl Default for DomainRules {
             max_uri_length: None,
             allowed_content_types: Vec::new(),
             maintenance_mode: false,
+            maintenance_status_code: None,
             preserve_host_header: false,
             add_security_headers: false,
             cors_allowed_origins: Vec::new(),

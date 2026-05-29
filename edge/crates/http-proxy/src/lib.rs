@@ -531,8 +531,13 @@ impl PolicyEnforcer {
         context: &ProxyRequestContext<'_>,
     ) -> Option<PolicyRejection> {
         if rules.maintenance_mode {
+            let status = rules
+                .maintenance_status_code
+                .and_then(|value| StatusCode::from_u16(value).ok())
+                .filter(|value| value.is_server_error() || value.is_client_error())
+                .unwrap_or(StatusCode::SERVICE_UNAVAILABLE);
             return Some(policy_rejection(
-                StatusCode::SERVICE_UNAVAILABLE,
+                status,
                 "domain is in maintenance mode",
                 "maintenance_mode",
             ));
