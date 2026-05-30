@@ -82,6 +82,8 @@ services:
       CLICKHOUSE_USER: pxxl
       CLICKHOUSE_PASSWORD: pxxl
       CLICKHOUSE_DEFAULT_ACCESS_MANAGEMENT: "1"
+    ports:
+      - "127.0.0.1:18124:8123"
     volumes:
       - ./data/clickhouse:/var/lib/clickhouse
 
