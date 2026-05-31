@@ -161,7 +161,9 @@ replace_edge_container_after_build
 log "Starting proxy stack"
 $COMPOSE "${compose_files[@]}" up -d
 
-for url in "http://127.0.0.1:8081/healthz" "http://127.0.0.1:8081/readyz"; do
+admin_health_base="${PXXL_PROXY_ADMIN_URL:-http://127.0.0.1:8081}"
+admin_health_base="${admin_health_base%/}"
+for url in "$admin_health_base/healthz" "$admin_health_base/readyz"; do
   log "Waiting for $url"
   ok=false
   for i in $(seq 1 45); do
