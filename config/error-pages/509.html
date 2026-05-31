@@ -3,151 +3,195 @@
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>509 Bandwidth limit reached</title>
+  <title>509 Bandwidth Limit Exceeded</title>
   <style>
-    :root {
-      color-scheme: dark;
-      --bg: #020305;
-      --panel: #0d0d0d;
-      --panel-strong: #0d0d0d;
-      --text: #f8fbff;
-      --muted: #9aa7b8;
-      --soft: #d8e0ea;
-      --line: #ffffff20;
-      --cyan: #FF63F990;
-      --blue: #73a7ff;
-      --violet: #b28cff;
-    }
     * { box-sizing: border-box; }
+    html,
     body {
       margin: 0;
-      min-height: 100vh;
-      overflow-x: hidden;
-      display: grid;
-      place-items: center;
-      padding: 28px;
-      background: #020305;
-      color: var(--text);
-      font-family: Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+      min-height: 100%;
+      background: #000;
     }
-    body::before {
-      content: "";
-      position: fixed;
-      inset: 0;
+    body {
+      font-family: ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+      color: #fff;
+    }
+    .not-found {
+      position: relative;
+      min-height: 100vh;
+      margin: 0 auto;
+      overflow: hidden;
+      background: #000;
+    }
+    .logo-link {
+      position: absolute;
+      z-index: 40;
+      top: 32px;
+      right: 0;
+      left: 0;
+      display: block;
+      width: fit-content;
+      margin: 0 auto;
+    }
+    .logo-link img {
+      display: block;
+      width: 112px;
+      height: auto;
+    }
+    .large-layer {
+      position: absolute;
+      z-index: 1;
+      top: 140px;
+      right: 0;
+      left: 0;
       pointer-events: none;
     }
-    body::before {
-      background-image:
-        radial-gradient(circle, rgba(255,255,255,0.80) 0 1px, transparent 1.3px),
-        radial-gradient(circle, rgba(255,255,255,0.36) 0 1px, transparent 1.4px);
-      background-size: 110px 110px, 170px 170px;
-      background-position: 10px 20px, 60px 80px;
-      opacity: 0.34;
+    .large-layer.shadow {
+      z-index: 0;
+      top: 145px;
     }
-    main {
+    .large-404,
+    .medium-404 {
+      margin: 0 auto;
+      font-weight: 600;
+      line-height: 0.9;
+      text-align: center;
+      transform: rotate(-0.133deg);
+      user-select: none;
+      white-space: nowrap;
+    }
+    .large-404 {
+      font-size: 262.916px;
+      color: rgba(217, 217, 217, 0.04);
+    }
+    .large-layer.shadow .large-404 {
+      color: rgba(255, 255, 255, 0.012);
+    }
+    .medium-layers {
       position: relative;
-      z-index: 1;
-      width: min(760px, 100%);
-      padding: clamp(28px, 5vw, 52px);
-      border: 1px solid var(--line);
-      border-radius: 8px;
-      background: var(--panel);
-      box-shadow: 0 26px 90px rgba(0,0,0,0.54);
-      backdrop-filter: blur(18px);
+      z-index: 2;
+      margin-top: 200px;
+      height: 210px;
     }
-    .eyebrow {
-      display: inline-flex;
-      align-items: center;
-      gap: 10px;
-      color: var(--cyan);
-      font-size: 12px;
-      font-weight: 800;
-      letter-spacing: 0.08em;
-      text-transform: uppercase;
+    .medium-404 {
+      position: absolute;
+      top: 0;
+      right: 0;
+      left: 0;
+      font-size: 100.999px;
+      color: rgba(255, 255, 255, 0.12);
     }
-    .dot {
-      width: 7px;
-      height: 7px;
-      border-radius: 999px;
-      background: var(--cyan);
-      box-shadow: 0 0 24px var(--cyan);
+    .medium-404.front {
+      top: 12px;
+      color: rgba(255, 255, 255, 0.40);
+    }
+    .content {
+      position: relative;
+      z-index: 3;
+      width: min(100%, 440px);
+      margin: 130px auto 0;
+      padding: 0 12px;
+      text-align: center;
     }
     h1 {
-      margin: 16px 0 12px;
-      max-width: 12ch;
-      font-size: clamp(42px, 9vw, 82px);
-      line-height: 0.95;
+      margin: 0;
+      color: #fff;
+      font-size: 23px;
+      font-weight: 600;
+      line-height: 1.25;
       letter-spacing: 0;
     }
-    .message {
-      max-width: 62ch;
-      margin: 0;
-      color: var(--soft);
-      font-size: clamp(15px, 2vw, 18px);
-      line-height: 1.65;
+    p {
+      max-width: 384px;
+      margin: 8px auto 0;
+      color: rgba(255, 255, 255, 0.60);
+      font-size: 14px;
+      font-weight: 500;
+      line-height: 1.55;
+      text-align: center;
     }
-    .details {
-      display: grid;
-      grid-template-columns: repeat(2, minmax(0, 1fr));
-      gap: 12px;
-      margin-top: 30px;
-    }
-    .detail {
-      min-width: 0;
-      border: 1px solid var(--line);
-      border-radius: 8px;
-      padding: 14px 16px;
-      background: rgba(255,255,255,0.035);
-    }
-    .label {
-      margin-bottom: 7px;
-      color: var(--muted);
-      font-size: 11px;
-      font-weight: 800;
-      letter-spacing: 0.08em;
-      text-transform: uppercase;
-    }
-    .value {
-      color: var(--text);
+    .request-id {
+      margin-top: 12px;
+      color: rgba(255, 255, 255, 0.42);
       font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", monospace;
-      font-size: 13px;
+      font-size: 11.5px;
+      font-weight: 500;
       overflow-wrap: anywhere;
     }
-    .request {
-      grid-column: 1 / -1;
-      border-color: rgba(255,99,249,0.30);
-      background: rgba(255,255,255,0.035);
+    .button-frame {
+      position: relative;
+      z-index: 4;
+      display: block;
+      width: fit-content;
+      margin: 16px auto 0;
+      padding-top: 2px;
+      padding-right: 2px;
+      border-top: 1px solid rgba(217, 217, 217, 0.80);
+      border-right: 1px solid rgba(217, 217, 217, 0.45);
+      cursor: pointer;
     }
-    @media (max-width: 640px) {
-      body { padding: 16px; }
-      .details { grid-template-columns: 1fr; }
-      h1 { font-size: clamp(38px, 15vw, 62px); }
+    .visit-link {
+      display: block;
+      border: 0;
+      border-radius: 0;
+      background: #000;
+      padding: 14.85px 22.8px;
+      color: #fff;
+      font: inherit;
+      font-size: 14.5px;
+      font-weight: 500;
+      line-height: 1;
+      text-decoration: none;
+      white-space: nowrap;
+      cursor: pointer;
+    }
+    .visit-link:hover { transform: scale(0.99); }
+    .visit-link:active { transform: scale(1.1); }
+    @media (min-width: 768px) {
+      .large-layer { top: 20px; }
+      .large-layer.shadow { top: -16px; }
+      .medium-layers {
+        margin-top: 100px;
+        height: 210px;
+      }
+      .content { margin-top: 40px; }
+      .button-frame { margin-top: 27px; }
+    }
+    @media (min-width: 1024px) {
+      .large-404 { font-size: 547.559px; }
+      .medium-404 { font-size: 200.477px; }
+      .medium-404.front { top: 24px; }
+      .medium-layers {
+        margin-top: 100px;
+        height: 260px;
+      }
+      .content { margin-top: 40px; }
     }
   </style>
 </head>
 <body>
-  <main>
-    <div class="eyebrow"><span class="dot"></span>Pxxl Proxy / 509</div>
-    <h1>Bandwidth limit reached</h1>
-    <p class="message">This domain has used its current bandwidth allocation.</p>
-    <div class="details">
-      <div class="detail request">
-        <div class="label">Request ID</div>
-        <div class="value">{{request_id}}</div>
-      </div>
-      <div class="detail">
-        <div class="label">Processing time</div>
-        <div class="value">{{processing_time_ms}} ms</div>
-      </div>
-      <div class="detail">
-        <div class="label">Domain</div>
-        <div class="value">{{domain}}</div>
-      </div>
-      <div class="detail">
-        <div class="label">Path</div>
-        <div class="value">{{path}}</div>
+  <section class="not-found">
+    <a class="logo-link" href="https://pxxl.app" aria-label="Visit Pxxl">
+      <img src="https://cdn.pxxl.app/core/website/assets/pxxllogo.png" alt="Pxxl">
+    </a>
+    <div class="large-layer" aria-hidden="true">
+      <h2 class="large-404">404</h2>
+    </div>
+    <div class="large-layer shadow" aria-hidden="true">
+      <h2 class="large-404">404</h2>
+    </div>
+    <div class="medium-layers" aria-hidden="true">
+      <p class="medium-404">404</p>
+      <p class="medium-404 front">404</p>
+    </div>
+    <div class="content">
+      <h1>oooops! chief..&#128546;</h1>
+      <p>We can&apos;t show the page you requested due to legal reasons.</p>
+      <p class="request-id">Request ID: {{request_id}}</p>
+      <div class="button-frame">
+        <a class="visit-link" href="https://pxxl.app">Visit Pxxl</a>
       </div>
     </div>
-  </main>
+  </section>
 </body>
 </html>
