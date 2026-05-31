@@ -4,6 +4,7 @@ FROM docker.io/library/rust:1-bookworm AS builder
 WORKDIR /src
 COPY Cargo.toml ./
 COPY Cargo.lock ./
+COPY config ./config
 COPY edge ./edge
 RUN --mount=type=cache,target=/usr/local/cargo/registry \
     --mount=type=cache,target=/src/target \
