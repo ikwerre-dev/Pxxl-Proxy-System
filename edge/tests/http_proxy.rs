@@ -168,6 +168,11 @@ async fn strips_hop_by_hop_response_headers() {
 
     assert!(headers.get("connection").is_none());
     assert!(headers.get("x-hop-secret").is_none());
+    assert!(
+        headers.get("host").is_none(),
+        "unexpected host response header: {:?}",
+        headers.get("host")
+    );
 }
 
 #[tokio::test]
@@ -1130,6 +1135,7 @@ async fn spawn_hop_by_hop_upstream() -> SocketAddr {
                 let service = service_fn(move |_req| async move {
                     Ok::<_, Infallible>(
                         Response::builder()
+                            .header("host", "10.88.0.13:5387")
                             .header("connection", "x-hop-secret")
                             .header("x-hop-secret", "do-not-forward")
                             .header("transfer-encoding", "chunked")

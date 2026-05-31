@@ -3023,6 +3023,7 @@ fn strip_forwarded_request_headers(headers: &mut HeaderMap) {
 
     for name in [
         "connection",
+        "host",
         "upgrade",
         "te",
         "trailer",
@@ -3066,6 +3067,7 @@ fn strip_hop_by_hop_response_headers(headers: &mut HeaderMap) {
 
     for name in [
         "connection",
+        "host",
         "upgrade",
         "te",
         "trailer",
