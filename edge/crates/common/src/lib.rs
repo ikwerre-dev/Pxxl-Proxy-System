@@ -1,7 +1,7 @@
 use chrono::{DateTime, Utc};
 use ipnet::{IpNet, Ipv4Net, Ipv6Net};
 use serde::{de, Deserialize, Deserializer, Serialize};
-use std::{collections::HashMap, fmt, net::IpAddr, str::FromStr};
+use std::{collections::HashMap, env, fmt, net::IpAddr, str::FromStr};
 use url::Url;
 use uuid::Uuid;
 
@@ -1215,11 +1215,22 @@ fn validate_upstream_host(host: &str) -> std::result::Result<(), String> {
         return Err("upstream host contains invalid characters".to_string());
     }
     if let Ok(ip) = host.parse::<IpAddr>() {
-        if !ip_allowed_for_upstream(ip) {
+        if !private_upstreams_allowed() && !ip_allowed_for_upstream(ip) {
             return Err("private, loopback, link-local, multicast, or unspecified upstream IP is not allowed".to_string());
         }
     }
     Ok(())
+}
+
+fn private_upstreams_allowed() -> bool {
+    env::var("PXXL_ALLOW_PRIVATE_UPSTREAMS")
+        .map(|value| {
+            matches!(
+                value.to_ascii_lowercase().as_str(),
+                "1" | "true" | "yes" | "on"
+            )
+        })
+        .unwrap_or(false)
 }
 
 pub fn ip_allowed_for_upstream(ip: IpAddr) -> bool {
