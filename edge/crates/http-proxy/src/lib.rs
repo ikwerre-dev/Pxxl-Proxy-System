@@ -1859,8 +1859,9 @@ impl ProxyServer {
                 ])
                 .inc();
 
-            // Capture request content-length before req is moved into forward_streaming
+            // Capture metadata before req is moved into forward_streaming.
             let req_content_length = content_length(req.headers()).unwrap_or(0);
+            let is_upgrade_request = is_websocket_upgrade(req.headers());
 
             match self
                 .forward_streaming(
@@ -1925,7 +1926,9 @@ impl ProxyServer {
                         &middleware.sticky_sessions,
                         &upstream,
                     );
-                    strip_hop_by_hop_response_headers(response.headers_mut());
+                    if !is_upgrade_request || status != StatusCode::SWITCHING_PROTOCOLS {
+                        strip_hop_by_hop_response_headers(response.headers_mut());
+                    }
                     let stream_bytes_sent = req_content_length;
                     let stream_bytes_received = content_length(response.headers()).unwrap_or(0);
                     self.observe_request(
@@ -2406,12 +2409,14 @@ impl ProxyServer {
 
     async fn forward_streaming(
         &self,
-        req: Request<Incoming>,
+        mut req: Request<Incoming>,
         context: &ForwardContext<'_>,
         max_request_bytes: u64,
     ) -> Result<Response<BoxBody>, PxxlError> {
         ensure_runtime_upstream_allowed(&context.matched.route.source, &context.upstream.url)
             .await?;
+        let websocket_upgrade = is_websocket_upgrade(req.headers());
+        let downstream_upgrade = websocket_upgrade.then(|| hyper::upgrade::on(&mut req));
         let (parts, body) = req.into_parts();
         let limited_body = Limited::new(body, limit_to_usize(max_request_bytes)).boxed();
         let mut req = Request::from_parts(parts, limited_body);
@@ -2419,6 +2424,9 @@ impl ProxyServer {
         let upstream_uri = build_upstream_uri(context.upstream, req.uri())?;
         *req.uri_mut() = upstream_uri;
         strip_forwarded_request_headers(req.headers_mut());
+        if websocket_upgrade {
+            preserve_websocket_upgrade_headers(req.headers_mut());
+        }
 
         if !context.matched.route.rules.preserve_host_header {
             let authority = context.upstream.authority()?;
@@ -2465,6 +2473,33 @@ impl ProxyServer {
             .request(req)
             .await
             .map_err(|_| PxxlError::InvalidUpstream(context.upstream.url.clone()))?;
+
+        if websocket_upgrade && response.status() == StatusCode::SWITCHING_PROTOCOLS {
+            let mut response =
+                response.map(|body| body.map_err(|error| -> BoxError { Box::new(error) }).boxed());
+            let upstream_upgrade = hyper::upgrade::on(&mut response);
+            if let Some(downstream_upgrade) = downstream_upgrade {
+                let upstream_url = context.upstream.url.clone();
+                tokio::spawn(async move {
+                    match tokio::try_join!(downstream_upgrade, upstream_upgrade) {
+                        Ok((downstream, upstream)) => {
+                            let mut downstream = TokioIo::new(downstream);
+                            let mut upstream = TokioIo::new(upstream);
+                            if let Err(error) =
+                                tokio::io::copy_bidirectional(&mut downstream, &mut upstream).await
+                            {
+                                debug!(%error, upstream = %upstream_url, "websocket tunnel closed");
+                            }
+                        }
+                        Err(error) => {
+                            debug!(%error, upstream = %upstream_url, "websocket upgrade failed");
+                        }
+                    }
+                });
+            }
+            return Ok(response);
+        }
+
         let (parts, body) = response.into_parts();
         let body = Limited::new(
             body,
@@ -3007,6 +3042,11 @@ fn strip_forwarded_request_headers(headers: &mut HeaderMap) {
     ] {
         headers.remove(HeaderName::from_static(name));
     }
+}
+
+fn preserve_websocket_upgrade_headers(headers: &mut HeaderMap) {
+    headers.insert(CONNECTION, HeaderValue::from_static("Upgrade"));
+    headers.insert(UPGRADE, HeaderValue::from_static("websocket"));
 }
 
 fn strip_hop_by_hop_response_headers(headers: &mut HeaderMap) {

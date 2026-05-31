@@ -99,8 +99,8 @@ sync_control_plane_routes() {
     [ -n "$gateway_upstream" ] || continue
     [ -n "$frontend_upstream" ] || continue
     payload=$(
-      printf '{"domain":"%s","id":"frontend-%s","tls":true,"paths":[{"prefix":"/api","upstreams":[{"url":"%s","weight":1}]},{"prefix":"/e","upstreams":[{"url":"%s","weight":1}]},{"prefix":"/batch","upstreams":[{"url":"%s","weight":1}]},{"prefix":"/decide","upstreams":[{"url":"%s","weight":1}]},{"prefix":"/flags","upstreams":[{"url":"%s","weight":1}]},{"prefix":"/array","upstreams":[{"url":"%s","weight":1}]},{"prefix":"/static","upstreams":[{"url":"%s","weight":1}]},{"prefix":"/","upstreams":[{"url":"%s","weight":1}]}]}' \
-        "$domain" "$domain" "$gateway_upstream" "$posthog_api_upstream" "$posthog_api_upstream" "$posthog_api_upstream" "$posthog_api_upstream" "$posthog_assets_upstream" "$posthog_assets_upstream" "$frontend_upstream"
+      printf '{"domain":"%s","id":"frontend-%s","tls":true,"paths":[{"prefix":"/api/surveys","upstreams":[{"url":"%s","weight":1}]},{"prefix":"/i","upstreams":[{"url":"%s","weight":1}]},{"prefix":"/e","upstreams":[{"url":"%s","weight":1}]},{"prefix":"/batch","upstreams":[{"url":"%s","weight":1}]},{"prefix":"/decide","upstreams":[{"url":"%s","weight":1}]},{"prefix":"/flags","upstreams":[{"url":"%s","weight":1}]},{"prefix":"/capture","upstreams":[{"url":"%s","weight":1}]},{"prefix":"/engage","upstreams":[{"url":"%s","weight":1}]},{"prefix":"/array","upstreams":[{"url":"%s","weight":1}]},{"prefix":"/static","upstreams":[{"url":"%s","weight":1}]},{"prefix":"/api","upstreams":[{"url":"%s","weight":1}]},{"prefix":"/","upstreams":[{"url":"%s","weight":1}]}]}' \
+        "$domain" "$domain" "$posthog_api_upstream" "$posthog_api_upstream" "$posthog_api_upstream" "$posthog_api_upstream" "$posthog_api_upstream" "$posthog_api_upstream" "$posthog_api_upstream" "$posthog_api_upstream" "$posthog_assets_upstream" "$posthog_assets_upstream" "$gateway_upstream" "$frontend_upstream"
     )
     log "Syncing proxy route $domain -> /api $gateway_upstream, PostHog first-party, / $frontend_upstream"
     curl_args=(-fsS -X POST "$admin_url/v1/domains" -H 'Content-Type: application/json')
