@@ -48,6 +48,7 @@ const SCOPE_TOKENS_WRITE: &str = "tokens:write";
 const SCOPE_ANALYTICS_READ: &str = "analytics:read";
 const ADMIN_LOGIN_MAX_ATTEMPTS: u32 = 5;
 const ADMIN_LOGIN_WINDOW: Duration = Duration::from_secs(10 * 60);
+const ANALYTICS_RECENT_LIMIT_MAX: usize = 5000;
 
 #[derive(Clone)]
 struct ApiServer {
@@ -673,7 +674,7 @@ impl ApiServer {
                 if let Some(response) = require_scope(&principal, SCOPE_ANALYTICS_READ) {
                     return response;
                 }
-                let limit = query_limit(&query, 50, 200);
+                let limit = query_limit(&query, 50, ANALYTICS_RECENT_LIMIT_MAX);
                 json_response(
                     StatusCode::OK,
                     json!({ "visits": self.state.stats.recent_visits_all(limit) }),
@@ -683,7 +684,7 @@ impl ApiServer {
                 if let Some(response) = require_scope(&principal, SCOPE_ANALYTICS_READ) {
                     return response;
                 }
-                let limit = query_limit(&query, 50, 200);
+                let limit = query_limit(&query, 50, ANALYTICS_RECENT_LIMIT_MAX);
                 let request_id = query_value(&query, "request_id");
                 let logs = request_id
                     .as_deref()
@@ -757,7 +758,7 @@ impl ApiServer {
                     );
                 }
                 let normalized = normalize_domain(domain);
-                let limit = query_limit(&query, 50, 200);
+                let limit = query_limit(&query, 50, ANALYTICS_RECENT_LIMIT_MAX);
                 json_response(
                     StatusCode::OK,
                     json!({
@@ -781,7 +782,7 @@ impl ApiServer {
                     );
                 }
                 let normalized = normalize_domain(domain);
-                let limit = query_limit(&query, 50, 200);
+                let limit = query_limit(&query, 50, ANALYTICS_RECENT_LIMIT_MAX);
                 let request_id = query_value(&query, "request_id");
                 let logs = request_id
                     .as_deref()

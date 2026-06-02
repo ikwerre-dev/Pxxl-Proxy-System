@@ -19,7 +19,7 @@ use std::{
 use tokio::sync::mpsc;
 use tracing::info;
 
-const RECENT_VISIT_LIMIT: usize = 200;
+const RECENT_VISIT_LIMIT: usize = 5000;
 const MAX_COUNTER_KEYS: usize = 1_000;
 const OVERFLOW_COUNTER_KEY: &str = "__other__";
 
