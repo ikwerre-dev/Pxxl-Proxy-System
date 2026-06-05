@@ -8,7 +8,7 @@ use hyper_util::{
     rt::TokioExecutor,
 };
 use pxxl_api::{run_admin_api, run_metrics_server, AdminApiAuth, AdminLoginAccount, MetricsAuth};
-use pxxl_common::{ip_allowed_for_upstream, parse_ip_net, Route, RouteSource};
+use pxxl_common::{ip_allowed_for_upstream, parse_ip_net, PathRoute, Route, RouteSource, Upstream};
 use pxxl_config::{HealthCheckConfig, PxxlConfig};
 use pxxl_core::{route_allows_www_alias, EdgeState, RouteRegistry};
 use pxxl_database_proxy::{run_database_proxy, DatabaseProxyRoute, DatabaseRouteRegistry};
@@ -25,6 +25,8 @@ use pxxl_metrics::PxxlMetrics;
 use pxxl_redis_sync::{RedisRouteStore, RedisTokenStore};
 use pxxl_storage::run_clickhouse_writer;
 use pxxl_tls::LocalCertificateStore;
+use redis::streams::StreamReadReply;
+use serde::Deserialize;
 use std::{
     collections::{BTreeSet, HashMap},
     net::{IpAddr, SocketAddr},
@@ -208,6 +210,16 @@ async fn main() -> Result<()> {
         )));
     }
 
+    if env_flag_default("PXXL_ROUTE_EVENTS_ENABLED", true) {
+        tasks.push(tokio::spawn(run_route_event_consumer(
+            config.redis.url.clone(),
+            "pxxl:route_events".to_string(),
+            state.clone(),
+            route_store.clone(),
+            shutdown_rx.clone(),
+        )));
+    }
+
     if config.database_proxy.enabled {
         for listener in &config.database_proxy.listeners {
             let addr = parse_addr("database_proxy.listeners.listen", &listener.listen)?;
@@ -300,6 +312,155 @@ async fn main() -> Result<()> {
 
     info!("Pxxl Proxy stopped");
     Ok(())
+}
+
+#[derive(Debug, Clone, Default, Deserialize)]
+struct RuntimeRouteEvent {
+    #[serde(default)]
+    event_type: String,
+    #[serde(default)]
+    domain: String,
+    #[serde(default)]
+    path: String,
+    #[serde(default)]
+    upstream_url: String,
+    #[serde(default)]
+    runtime_server_ip: String,
+    #[serde(default)]
+    published_port: String,
+    #[serde(default)]
+    project_id: String,
+    #[serde(default)]
+    deployment_id: String,
+    #[serde(default)]
+    container_id: String,
+}
+
+async fn run_route_event_consumer(
+    redis_url: String,
+    stream: String,
+    state: EdgeState,
+    route_store: RedisRouteStore,
+    mut shutdown: watch::Receiver<bool>,
+) -> Result<()> {
+    let client = redis::Client::open(redis_url.as_str())?;
+    let mut connection = client.get_multiplexed_async_connection().await?;
+    let mut last_id = "$".to_string();
+
+    loop {
+        tokio::select! {
+            changed = shutdown.changed() => {
+                if changed.is_ok() && *shutdown.borrow() {
+                    break;
+                }
+            }
+            result = async {
+                redis::cmd("XREAD")
+                    .arg("BLOCK").arg(5000)
+                    .arg("COUNT").arg(50)
+                    .arg("STREAMS").arg(&stream).arg(&last_id)
+                    .query_async::<StreamReadReply>(&mut connection)
+                    .await
+            } => {
+                match result {
+                    Ok(reply) => {
+                        for key in reply.keys {
+                            for id in key.ids {
+                                last_id = id.id.clone();
+                                if let Some(event) = runtime_route_event_from_fields(id.map) {
+                                    if let Err(error) = apply_runtime_route_event(&state, &route_store, event).await {
+                                        warn!(%error, "failed to apply runtime route event");
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    Err(error) => {
+                        warn!(%error, "runtime route event stream read failed");
+                        time::sleep(Duration::from_secs(1)).await;
+                    }
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+fn runtime_route_event_from_fields(
+    fields: HashMap<String, redis::Value>,
+) -> Option<RuntimeRouteEvent> {
+    let mut json = serde_json::Map::new();
+    for (key, value) in fields {
+        if let Ok(value) = redis::from_redis_value::<String>(&value) {
+            json.insert(key, serde_json::Value::String(value));
+        }
+    }
+    serde_json::from_value(serde_json::Value::Object(json)).ok()
+}
+
+async fn apply_runtime_route_event(
+    state: &EdgeState,
+    route_store: &RedisRouteStore,
+    event: RuntimeRouteEvent,
+) -> Result<()> {
+    let event_type = event.event_type.trim();
+    if !matches!(event_type, "container.healthy" | "route.promote") {
+        return Ok(());
+    }
+    let domain = event
+        .domain
+        .trim()
+        .trim_end_matches('.')
+        .to_ascii_lowercase();
+    if domain.is_empty() {
+        return Ok(());
+    }
+    let upstream_url = runtime_route_upstream_url(&event);
+    if upstream_url.is_empty() {
+        return Ok(());
+    }
+    let path = if event.path.trim().is_empty() {
+        "/"
+    } else {
+        event.path.trim()
+    };
+    let mut route = Route::new(
+        domain.clone(),
+        vec![PathRoute::new(
+            path,
+            vec![Upstream::new(upstream_url.clone())],
+        )],
+        RouteSource::Api,
+    )
+    .with_id(format!("runtime-{domain}"));
+    route.tls = true;
+    route
+        .validate_for_dynamic_control_plane()
+        .map_err(|reason| anyhow::anyhow!("invalid runtime route event for {domain}: {reason}"))?;
+    state.routes.upsert_api_route(route.clone());
+    route_store.upsert_route(&route).await?;
+    info!(
+        domain = %domain,
+        upstream = %upstream_url,
+        project_id = %event.project_id,
+        deployment_id = %event.deployment_id,
+        container_id = %event.container_id,
+        "applied runtime route event"
+    );
+    Ok(())
+}
+
+fn runtime_route_upstream_url(event: &RuntimeRouteEvent) -> String {
+    let upstream_url = event.upstream_url.trim();
+    if !upstream_url.is_empty() {
+        return upstream_url.to_string();
+    }
+    let host = event.runtime_server_ip.trim();
+    let port = event.published_port.trim();
+    if host.is_empty() || port.is_empty() {
+        return String::new();
+    }
+    format!("http://{host}:{port}")
 }
 
 async fn run_health_checks(
@@ -774,6 +935,12 @@ fn env_flag(name: &str) -> bool {
     std::env::var(name)
         .map(|value| parse_bool(&value))
         .unwrap_or(false)
+}
+
+fn env_flag_default(name: &str, fallback: bool) -> bool {
+    std::env::var(name)
+        .map(|value| parse_bool(&value))
+        .unwrap_or(fallback)
 }
 
 fn parse_addr(name: &str, value: &str) -> Result<SocketAddr> {
