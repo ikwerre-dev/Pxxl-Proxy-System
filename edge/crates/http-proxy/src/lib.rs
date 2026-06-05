@@ -69,6 +69,50 @@ const DIGEST_NONCE_TTL_MS: u64 = 5 * 60 * 1_000;
 const DIGEST_NONCE_CLOCK_SKEW_MS: u64 = 30 * 1_000;
 const DIGEST_REPLAY_EVICT_AT: usize = 100_000;
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ProxyErrorReason {
+    RouteNotRegistered,
+    RouteHasNoUpstreams,
+    AllUpstreamsUnhealthy,
+    CircuitBreakerOpen,
+    UpstreamTcpUnreachable,
+    ProxyInternal,
+}
+
+impl ProxyErrorReason {
+    fn code(self) -> &'static str {
+        match self {
+            Self::RouteNotRegistered => "route_not_registered",
+            Self::RouteHasNoUpstreams => "route_has_no_upstreams",
+            Self::AllUpstreamsUnhealthy => "all_upstreams_unhealthy",
+            Self::CircuitBreakerOpen => "circuit_breaker_open",
+            Self::UpstreamTcpUnreachable => "upstream_tcp_unreachable",
+            Self::ProxyInternal => "proxy_internal_error",
+        }
+    }
+
+    fn public_message(self) -> &'static str {
+        match self {
+            Self::RouteNotRegistered => {
+                "No route is registered for this domain yet. The deployment may still be connecting to the proxy."
+            }
+            Self::RouteHasNoUpstreams => {
+                "This domain is registered, but it does not have a runtime container target yet."
+            }
+            Self::AllUpstreamsUnhealthy => {
+                "The app route exists, but the registered runtime port is not responding yet. This usually means the container is running on a different port than the one Pxxl registered."
+            }
+            Self::CircuitBreakerOpen => {
+                "The app route exists, but recent upstream failures temporarily opened the protection circuit."
+            }
+            Self::UpstreamTcpUnreachable => {
+                "The app route exists, but the registered runtime port could not be reached. Check that the app is listening on the configured PORT."
+            }
+            Self::ProxyInternal => "The proxy hit an internal routing error while serving this request.",
+        }
+    }
+}
+
 #[derive(Clone, Debug)]
 pub struct ErrorPageRenderer {
     enabled: bool,
@@ -201,6 +245,7 @@ impl ErrorPageRenderer {
                     template.body.as_ref(),
                     status,
                     message,
+                    "proxy_error",
                     domain,
                     path,
                     request_id,
@@ -211,6 +256,72 @@ impl ErrorPageRenderer {
                 default_error_html(
                     status,
                     message,
+                    "proxy_error",
+                    domain,
+                    path,
+                    request_id,
+                    processing_time_ms,
+                )
+            });
+
+        html_response(status, body)
+    }
+
+    fn response_with_reason(
+        &self,
+        status: StatusCode,
+        reason: ProxyErrorReason,
+        domain: &str,
+        path: &str,
+        request_id: &str,
+        processing_time_ms: u128,
+    ) -> Response<BoxBody> {
+        self.response_with_reason_code(
+            status,
+            reason.public_message(),
+            reason.code(),
+            domain,
+            path,
+            request_id,
+            processing_time_ms,
+        )
+    }
+
+    fn response_with_reason_code(
+        &self,
+        status: StatusCode,
+        message: &str,
+        reason_code: &str,
+        domain: &str,
+        path: &str,
+        request_id: &str,
+        processing_time_ms: u128,
+    ) -> Response<BoxBody> {
+        if !self.enabled {
+            return text_response(status, message);
+        }
+
+        let body = self
+            .pages
+            .get(&status.as_u16())
+            .or(self.default_page.as_ref())
+            .map(|template| {
+                render_error_template(
+                    template.body.as_ref(),
+                    status,
+                    message,
+                    reason_code,
+                    domain,
+                    path,
+                    request_id,
+                    processing_time_ms,
+                )
+            })
+            .unwrap_or_else(|| {
+                default_error_html(
+                    status,
+                    message,
+                    reason_code,
                     domain,
                     path,
                     request_id,
@@ -264,6 +375,7 @@ impl ErrorPageRenderer {
                         .unwrap_or("Bandwidth Limit Exceeded"),
                 )
                 .replace("{{message}}", "Bandwidth limit exceeded")
+                .replace("{{reason_code}}", "bandwidth_limit_exceeded")
                 .replace("{{path}}", path)
         } else {
             format!(
@@ -1571,9 +1683,9 @@ impl ProxyServer {
             Some(matched) => matched,
             None => {
                 self.observe_request(&context, StatusCode::NOT_FOUND, started, None, 0, 0);
-                finish_response!(self.error_response(
+                finish_response!(self.diagnostic_error_response(
                     StatusCode::NOT_FOUND,
-                    "no route matched this host/path",
+                    ProxyErrorReason::RouteNotRegistered,
                     &domain,
                     &path,
                     &request_id,
@@ -1803,9 +1915,9 @@ impl ProxyServer {
                         0,
                         0,
                     );
-                    finish_response!(self.error_response(
+                    finish_response!(self.diagnostic_error_response(
                         StatusCode::SERVICE_UNAVAILABLE,
-                        "no healthy upstreams",
+                        self.route_unavailable_reason(&matched, upstreams),
                         &domain,
                         &path,
                         &request_id,
@@ -2011,9 +2123,9 @@ impl ProxyServer {
                         0,
                         0,
                     );
-                    finish_response!(self.error_response(
+                    finish_response!(self.diagnostic_error_response(
                         StatusCode::BAD_GATEWAY,
-                        "upstream request failed",
+                        self.upstream_failure_reason(&error),
                         &domain,
                         &path,
                         &request_id,
@@ -2091,9 +2203,9 @@ impl ProxyServer {
                     0,
                     0,
                 );
-                finish_response!(self.error_response(
+                finish_response!(self.diagnostic_error_response(
                     StatusCode::SERVICE_UNAVAILABLE,
-                    "no healthy upstreams",
+                    self.route_unavailable_reason(&matched, upstreams),
                     &domain,
                     &path,
                     &request_id,
@@ -2288,9 +2400,9 @@ impl ProxyServer {
                     0,
                     0,
                 );
-                finish_response!(self.error_response(
+                finish_response!(self.diagnostic_error_response(
                     StatusCode::BAD_GATEWAY,
-                    "upstream request failed",
+                    self.upstream_failure_reason(&error),
                     &domain,
                     &path,
                     &request_id,
@@ -2528,6 +2640,61 @@ impl ProxyServer {
             request_id,
             started.elapsed().as_millis(),
         )
+    }
+
+    fn diagnostic_error_response(
+        &self,
+        status: StatusCode,
+        reason: ProxyErrorReason,
+        domain: &str,
+        path: &str,
+        request_id: &str,
+        started: Instant,
+    ) -> Response<BoxBody> {
+        self.error_pages.response_with_reason(
+            status,
+            reason,
+            domain,
+            path,
+            request_id,
+            started.elapsed().as_millis(),
+        )
+    }
+
+    fn route_unavailable_reason(
+        &self,
+        matched: &RouteMatch,
+        upstreams: &[Upstream],
+    ) -> ProxyErrorReason {
+        if upstreams.is_empty() {
+            return ProxyErrorReason::RouteHasNoUpstreams;
+        }
+
+        let healthy_count = upstreams.iter().filter(|upstream| upstream.healthy).count();
+        if healthy_count == 0 {
+            return ProxyErrorReason::AllUpstreamsUnhealthy;
+        }
+
+        let all_healthy_upstreams_blocked_by_circuit =
+            upstreams.iter().filter(|upstream| upstream.healthy).all(|upstream| {
+                self.policy.circuit_is_open(
+                    &matched.route.id,
+                    &matched.path.prefix,
+                    &upstream.url,
+                )
+            });
+        if all_healthy_upstreams_blocked_by_circuit {
+            ProxyErrorReason::CircuitBreakerOpen
+        } else {
+            ProxyErrorReason::AllUpstreamsUnhealthy
+        }
+    }
+
+    fn upstream_failure_reason(&self, error: &PxxlError) -> ProxyErrorReason {
+        match error {
+            PxxlError::InvalidUpstream(_) => ProxyErrorReason::UpstreamTcpUnreachable,
+            _ => ProxyErrorReason::ProxyInternal,
+        }
     }
 
     fn observe_request(
@@ -4313,6 +4480,7 @@ fn boxed_full(body: Bytes) -> BoxBody {
 fn default_error_html(
     status: StatusCode,
     message: &str,
+    reason_code: &str,
     domain: &str,
     path: &str,
     request_id: &str,
@@ -4322,6 +4490,7 @@ fn default_error_html(
         DEFAULT_ERROR_TEMPLATE,
         status,
         message,
+        reason_code,
         domain,
         path,
         request_id,
@@ -4368,6 +4537,7 @@ fn render_error_template(
     template: &str,
     status: StatusCode,
     message: &str,
+    reason_code: &str,
     domain: &str,
     path: &str,
     request_id: &str,
@@ -4383,6 +4553,7 @@ fn render_error_template(
         .replace("{{status_code}}", &escape_html(&status_code))
         .replace("{{status_text}}", &escape_html(status_text))
         .replace("{{message}}", &escape_html(message))
+        .replace("{{reason_code}}", &escape_html(reason_code))
         .replace("{{domain}}", &escape_html(domain))
         .replace("{{path}}", &escape_html(path))
         .replace("{{request_id}}", &escape_html(request_id))
@@ -4423,9 +4594,10 @@ mod tests {
     #[test]
     fn renders_custom_error_page_template() {
         let rendered = render_error_template(
-            "<h1>{{status_code}} {{status_text}}</h1><p>{{message}}</p><span>{{domain}}{{path}}</span><em>{{processing_time_ms}} ms</em>",
+            "<h1>{{status_code}} {{status_text}}</h1><p>{{message}}</p><b>{{reason_code}}</b><span>{{domain}}{{path}}</span><em>{{processing_time_ms}} ms</em>",
             StatusCode::BAD_GATEWAY,
             "upstream <failed>",
+            "upstream_tcp_unreachable",
             "app.pxxlhost",
             "/users?name=<x>",
             "request-123",
@@ -4434,6 +4606,7 @@ mod tests {
 
         assert!(rendered.contains("502 Bad Gateway"));
         assert!(rendered.contains("upstream &lt;failed&gt;"));
+        assert!(rendered.contains("upstream_tcp_unreachable"));
         assert!(rendered.contains("app.pxxlhost/users?name=&lt;x&gt;"));
         assert!(rendered.contains("17"));
     }
