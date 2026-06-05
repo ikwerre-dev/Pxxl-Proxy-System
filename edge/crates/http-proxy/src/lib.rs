@@ -100,13 +100,13 @@ impl ProxyErrorReason {
                 "This domain is registered, but it does not have a runtime container target yet."
             }
             Self::AllUpstreamsUnhealthy => {
-                "The app route exists, but the registered runtime port is not responding yet. This usually means the container is running on a different port than the one Pxxl registered."
+                "The app route exists, but Pxxl cannot reach the port registered for this deployment. Make sure your app listens on the same port configured in your Pxxl project settings, or reads the PORT environment variable provided by Pxxl."
             }
             Self::CircuitBreakerOpen => {
                 "The app route exists, but recent upstream failures temporarily opened the protection circuit."
             }
             Self::UpstreamTcpUnreachable => {
-                "The app route exists, but the registered runtime port could not be reached. Check that the app is listening on the configured PORT."
+                "The app route exists, but Pxxl could not connect to the registered runtime port. Check that your app is binding to 0.0.0.0 and listening on the same port configured in your Pxxl project settings, preferably through the PORT environment variable."
             }
             Self::ProxyInternal => "The proxy hit an internal routing error while serving this request.",
         }
