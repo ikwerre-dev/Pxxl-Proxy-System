@@ -1076,6 +1076,7 @@ pub fn canonicalize_path(path: &str) -> std::result::Result<String, String> {
     }
 
     let decoded = decoded.replace('\\', "/");
+    let preserve_trailing_slash = decoded.ends_with('/');
     let mut segments = Vec::new();
     for segment in decoded.split('/') {
         match segment {
@@ -1089,6 +1090,8 @@ pub fn canonicalize_path(path: &str) -> std::result::Result<String, String> {
 
     if segments.is_empty() {
         Ok("/".to_string())
+    } else if preserve_trailing_slash {
+        Ok(format!("/{}/", segments.join("/")))
     } else {
         Ok(format!("/{}", segments.join("/")))
     }
@@ -1482,6 +1485,16 @@ mod tests {
             "/admin"
         );
         assert!(canonicalize_path("/api/%zz").is_err());
+    }
+
+    #[test]
+    fn canonicalized_request_paths_preserve_trailing_slash() {
+        assert_eq!(canonicalize_path("/admin/").unwrap(), "/admin/");
+        assert_eq!(canonicalize_path("/api/ping/").unwrap(), "/api/ping/");
+        assert_eq!(
+            canonicalize_path("/api//users/./42/").unwrap(),
+            "/api/users/42/"
+        );
     }
 
     #[test]
