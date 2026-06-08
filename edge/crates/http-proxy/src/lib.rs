@@ -2587,8 +2587,10 @@ impl ProxyServer {
             .map_err(|_| PxxlError::InvalidUpstream(context.upstream.url.clone()))?;
 
         if websocket_upgrade && response.status() == StatusCode::SWITCHING_PROTOCOLS {
-            let mut response =
-                response.map(|body| body.map_err(|error| -> BoxError { Box::new(error) }).boxed());
+            let mut response = response.map(|body| {
+                body.map_err(|error| -> BoxError { Box::new(error) })
+                    .boxed()
+            });
             let upstream_upgrade = hyper::upgrade::on(&mut response);
             if let Some(downstream_upgrade) = downstream_upgrade {
                 let upstream_url = context.upstream.url.clone();
@@ -2675,13 +2677,12 @@ impl ProxyServer {
             return ProxyErrorReason::AllUpstreamsUnhealthy;
         }
 
-        let all_healthy_upstreams_blocked_by_circuit =
-            upstreams.iter().filter(|upstream| upstream.healthy).all(|upstream| {
-                self.policy.circuit_is_open(
-                    &matched.route.id,
-                    &matched.path.prefix,
-                    &upstream.url,
-                )
+        let all_healthy_upstreams_blocked_by_circuit = upstreams
+            .iter()
+            .filter(|upstream| upstream.healthy)
+            .all(|upstream| {
+                self.policy
+                    .circuit_is_open(&matched.route.id, &matched.path.prefix, &upstream.url)
             });
         if all_healthy_upstreams_blocked_by_circuit {
             ProxyErrorReason::CircuitBreakerOpen

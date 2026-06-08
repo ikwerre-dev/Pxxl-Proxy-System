@@ -7,7 +7,10 @@ use hyper_util::{
     client::legacy::{connect::HttpConnector, Client},
     rt::TokioExecutor,
 };
-use pxxl_api::{run_admin_api, run_metrics_server, AdminApiAuth, AdminLoginAccount, MetricsAuth};
+use pxxl_api::{
+    run_admin_api, run_metrics_server, AdminApiAuth, AdminLoginAccount, MetricsAuth,
+    TlsCertificateRuntimeStatus,
+};
 use pxxl_common::{ip_allowed_for_upstream, parse_ip_net, PathRoute, Route, RouteSource, Upstream};
 use pxxl_config::{HealthCheckConfig, PxxlConfig};
 use pxxl_core::{route_allows_www_alias, EdgeState, RouteRegistry};
@@ -124,7 +127,9 @@ async fn main() -> Result<()> {
     let cert_domains = certificate_domains(&config.tls.local_subject_alt_names, &state);
 
     let cert_store = LocalCertificateStore::new(config.tls.cert_dir.clone());
+    let tls_status = TlsCertificateRuntimeStatus::new();
     let bundle = cert_store.regenerate_certificate(&cert_domains).await?;
+    tls_status.mark_success(cert_domains.clone());
     let tls_config = cert_store.server_config_from_bundle(&bundle)?;
     let reloadable_tls = ReloadableTlsConfig::new(tls_config);
     metrics
@@ -183,6 +188,7 @@ async fn main() -> Result<()> {
             admin_addr,
             state.clone(),
             config.tls.cert_dir.clone(),
+            tls_status.clone(),
             Some(route_store.clone()),
             Some(database_routes.clone()),
             admin_auth,
@@ -243,6 +249,7 @@ async fn main() -> Result<()> {
     tasks.push(tokio::spawn(run_tls_reloader(
         cert_store.clone(),
         reloadable_tls,
+        tls_status,
         state.clone(),
         config.tls.local_subject_alt_names.clone(),
         shutdown_rx.clone(),
@@ -645,6 +652,7 @@ fn collect_upstream_checks(routes: &[Route]) -> BTreeSet<UpstreamCheck> {
 async fn run_tls_reloader(
     cert_store: LocalCertificateStore,
     tls_config: ReloadableTlsConfig,
+    tls_status: TlsCertificateRuntimeStatus,
     state: EdgeState,
     local_subject_alt_names: Vec<String>,
     mut shutdown: watch::Receiver<bool>,
@@ -678,6 +686,7 @@ async fn run_tls_reloader(
                             "exhausted local TLS certificate reload attempts for dynamic route domains"
                         );
                         exhausted_domains = Some(domains);
+                        tls_status.mark_exhausted(exhausted_domains.clone().unwrap_or_default());
                         pending_domains = None;
                         continue;
                     }
@@ -687,25 +696,32 @@ async fn run_tls_reloader(
                         Ok(bundle) => match cert_store.server_config_from_bundle(&bundle) {
                             Ok(config) => {
                                 tls_config.store(config);
+                                tls_status.mark_success(domains.clone());
                                 exhausted_domains = None;
                                 pending_domains = None;
                                 attempts = 0;
                                 current_domains = domains;
                                 info!("reloaded local TLS certificate for dynamic route domains");
                             }
-                            Err(error) => warn!(
+                            Err(error) => {
+                                tls_status.mark_error("server_config", error.to_string(), domains.clone());
+                                warn!(
+                                    %error,
+                                    attempt = attempts,
+                                    max_attempts = TLS_RELOAD_MAX_ATTEMPTS,
+                                    "failed to rebuild TLS server config"
+                                )
+                            }
+                        },
+                        Err(error) => {
+                            tls_status.mark_error("regenerate", error.to_string(), domains.clone());
+                            warn!(
                                 %error,
                                 attempt = attempts,
                                 max_attempts = TLS_RELOAD_MAX_ATTEMPTS,
-                                "failed to rebuild TLS server config"
-                            ),
-                        },
-                        Err(error) => warn!(
-                            %error,
-                            attempt = attempts,
-                            max_attempts = TLS_RELOAD_MAX_ATTEMPTS,
-                            "failed to regenerate local TLS certificate"
-                        ),
+                                "failed to regenerate local TLS certificate"
+                            )
+                        }
                     }
                 }
             }

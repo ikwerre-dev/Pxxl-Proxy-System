@@ -54,9 +54,75 @@ const ANALYTICS_RECENT_LIMIT_MAX: usize = 5000;
 struct ApiServer {
     state: EdgeState,
     cert_dir: String,
+    tls_status: TlsCertificateRuntimeStatus,
     route_store: Option<RedisRouteStore>,
     database_routes: Option<DatabaseRouteRegistry>,
     auth: AdminApiAuth,
+}
+
+#[derive(Clone, Debug, Default, Serialize)]
+pub struct TlsCertificateRuntimeSnapshot {
+    pub last_attempt_unix_ms: Option<u128>,
+    pub last_success_unix_ms: Option<u128>,
+    pub last_error_unix_ms: Option<u128>,
+    pub last_error: Option<String>,
+    pub last_error_stage: Option<String>,
+    pub last_domains: Vec<String>,
+    pub exhausted_domains: Vec<String>,
+}
+
+#[derive(Clone, Debug, Default)]
+pub struct TlsCertificateRuntimeStatus {
+    inner: Arc<Mutex<TlsCertificateRuntimeSnapshot>>,
+}
+
+impl TlsCertificateRuntimeStatus {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn mark_success(&self, domains: Vec<String>) {
+        if let Ok(mut status) = self.inner.lock() {
+            let now = unix_now_ms();
+            status.last_attempt_unix_ms = Some(now);
+            status.last_success_unix_ms = Some(now);
+            status.last_error = None;
+            status.last_error_stage = None;
+            status.last_domains = domains;
+            status.exhausted_domains.clear();
+        }
+    }
+
+    pub fn mark_error(&self, stage: impl Into<String>, error: impl ToString, domains: Vec<String>) {
+        if let Ok(mut status) = self.inner.lock() {
+            let now = unix_now_ms();
+            status.last_attempt_unix_ms = Some(now);
+            status.last_error_unix_ms = Some(now);
+            status.last_error = Some(error.to_string());
+            status.last_error_stage = Some(stage.into());
+            status.last_domains = domains;
+        }
+    }
+
+    pub fn mark_exhausted(&self, domains: Vec<String>) {
+        if let Ok(mut status) = self.inner.lock() {
+            status.exhausted_domains = domains;
+        }
+    }
+
+    pub fn snapshot(&self) -> TlsCertificateRuntimeSnapshot {
+        self.inner
+            .lock()
+            .map(|status| status.clone())
+            .unwrap_or_default()
+    }
+}
+
+fn unix_now_ms() -> u128 {
+    std::time::SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_millis())
+        .unwrap_or_default()
 }
 
 #[derive(Debug, Deserialize)]
@@ -186,6 +252,7 @@ struct CertificateStatusResponse {
     generated: bool,
     cert_modified_unix_ms: Option<u128>,
     domains: Vec<CertificateDomainStatus>,
+    runtime: TlsCertificateRuntimeSnapshot,
 }
 
 #[derive(Debug, Deserialize)]
@@ -200,6 +267,7 @@ pub async fn run_admin_api(
     addr: SocketAddr,
     state: EdgeState,
     cert_dir: impl Into<String>,
+    tls_status: TlsCertificateRuntimeStatus,
     route_store: Option<RedisRouteStore>,
     database_routes: Option<DatabaseRouteRegistry>,
     auth: AdminApiAuth,
@@ -209,6 +277,7 @@ pub async fn run_admin_api(
     let server = ApiServer {
         state,
         cert_dir: cert_dir.into(),
+        tls_status,
         route_store,
         database_routes,
         auth,
@@ -1238,6 +1307,7 @@ impl ApiServer {
             generated,
             cert_modified_unix_ms,
             domains,
+            runtime: self.tls_status.snapshot(),
         }
     }
 
