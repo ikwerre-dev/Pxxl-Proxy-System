@@ -1059,6 +1059,12 @@ impl ApiServer {
                 StatusCode::OK,
                 json!({ "certificate": self.certificate_status(None).await }),
             ),
+            (Method::GET, "/v1/certs/public") => {
+                if let Some(response) = require_scope(&principal, SCOPE_ROUTES_READ) {
+                    return response;
+                }
+                self.download_public_certificate().await
+            }
             (Method::POST, path) if path.starts_with("/v1/blacklist/") => {
                 if let Some(response) = require_scope(&principal, SCOPE_ROUTES_WRITE) {
                     return response;
@@ -1308,6 +1314,29 @@ impl ApiServer {
             cert_modified_unix_ms,
             domains,
             runtime: self.tls_status.snapshot(),
+        }
+    }
+
+    async fn download_public_certificate(&self) -> Response<BoxBody> {
+        let cert_path = PathBuf::from(&self.cert_dir).join("local-dev-cert.pem");
+        match tokio::fs::read_to_string(&cert_path).await {
+            Ok(pem) => Response::builder()
+                .status(StatusCode::OK)
+                .header("content-type", "application/x-pem-file")
+                .header(
+                    "content-disposition",
+                    "attachment; filename=\"pxxl-proxy-public-cert.pem\"",
+                )
+                .body(
+                    Full::new(Bytes::from(pem))
+                        .map_err(|never| match never {})
+                        .boxed(),
+                )
+                .unwrap(),
+            Err(error) => json_response(
+                StatusCode::NOT_FOUND,
+                json!({"error": format!("public certificate is not available: {error}")}),
+            ),
         }
     }
 
