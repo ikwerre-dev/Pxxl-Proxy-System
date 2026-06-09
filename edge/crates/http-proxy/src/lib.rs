@@ -4469,7 +4469,10 @@ async fn serve_acme_http01_challenge(path: &str) -> Option<Response<BoxBody>> {
         || token == ".."
         || token.starts_with('.')
     {
-        return Some(text_response(StatusCode::BAD_REQUEST, "invalid acme challenge token"));
+        return Some(text_response(
+            StatusCode::BAD_REQUEST,
+            "invalid acme challenge token",
+        ));
     }
 
     let root = PathBuf::from(
@@ -4487,7 +4490,10 @@ async fn serve_acme_http01_challenge(path: &str) -> Option<Response<BoxBody>> {
             "text/plain; charset=utf-8",
             value,
         )),
-        Err(_) => Some(text_response(StatusCode::NOT_FOUND, "acme challenge not found")),
+        Err(_) => Some(text_response(
+            StatusCode::NOT_FOUND,
+            "acme challenge not found",
+        )),
     }
 }
 
