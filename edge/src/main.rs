@@ -27,7 +27,7 @@ use pxxl_load_balancer::LoadBalancer;
 use pxxl_metrics::PxxlMetrics;
 use pxxl_redis_sync::{RedisRouteStore, RedisTokenStore};
 use pxxl_storage::run_clickhouse_writer;
-use pxxl_tls::{CertificateBundle, LocalCertificateStore};
+use pxxl_tls::{CertificateBundle, CertificateIssuer, LocalCertificateStore};
 use redis::streams::StreamReadReply;
 use serde::Deserialize;
 use std::{
@@ -148,7 +148,7 @@ async fn main() -> Result<()> {
 
     let cert_store = LocalCertificateStore::new(config.tls.cert_dir.clone());
     let tls_status = TlsCertificateRuntimeStatus::new();
-    let bundle = cert_store.regenerate_certificate(&cert_domains).await?;
+    let bundle = cert_store.ensure_certificate(&cert_domains).await?;
     tls_status.mark_success(cert_domains.clone());
     let tls_config = cert_store.server_config_with_domain_certs(&bundle)?;
     let reloadable_tls = ReloadableTlsConfig::new(tls_config);
