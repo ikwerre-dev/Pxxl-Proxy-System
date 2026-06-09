@@ -27,7 +27,7 @@ use pxxl_load_balancer::LoadBalancer;
 use pxxl_metrics::PxxlMetrics;
 use pxxl_redis_sync::{RedisRouteStore, RedisTokenStore};
 use pxxl_storage::run_clickhouse_writer;
-use pxxl_tls::LocalCertificateStore;
+use pxxl_tls::{CertificateBundle, LocalCertificateStore};
 use redis::streams::StreamReadReply;
 use serde::Deserialize;
 use std::{
@@ -665,10 +665,32 @@ async fn run_tls_reloader(
     let mut pending_domains: Option<Vec<String>> = None;
     let mut exhausted_domains: Option<Vec<String>> = None;
     let mut attempts = 0_u8;
+    let mut current_cert_modified = cert_modified_unix_ms(&cert_store.cert_path()).await;
 
     loop {
         tokio::select! {
             _ = interval.tick() => {
+                let latest_cert_modified = cert_modified_unix_ms(&cert_store.cert_path()).await;
+                if latest_cert_modified.is_some() && latest_cert_modified != current_cert_modified {
+                    let bundle = CertificateBundle {
+                        cert_path: cert_store.cert_path(),
+                        key_path: cert_store.key_path(),
+                        domains: current_domains.clone(),
+                    };
+                    match cert_store.server_config_from_bundle(&bundle) {
+                        Ok(config) => {
+                            tls_config.store(config);
+                            current_cert_modified = latest_cert_modified;
+                            tls_status.mark_success(current_domains.clone());
+                            info!("reloaded TLS certificate from updated certificate files");
+                        }
+                        Err(error) => {
+                            tls_status.mark_error("file_reload", error.to_string(), current_domains.clone());
+                            warn!(%error, "failed to reload TLS certificate from updated files");
+                        }
+                    }
+                }
+
                 let domains = certificate_domains(&local_subject_alt_names, &state);
                 if domains != current_domains
                     && pending_domains.as_ref() != Some(&domains)
@@ -701,6 +723,7 @@ async fn run_tls_reloader(
                                 pending_domains = None;
                                 attempts = 0;
                                 current_domains = domains;
+                                current_cert_modified = cert_modified_unix_ms(&cert_store.cert_path()).await;
                                 info!("reloaded local TLS certificate for dynamic route domains");
                             }
                             Err(error) => {
@@ -754,6 +777,15 @@ fn certificate_domains(local_subject_alt_names: &[String], state: &EdgeState) ->
     domains.dedup();
     domains.truncate(MAX_CERT_DOMAINS);
     domains
+}
+
+async fn cert_modified_unix_ms(path: &Path) -> Option<u128> {
+    tokio::fs::metadata(path)
+        .await
+        .ok()
+        .and_then(|metadata| metadata.modified().ok())
+        .and_then(|modified| modified.duration_since(std::time::UNIX_EPOCH).ok())
+        .map(|duration| duration.as_millis())
 }
 
 fn safe_certificate_domain(domain: &str) -> bool {

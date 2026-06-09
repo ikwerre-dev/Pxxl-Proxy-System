@@ -20,15 +20,16 @@ use serde::{Deserialize, Serialize};
 use serde_json::json;
 use sha2::{Digest, Sha256};
 use std::{
-    collections::HashMap,
+    collections::{BTreeSet, HashMap},
     convert::Infallible,
     net::{IpAddr, SocketAddr},
-    path::PathBuf,
+    path::{Path, PathBuf},
     sync::{Arc, Mutex, OnceLock},
     time::{Duration, UNIX_EPOCH},
 };
 use tokio::{
     net::TcpListener,
+    process::Command,
     sync::{watch, Semaphore},
     time,
 };
@@ -891,6 +892,24 @@ impl ApiServer {
                     json!({ "certificate": self.certificate_status(Some(domain)).await }),
                 )
             }
+            (Method::POST, path)
+                if path.starts_with("/v1/domains/") && path.ends_with("/cert/resync") =>
+            {
+                if let Some(response) = require_scope(&principal, SCOPE_ROUTES_WRITE) {
+                    return response;
+                }
+                let domain = path
+                    .trim_start_matches("/v1/domains/")
+                    .trim_end_matches("/cert/resync")
+                    .trim_matches('/');
+                if domain.is_empty() {
+                    return json_response(
+                        StatusCode::BAD_REQUEST,
+                        json!({"error": "missing domain"}),
+                    );
+                }
+                self.resync_domain_certificate(domain).await
+            }
             (Method::GET, path) if path.starts_with("/v1/domains/") => {
                 if let Some(response) = require_scope(&principal, SCOPE_ROUTES_READ) {
                     return response;
@@ -1273,6 +1292,168 @@ impl ApiServer {
                 "status": "created",
                 "domain": redact_route(route),
                 "certificate": certificate
+            }),
+        )
+    }
+
+    async fn resync_domain_certificate(&self, domain: &str) -> Response<BoxBody> {
+        let domain = normalize_domain(domain);
+        if domain.is_empty()
+            || domain == "localhost"
+            || domain.ends_with(".local")
+            || domain.ends_with(".test")
+            || domain.contains('*')
+            || domain.parse::<IpAddr>().is_ok()
+        {
+            return json_response(
+                StatusCode::BAD_REQUEST,
+                json!({"error": "invalid certificate domain"}),
+            );
+        }
+
+        let certbot = std::env::var("PXXL_CERTBOT_BIN").unwrap_or_else(|_| "certbot".to_string());
+        let email =
+            std::env::var("PXXL_ACME_EMAIL").unwrap_or_else(|_| "admin@pxxl.app".to_string());
+        let webroot = PathBuf::from(
+            std::env::var("PXXL_ACME_CHALLENGE_DIR")
+                .unwrap_or_else(|_| "/data/acme-challenges".to_string()),
+        );
+        let request_dir = PathBuf::from(
+            std::env::var("PXXL_CERT_REQUEST_DIR")
+                .unwrap_or_else(|_| "/data/cert-requests".to_string()),
+        );
+        let certbot_config = PathBuf::from(
+            std::env::var("PXXL_CERTBOT_CONFIG_DIR")
+                .unwrap_or_else(|_| "/data/letsencrypt".to_string()),
+        );
+        let certbot_work = PathBuf::from(
+            std::env::var("PXXL_CERTBOT_WORK_DIR")
+                .unwrap_or_else(|_| "/data/letsencrypt-work".to_string()),
+        );
+        let certbot_logs = PathBuf::from(
+            std::env::var("PXXL_CERTBOT_LOGS_DIR")
+                .unwrap_or_else(|_| "/data/letsencrypt-logs".to_string()),
+        );
+
+        for dir in [
+            &webroot,
+            &request_dir,
+            &certbot_config,
+            &certbot_work,
+            &certbot_logs,
+        ] {
+            if let Err(error) = tokio::fs::create_dir_all(dir).await {
+                return json_response(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    json!({"error": format!("failed to create certificate directory: {error}")}),
+                );
+            }
+        }
+
+        let domains_file = request_dir.join("domains.txt");
+        let mut domains = BTreeSet::new();
+        if let Ok(existing) = tokio::fs::read_to_string(&domains_file).await {
+            for line in existing.lines() {
+                let item = normalize_domain(line.trim());
+                if !item.is_empty() {
+                    domains.insert(item);
+                }
+            }
+        }
+        domains.insert(domain.clone());
+        if domains.len() > 100 {
+            return json_response(
+                StatusCode::PAYLOAD_TOO_LARGE,
+                json!({"error": "certificate resync set has reached 100 domains; split into a dedicated certificate bundle before adding more"}),
+            );
+        }
+
+        let cert_name = "pxxl-resynced-domains";
+        let mut args = vec![
+            "certonly".to_string(),
+            "--webroot".to_string(),
+            "-w".to_string(),
+            webroot.display().to_string(),
+            "--config-dir".to_string(),
+            certbot_config.display().to_string(),
+            "--work-dir".to_string(),
+            certbot_work.display().to_string(),
+            "--logs-dir".to_string(),
+            certbot_logs.display().to_string(),
+            "--cert-name".to_string(),
+            cert_name.to_string(),
+            "--agree-tos".to_string(),
+            "--non-interactive".to_string(),
+            "--email".to_string(),
+            email,
+            "--keep-until-expiring".to_string(),
+            "--expand".to_string(),
+        ];
+        for item in &domains {
+            args.push("-d".to_string());
+            args.push(item.clone());
+        }
+
+        let output = match time::timeout(
+            Duration::from_secs(180),
+            Command::new(&certbot).args(&args).output(),
+        )
+        .await
+        {
+            Ok(Ok(output)) => output,
+            Ok(Err(error)) => {
+                return json_response(
+                    StatusCode::BAD_GATEWAY,
+                    json!({"error": format!("failed to run certbot: {error}")}),
+                )
+            }
+            Err(_) => {
+                return json_response(
+                    StatusCode::GATEWAY_TIMEOUT,
+                    json!({"error": "certbot timed out while issuing certificate"}),
+                )
+            }
+        };
+
+        let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
+        let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+        if !output.status.success() {
+            return json_response(
+                StatusCode::BAD_GATEWAY,
+                json!({
+                    "error": "certificate issuance failed",
+                    "stdout": stdout,
+                    "stderr": stderr
+                }),
+            );
+        }
+
+        let live_dir = certbot_config.join("live").join(cert_name);
+        let cert_path = PathBuf::from(&self.cert_dir).join("local-dev-cert.pem");
+        let key_path = PathBuf::from(&self.cert_dir).join("local-dev-key.pem");
+        if let Err(error) = copy_certbot_bundle(&live_dir, &cert_path, &key_path).await {
+            return json_response(
+                StatusCode::BAD_GATEWAY,
+                json!({"error": format!("certificate issued but could not be installed: {error}")}),
+            );
+        }
+
+        let domain_list = domains.iter().cloned().collect::<Vec<_>>().join("\n");
+        if let Err(error) = tokio::fs::write(&domains_file, format!("{domain_list}\n")).await {
+            return json_response(
+                StatusCode::BAD_GATEWAY,
+                json!({"error": format!("certificate installed but request set could not be saved: {error}")}),
+            );
+        }
+
+        json_response(
+            StatusCode::OK,
+            json!({
+                "status": "issued",
+                "domain": domain,
+                "domains": domains.into_iter().collect::<Vec<_>>(),
+                "certificate": self.certificate_status(Some(&domain)).await,
+                "stdout": stdout
             }),
         )
     }
@@ -1714,6 +1895,27 @@ fn hmac_sha256(key: &[u8], data: &[u8]) -> [u8; 32] {
 
 fn redact_routes(routes: Vec<Route>) -> Vec<Route> {
     routes.into_iter().map(redact_route).collect()
+}
+
+async fn copy_certbot_bundle(
+    live_dir: &Path,
+    cert_path: &Path,
+    key_path: &Path,
+) -> std::io::Result<()> {
+    let fullchain = tokio::fs::read(live_dir.join("fullchain.pem")).await?;
+    let private_key = tokio::fs::read(live_dir.join("privkey.pem")).await?;
+    if let Some(parent) = cert_path.parent() {
+        tokio::fs::create_dir_all(parent).await?;
+    }
+    tokio::fs::write(cert_path, fullchain).await?;
+    tokio::fs::write(key_path, private_key).await?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        tokio::fs::set_permissions(cert_path, std::fs::Permissions::from_mode(0o644)).await?;
+        tokio::fs::set_permissions(key_path, std::fs::Permissions::from_mode(0o600)).await?;
+    }
+    Ok(())
 }
 
 fn certificate_domain_status(
