@@ -68,6 +68,7 @@ const POLICY_RATE_BUCKET_EVICT_AT: usize = 100_000;
 const DIGEST_NONCE_TTL_MS: u64 = 5 * 60 * 1_000;
 const DIGEST_NONCE_CLOCK_SKEW_MS: u64 = 30 * 1_000;
 const DIGEST_REPLAY_EVICT_AT: usize = 100_000;
+const ACME_CHALLENGE_PREFIX: &str = "/.well-known/acme-challenge/";
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum ProxyErrorReason {
@@ -1627,6 +1628,11 @@ impl ProxyServer {
             location: &location,
             timestamp_unix_ms,
         };
+
+        if let Some(response) = serve_acme_http01_challenge(&path).await {
+            self.observe_request(&context, response.status(), started, None, 0, 0);
+            finish_response!(response);
+        }
 
         if let Some(ip) = remote_ip {
             match self.state.security.check(&domain, ip) {
@@ -4452,6 +4458,31 @@ fn html_response(status: StatusCode, body: String) -> Response<BoxBody> {
 
 fn text_response(status: StatusCode, message: &str) -> Response<BoxBody> {
     response_with_body(status, "text/plain; charset=utf-8", message.to_string())
+}
+
+async fn serve_acme_http01_challenge(path: &str) -> Option<Response<BoxBody>> {
+    let token = path.strip_prefix(ACME_CHALLENGE_PREFIX)?;
+    if token.is_empty()
+        || token.contains('/')
+        || token.contains('\\')
+        || token == "."
+        || token == ".."
+        || token.starts_with('.')
+    {
+        return Some(text_response(StatusCode::BAD_REQUEST, "invalid acme challenge token"));
+    }
+
+    let root = std::env::var("PXXL_ACME_CHALLENGE_DIR")
+        .unwrap_or_else(|_| "/data/acme-challenges".to_string());
+    let challenge_path = PathBuf::from(root).join(token);
+    match tokio::fs::read_to_string(challenge_path).await {
+        Ok(value) => Some(response_with_body(
+            StatusCode::OK,
+            "text/plain; charset=utf-8",
+            value,
+        )),
+        Err(_) => Some(text_response(StatusCode::NOT_FOUND, "acme challenge not found")),
+    }
 }
 
 fn response_with_body(
