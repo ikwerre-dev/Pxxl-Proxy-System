@@ -20,7 +20,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::json;
 use sha2::{Digest, Sha256};
 use std::{
-    collections::{BTreeSet, HashMap},
+    collections::HashMap,
     convert::Infallible,
     net::{IpAddr, SocketAddr},
     path::{Path, PathBuf},
@@ -242,6 +242,7 @@ struct CertificateDomainStatus {
     covered: bool,
     status: &'static str,
     reason: &'static str,
+    dedicated: bool,
 }
 
 #[derive(Debug, Serialize)]
@@ -1318,10 +1319,6 @@ impl ApiServer {
             std::env::var("PXXL_ACME_CHALLENGE_DIR")
                 .unwrap_or_else(|_| "/data/acme-challenges".to_string()),
         );
-        let request_dir = PathBuf::from(
-            std::env::var("PXXL_CERT_REQUEST_DIR")
-                .unwrap_or_else(|_| "/data/cert-requests".to_string()),
-        );
         let certbot_config = PathBuf::from(
             std::env::var("PXXL_CERTBOT_CONFIG_DIR")
                 .unwrap_or_else(|_| "/data/letsencrypt".to_string()),
@@ -1335,13 +1332,7 @@ impl ApiServer {
                 .unwrap_or_else(|_| "/data/letsencrypt-logs".to_string()),
         );
 
-        for dir in [
-            &webroot,
-            &request_dir,
-            &certbot_config,
-            &certbot_work,
-            &certbot_logs,
-        ] {
+        for dir in [&webroot, &certbot_config, &certbot_work, &certbot_logs] {
             if let Err(error) = tokio::fs::create_dir_all(dir).await {
                 return json_response(
                     StatusCode::INTERNAL_SERVER_ERROR,
@@ -1350,26 +1341,8 @@ impl ApiServer {
             }
         }
 
-        let domains_file = request_dir.join("domains.txt");
-        let mut domains = BTreeSet::new();
-        if let Ok(existing) = tokio::fs::read_to_string(&domains_file).await {
-            for line in existing.lines() {
-                let item = normalize_domain(line.trim());
-                if !item.is_empty() {
-                    domains.insert(item);
-                }
-            }
-        }
-        domains.insert(domain.clone());
-        if domains.len() > 100 {
-            return json_response(
-                StatusCode::PAYLOAD_TOO_LARGE,
-                json!({"error": "certificate resync set has reached 100 domains; split into a dedicated certificate bundle before adding more"}),
-            );
-        }
-
-        let cert_name = "pxxl-resynced-domains";
-        let mut args = vec![
+        let cert_name = format!("pxxl-domain-{}", safe_domain_cert_name(&domain));
+        let args = vec![
             "certonly".to_string(),
             "--webroot".to_string(),
             "-w".to_string(),
@@ -1387,12 +1360,9 @@ impl ApiServer {
             "--email".to_string(),
             email,
             "--keep-until-expiring".to_string(),
-            "--expand".to_string(),
+            "-d".to_string(),
+            domain.clone(),
         ];
-        for item in &domains {
-            args.push("-d".to_string());
-            args.push(item.clone());
-        }
 
         let output = match time::timeout(
             Duration::from_secs(180),
@@ -1429,20 +1399,21 @@ impl ApiServer {
         }
 
         let live_dir = certbot_config.join("live").join(cert_name);
-        let cert_path = PathBuf::from(&self.cert_dir).join("local-dev-cert.pem");
-        let key_path = PathBuf::from(&self.cert_dir).join("local-dev-key.pem");
+        let domain_dir = PathBuf::from(&self.cert_dir)
+            .join("domains")
+            .join(safe_domain_cert_name(&domain));
+        if let Err(error) = tokio::fs::create_dir_all(&domain_dir).await {
+            return json_response(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                json!({"error": format!("failed to create domain certificate directory: {error}")}),
+            );
+        }
+        let cert_path = domain_dir.join("fullchain.pem");
+        let key_path = domain_dir.join("privkey.pem");
         if let Err(error) = copy_certbot_bundle(&live_dir, &cert_path, &key_path).await {
             return json_response(
                 StatusCode::BAD_GATEWAY,
                 json!({"error": format!("certificate issued but could not be installed: {error}")}),
-            );
-        }
-
-        let domain_list = domains.iter().cloned().collect::<Vec<_>>().join("\n");
-        if let Err(error) = tokio::fs::write(&domains_file, format!("{domain_list}\n")).await {
-            return json_response(
-                StatusCode::BAD_GATEWAY,
-                json!({"error": format!("certificate installed but request set could not be saved: {error}")}),
             );
         }
 
@@ -1451,7 +1422,7 @@ impl ApiServer {
             json!({
                 "status": "issued",
                 "domain": domain,
-                "domains": domains.into_iter().collect::<Vec<_>>(),
+                "certPath": cert_path.display().to_string(),
                 "certificate": self.certificate_status(Some(&domain)).await,
                 "stdout": stdout
             }),
@@ -1474,20 +1445,25 @@ impl ApiServer {
         let domains = match domain_filter.map(normalize_domain) {
             Some(domain) => {
                 let maybe_route = routes.into_iter().find(|route| route.domain == domain);
+                let dedicated = domain_certificate_exists(&self.cert_dir, &domain).await;
                 vec![certificate_domain_status(
                     &domain,
                     maybe_route.as_ref(),
                     generated,
+                    dedicated,
                 )]
             }
             None => routes
                 .iter()
-                .map(|route| certificate_domain_status(&route.domain, Some(route), generated))
+                .map(|route| {
+                    let dedicated = domain_certificate_exists_sync(&self.cert_dir, &route.domain);
+                    certificate_domain_status(&route.domain, Some(route), generated, dedicated)
+                })
                 .collect(),
         };
 
         CertificateStatusResponse {
-            mode: "local_multi_san",
+            mode: "sni_domain_certs",
             cert_dir: self.cert_dir.clone(),
             cert_path: cert_path.display().to_string(),
             key_path: key_path.display().to_string(),
@@ -1922,6 +1898,7 @@ fn certificate_domain_status(
     domain: &str,
     route: Option<&Route>,
     generated: bool,
+    dedicated: bool,
 ) -> CertificateDomainStatus {
     match route {
         Some(route) if !route.tls => CertificateDomainStatus {
@@ -1930,13 +1907,23 @@ fn certificate_domain_status(
             covered: false,
             status: "disabled",
             reason: "route_tls_disabled",
+            dedicated: false,
+        },
+        Some(_) if dedicated => CertificateDomainStatus {
+            domain: domain.to_string(),
+            tls_enabled: true,
+            covered: true,
+            status: "covered",
+            reason: "dedicated_sni_certificate",
+            dedicated: true,
         },
         Some(_) if generated => CertificateDomainStatus {
             domain: domain.to_string(),
             tls_enabled: true,
             covered: true,
             status: "covered",
-            reason: "active_local_certificate_bundle",
+            reason: "fallback_certificate_bundle",
+            dedicated: false,
         },
         Some(_) => CertificateDomainStatus {
             domain: domain.to_string(),
@@ -1944,6 +1931,7 @@ fn certificate_domain_status(
             covered: false,
             status: "pending",
             reason: "certificate_bundle_not_generated_yet",
+            dedicated: false,
         },
         None => CertificateDomainStatus {
             domain: domain.to_string(),
@@ -1951,8 +1939,50 @@ fn certificate_domain_status(
             covered: false,
             status: "not_found",
             reason: "domain_not_registered",
+            dedicated,
         },
     }
+}
+
+async fn domain_certificate_exists(cert_dir: &str, domain: &str) -> bool {
+    tokio::fs::metadata(domain_certificate_path(cert_dir, domain))
+        .await
+        .is_ok()
+        && tokio::fs::metadata(domain_private_key_path(cert_dir, domain))
+            .await
+            .is_ok()
+}
+
+fn domain_certificate_exists_sync(cert_dir: &str, domain: &str) -> bool {
+    domain_certificate_path(cert_dir, domain).exists()
+        && domain_private_key_path(cert_dir, domain).exists()
+}
+
+fn domain_certificate_path(cert_dir: &str, domain: &str) -> PathBuf {
+    PathBuf::from(cert_dir)
+        .join("domains")
+        .join(safe_domain_cert_name(domain))
+        .join("fullchain.pem")
+}
+
+fn domain_private_key_path(cert_dir: &str, domain: &str) -> PathBuf {
+    PathBuf::from(cert_dir)
+        .join("domains")
+        .join(safe_domain_cert_name(domain))
+        .join("privkey.pem")
+}
+
+fn safe_domain_cert_name(domain: &str) -> String {
+    domain
+        .chars()
+        .map(|ch| {
+            if ch.is_ascii_alphanumeric() || ch == '.' || ch == '-' {
+                ch.to_ascii_lowercase()
+            } else {
+                '_'
+            }
+        })
+        .collect()
 }
 
 fn redact_route(mut route: Route) -> Route {

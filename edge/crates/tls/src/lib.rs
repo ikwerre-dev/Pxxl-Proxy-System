@@ -1,10 +1,16 @@
 use async_trait::async_trait;
 use rcgen::{Certificate, CertificateParams, DnType};
-use rustls::{pki_types::CertificateDer, ServerConfig};
+use rustls::{
+    pki_types::CertificateDer,
+    server::{ClientHello, ResolvesServerCert},
+    sign::CertifiedKey,
+    ServerConfig,
+};
 #[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
 use std::{
-    fs::File,
+    collections::HashMap,
+    fs::{self as std_fs, File},
     io::{BufReader, Cursor},
     path::{Path, PathBuf},
     sync::Arc,
@@ -77,6 +83,14 @@ impl LocalCertificateStore {
 
     pub fn key_path(&self) -> PathBuf {
         self.cert_dir.join("local-dev-key.pem")
+    }
+
+    pub fn domain_certs_dir(&self) -> PathBuf {
+        self.cert_dir.join("domains")
+    }
+
+    pub fn domain_cert_dir(&self, domain: &str) -> PathBuf {
+        self.domain_certs_dir().join(safe_domain_cert_name(domain))
     }
 
     pub async fn server_config(&self, domains: &[String]) -> Result<Arc<ServerConfig>> {
@@ -195,6 +209,19 @@ impl LocalCertificateStore {
         config.alpn_protocols = vec![b"h2".to_vec(), b"http/1.1".to_vec()];
         Ok(Arc::new(config))
     }
+
+    pub fn server_config_with_domain_certs(
+        &self,
+        fallback: &CertificateBundle,
+    ) -> Result<Arc<ServerConfig>> {
+        let fallback_key = certified_key_from_paths(&fallback.cert_path, &fallback.key_path)?;
+        let resolver = DomainCertificateResolver::load(self.domain_certs_dir(), fallback_key)?;
+        let mut config = ServerConfig::builder()
+            .with_no_client_auth()
+            .with_cert_resolver(Arc::new(resolver));
+        config.alpn_protocols = vec![b"h2".to_vec(), b"http/1.1".to_vec()];
+        Ok(Arc::new(config))
+    }
 }
 
 #[async_trait]
@@ -295,6 +322,69 @@ fn generate_certificate(domains: &[String]) -> Result<(String, String, Vec<Strin
     let cert_pem = cert.serialize_pem()?;
     let key_pem = cert.serialize_private_key_pem();
     Ok((cert_pem, key_pem, sans))
+}
+
+fn safe_domain_cert_name(domain: &str) -> String {
+    domain
+        .chars()
+        .map(|ch| {
+            if ch.is_ascii_alphanumeric() || ch == '.' || ch == '-' {
+                ch.to_ascii_lowercase()
+            } else {
+                '_'
+            }
+        })
+        .collect()
+}
+
+#[derive(Debug)]
+struct DomainCertificateResolver {
+    fallback: Arc<CertifiedKey>,
+    by_name: HashMap<String, Arc<CertifiedKey>>,
+}
+
+impl DomainCertificateResolver {
+    fn load(domain_certs_dir: PathBuf, fallback: CertifiedKey) -> Result<Self> {
+        let mut by_name = HashMap::new();
+        if let Ok(entries) = std_fs::read_dir(&domain_certs_dir) {
+            for entry in entries.flatten() {
+                let path = entry.path();
+                if !path.is_dir() {
+                    continue;
+                }
+                let Some(domain) = path.file_name().and_then(|value| value.to_str()) else {
+                    continue;
+                };
+                let cert_path = path.join("fullchain.pem");
+                let key_path = path.join("privkey.pem");
+                if !cert_path.exists() || !key_path.exists() {
+                    continue;
+                }
+                let key = certified_key_from_paths(&cert_path, &key_path)?;
+                by_name.insert(domain.to_ascii_lowercase(), Arc::new(key));
+            }
+        }
+        Ok(Self {
+            fallback: Arc::new(fallback),
+            by_name,
+        })
+    }
+}
+
+impl ResolvesServerCert for DomainCertificateResolver {
+    fn resolve(&self, client_hello: ClientHello<'_>) -> Option<Arc<CertifiedKey>> {
+        client_hello
+            .server_name()
+            .and_then(|name| self.by_name.get(&name.to_ascii_lowercase()).cloned())
+            .or_else(|| Some(self.fallback.clone()))
+    }
+}
+
+fn certified_key_from_paths(cert_path: &Path, key_path: &Path) -> Result<CertifiedKey> {
+    let certs = load_certs(cert_path)?;
+    let key = load_private_key(key_path)?;
+    let provider = rustls::crypto::aws_lc_rs::default_provider();
+    CertifiedKey::from_der(certs, key, &provider).map_err(TlsError::Rustls)
 }
 
 fn load_certs(path: &Path) -> Result<Vec<CertificateDer<'static>>> {

@@ -150,7 +150,7 @@ async fn main() -> Result<()> {
     let tls_status = TlsCertificateRuntimeStatus::new();
     let bundle = cert_store.regenerate_certificate(&cert_domains).await?;
     tls_status.mark_success(cert_domains.clone());
-    let tls_config = cert_store.server_config_from_bundle(&bundle)?;
+    let tls_config = cert_store.server_config_with_domain_certs(&bundle)?;
     let reloadable_tls = ReloadableTlsConfig::new(tls_config);
     metrics
         .tls_certificates_total
@@ -759,22 +759,22 @@ async fn run_tls_reloader(
     let mut pending_domains: Option<Vec<String>> = None;
     let mut exhausted_domains: Option<Vec<String>> = None;
     let mut attempts = 0_u8;
-    let mut current_cert_modified = cert_modified_unix_ms(&cert_store.cert_path()).await;
+    let mut current_cert_fingerprint = cert_fingerprint(&cert_store).await;
 
     loop {
         tokio::select! {
             _ = interval.tick() => {
-                let latest_cert_modified = cert_modified_unix_ms(&cert_store.cert_path()).await;
-                if latest_cert_modified.is_some() && latest_cert_modified != current_cert_modified {
+                let latest_cert_fingerprint = cert_fingerprint(&cert_store).await;
+                if latest_cert_fingerprint != current_cert_fingerprint {
                     let bundle = CertificateBundle {
                         cert_path: cert_store.cert_path(),
                         key_path: cert_store.key_path(),
                         domains: current_domains.clone(),
                     };
-                    match cert_store.server_config_from_bundle(&bundle) {
+                    match cert_store.server_config_with_domain_certs(&bundle) {
                         Ok(config) => {
                             tls_config.store(config);
-                            current_cert_modified = latest_cert_modified;
+                            current_cert_fingerprint = latest_cert_fingerprint;
                             tls_status.mark_success(current_domains.clone());
                             info!("reloaded TLS certificate from updated certificate files");
                         }
@@ -809,7 +809,7 @@ async fn run_tls_reloader(
 
                     attempts += 1;
                     match cert_store.regenerate_certificate(&domains).await {
-                        Ok(bundle) => match cert_store.server_config_from_bundle(&bundle) {
+                        Ok(bundle) => match cert_store.server_config_with_domain_certs(&bundle) {
                             Ok(config) => {
                                 tls_config.store(config);
                                 tls_status.mark_success(domains.clone());
@@ -817,7 +817,7 @@ async fn run_tls_reloader(
                                 pending_domains = None;
                                 attempts = 0;
                                 current_domains = domains;
-                                current_cert_modified = cert_modified_unix_ms(&cert_store.cert_path()).await;
+                                current_cert_fingerprint = cert_fingerprint(&cert_store).await;
                                 info!("reloaded local TLS certificate for dynamic route domains");
                             }
                             Err(error) => {
@@ -873,13 +873,45 @@ fn certificate_domains(local_subject_alt_names: &[String], state: &EdgeState) ->
     domains
 }
 
-async fn cert_modified_unix_ms(path: &Path) -> Option<u128> {
-    tokio::fs::metadata(path)
-        .await
+async fn cert_fingerprint(cert_store: &LocalCertificateStore) -> String {
+    let mut values = Vec::new();
+    push_cert_file_fingerprint(&mut values, &cert_store.cert_path());
+    push_cert_file_fingerprint(&mut values, &cert_store.key_path());
+    collect_cert_dir_fingerprints(&mut values, &cert_store.domain_certs_dir());
+    values.sort();
+    values.join("|")
+}
+
+fn collect_cert_dir_fingerprints(values: &mut Vec<String>, dir: &Path) {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.is_dir() {
+            collect_cert_dir_fingerprints(values, &path);
+        } else {
+            push_cert_file_fingerprint(values, &path);
+        }
+    }
+}
+
+fn push_cert_file_fingerprint(values: &mut Vec<String>, path: &Path) {
+    let Ok(metadata) = std::fs::metadata(path) else {
+        return;
+    };
+    let modified = metadata
+        .modified()
         .ok()
-        .and_then(|metadata| metadata.modified().ok())
-        .and_then(|modified| modified.duration_since(std::time::UNIX_EPOCH).ok())
+        .and_then(|value| value.duration_since(std::time::UNIX_EPOCH).ok())
         .map(|duration| duration.as_millis())
+        .unwrap_or_default();
+    values.push(format!(
+        "{}:{}:{}",
+        path.display(),
+        metadata.len(),
+        modified
+    ));
 }
 
 fn safe_certificate_domain(domain: &str) -> bool {
