@@ -7,7 +7,7 @@ use pxxl_common::{
 use pxxl_ddos::SecurityEngine;
 use pxxl_load_balancer::LoadBalancer;
 use pxxl_metrics::PxxlMetrics;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use std::{
     collections::{BTreeMap, HashMap, VecDeque},
     net::IpAddr,
@@ -309,6 +309,17 @@ impl DomainStatsRegistry {
         snapshots
     }
 
+    pub fn restore_snapshots(&self, snapshots: Vec<DomainStatsSnapshot>) {
+        for snapshot in snapshots {
+            if snapshot.domain.trim().is_empty() {
+                continue;
+            }
+            let counters = Arc::new(DomainStatsCounters::default());
+            counters.restore(snapshot.clone());
+            self.domains.insert(snapshot.domain, counters);
+        }
+    }
+
     pub fn recent_visits(&self, domain: &str, limit: usize) -> Vec<VisitSnapshot> {
         self.domains
             .get(domain)
@@ -465,6 +476,50 @@ impl DomainStatsCounters {
         }
     }
 
+    fn restore(&self, snapshot: DomainStatsSnapshot) {
+        self.requests_total
+            .store(snapshot.requests_total, Ordering::Relaxed);
+        self.responses_2xx
+            .store(snapshot.responses_2xx, Ordering::Relaxed);
+        self.responses_3xx
+            .store(snapshot.responses_3xx, Ordering::Relaxed);
+        self.responses_4xx
+            .store(snapshot.responses_4xx, Ordering::Relaxed);
+        self.responses_5xx
+            .store(snapshot.responses_5xx, Ordering::Relaxed);
+        self.total_latency_ms.store(
+            (snapshot.average_latency_ms.max(0.0) * snapshot.requests_total as f64).round() as u64,
+            Ordering::Relaxed,
+        );
+        self.total_bytes_sent
+            .store(snapshot.total_bytes_sent, Ordering::Relaxed);
+        self.total_bytes_received
+            .store(snapshot.total_bytes_received, Ordering::Relaxed);
+        self.last_status.store(
+            snapshot.last_status.unwrap_or_default() as u64,
+            Ordering::Relaxed,
+        );
+        self.last_seen_unix_ms.store(
+            snapshot.last_seen_unix_ms.unwrap_or_default(),
+            Ordering::Relaxed,
+        );
+
+        {
+            let mut countries = self.country_counts.lock();
+            for item in snapshot.top_countries {
+                countries.insert(item.code.clone(), item);
+            }
+        }
+        {
+            let mut continents = self.continent_counts.lock();
+            for item in snapshot.top_continents {
+                continents.insert(item.code.clone(), item);
+            }
+        }
+        restore_string_counts(&self.path_counts, snapshot.top_paths);
+        restore_string_counts(&self.upstream_counts, snapshot.top_upstreams);
+    }
+
     fn recent_visits(&self, limit: usize) -> Vec<VisitSnapshot> {
         self.recent_visits
             .lock()
@@ -501,7 +556,7 @@ pub struct RequestObservation {
     pub bytes_received: u64,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DomainStatsSnapshot {
     pub domain: String,
     pub requests_total: u64,
@@ -537,17 +592,24 @@ pub struct VisitSnapshot {
     pub bytes_received: u64,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct LocationCount {
     pub code: String,
     pub name: Option<String>,
     pub count: u64,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct StringCount {
     pub value: String,
     pub count: u64,
+}
+
+fn restore_string_counts(counts: &Mutex<HashMap<String, u64>>, values: Vec<StringCount>) {
+    let mut counts = counts.lock();
+    for item in values {
+        counts.insert(item.value, item.count);
+    }
 }
 
 fn increment_count(counts: &Mutex<HashMap<String, u64>>, value: String) {
@@ -949,5 +1011,47 @@ mod tests {
 
         assert!(!route.paths[0].upstreams[0].healthy);
         assert!(!route.rules.location_routes[0].upstreams[0].healthy);
+    }
+
+    #[test]
+    fn stats_registry_restores_persisted_snapshots() {
+        let registry = DomainStatsRegistry::new();
+        registry.restore_snapshots(vec![DomainStatsSnapshot {
+            domain: "app.example.com".to_string(),
+            requests_total: 42,
+            responses_2xx: 40,
+            responses_3xx: 1,
+            responses_4xx: 1,
+            responses_5xx: 0,
+            average_latency_ms: 12.5,
+            total_bytes_sent: 2048,
+            total_bytes_received: 512,
+            total_bandwidth: 2560,
+            last_status: Some(200),
+            last_seen_unix_ms: Some(1_800_000),
+            top_countries: vec![LocationCount {
+                code: "NG".to_string(),
+                name: Some("Nigeria".to_string()),
+                count: 7,
+            }],
+            top_continents: Vec::new(),
+            top_paths: vec![StringCount {
+                value: "/".to_string(),
+                count: 42,
+            }],
+            top_upstreams: vec![StringCount {
+                value: "http://10.88.0.11:3000".to_string(),
+                count: 42,
+            }],
+        }]);
+
+        let snapshot = registry.snapshot_domain("app.example.com").unwrap();
+
+        assert_eq!(snapshot.requests_total, 42);
+        assert_eq!(snapshot.responses_2xx, 40);
+        assert_eq!(snapshot.total_bandwidth, 2560);
+        assert_eq!(snapshot.last_status, Some(200));
+        assert_eq!(snapshot.top_paths[0].value, "/");
+        assert_eq!(snapshot.top_countries[0].code, "NG");
     }
 }

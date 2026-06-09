@@ -34,7 +34,7 @@ use std::{
     collections::{BTreeSet, HashMap},
     net::{IpAddr, SocketAddr},
     os::unix::fs::FileTypeExt,
-    path::Path,
+    path::{Path, PathBuf},
     sync::Arc,
     time::Duration,
 };
@@ -45,6 +45,8 @@ use tokio::{
 };
 use tracing::{info, warn};
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt, EnvFilter};
+
+const DEFAULT_STATS_SNAPSHOT_PATH: &str = "/data/stats/domain-stats.json";
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -103,6 +105,24 @@ async fn main() -> Result<()> {
         metrics.clone(),
         analytics_tx,
     );
+    let stats_snapshot_path = stats_snapshot_path();
+    match load_domain_stats_snapshot(&state, &stats_snapshot_path).await {
+        Ok(count) if count > 0 => {
+            info!(
+                count,
+                path = %stats_snapshot_path.display(),
+                "restored edge metrics snapshot"
+            );
+        }
+        Ok(_) => {}
+        Err(error) => {
+            warn!(
+                %error,
+                path = %stats_snapshot_path.display(),
+                "could not restore edge metrics snapshot"
+            );
+        }
+    }
     let error_pages =
         match ErrorPageRenderer::load_from_dir(config.error_pages.enabled, &config.error_pages.dir)
         {
@@ -215,6 +235,12 @@ async fn main() -> Result<()> {
             shutdown_rx.clone(),
         )));
     }
+
+    tasks.push(tokio::spawn(run_domain_stats_snapshotter(
+        state.clone(),
+        stats_snapshot_path,
+        shutdown_rx.clone(),
+    )));
 
     if env_flag_default("PXXL_ROUTE_EVENTS_ENABLED", true) {
         tasks.push(tokio::spawn(run_route_event_consumer(
@@ -341,6 +367,74 @@ struct RuntimeRouteEvent {
     deployment_id: String,
     #[serde(default)]
     container_id: String,
+}
+
+fn stats_snapshot_path() -> PathBuf {
+    std::env::var("PXXL_STATS_SNAPSHOT_PATH")
+        .ok()
+        .filter(|path| !path.trim().is_empty())
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from(DEFAULT_STATS_SNAPSHOT_PATH))
+}
+
+async fn load_domain_stats_snapshot(state: &EdgeState, path: &Path) -> Result<usize> {
+    if !path.exists() {
+        return Ok(0);
+    }
+    let bytes = tokio::fs::read(path).await?;
+    if bytes.is_empty() {
+        return Ok(0);
+    }
+    let snapshots = serde_json::from_slice::<Vec<pxxl_core::DomainStatsSnapshot>>(&bytes)
+        .context("parsing edge metrics snapshot")?;
+    let count = snapshots.len();
+    state.stats.restore_snapshots(snapshots);
+    Ok(count)
+}
+
+async fn run_domain_stats_snapshotter(
+    state: EdgeState,
+    path: PathBuf,
+    mut shutdown: watch::Receiver<bool>,
+) -> Result<()> {
+    let interval_seconds = std::env::var("PXXL_STATS_SNAPSHOT_INTERVAL_SECONDS")
+        .ok()
+        .and_then(|value| value.parse::<u64>().ok())
+        .unwrap_or(10)
+        .max(2);
+    let mut interval = time::interval(Duration::from_secs(interval_seconds));
+
+    loop {
+        tokio::select! {
+            _ = interval.tick() => {
+                if let Err(error) = write_domain_stats_snapshot(&state, &path).await {
+                    warn!(%error, path = %path.display(), "could not persist edge metrics snapshot");
+                }
+            }
+            changed = shutdown.changed() => {
+                if changed.is_ok() && *shutdown.borrow() {
+                    if let Err(error) = write_domain_stats_snapshot(&state, &path).await {
+                        warn!(%error, path = %path.display(), "could not persist final edge metrics snapshot");
+                    }
+                    break;
+                }
+            }
+        }
+    }
+
+    Ok(())
+}
+
+async fn write_domain_stats_snapshot(state: &EdgeState, path: &Path) -> Result<()> {
+    if let Some(parent) = path.parent() {
+        tokio::fs::create_dir_all(parent).await?;
+    }
+    let snapshots = state.stats.snapshots();
+    let bytes = serde_json::to_vec(&snapshots)?;
+    let temp_path = path.with_extension("json.tmp");
+    tokio::fs::write(&temp_path, bytes).await?;
+    tokio::fs::rename(&temp_path, path).await?;
+    Ok(())
 }
 
 async fn run_route_event_consumer(
