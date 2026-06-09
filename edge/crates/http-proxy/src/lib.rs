@@ -4472,10 +4472,16 @@ async fn serve_acme_http01_challenge(path: &str) -> Option<Response<BoxBody>> {
         return Some(text_response(StatusCode::BAD_REQUEST, "invalid acme challenge token"));
     }
 
-    let root = std::env::var("PXXL_ACME_CHALLENGE_DIR")
-        .unwrap_or_else(|_| "/data/acme-challenges".to_string());
-    let challenge_path = PathBuf::from(root).join(token);
-    match tokio::fs::read_to_string(challenge_path).await {
+    let root = PathBuf::from(
+        std::env::var("PXXL_ACME_CHALLENGE_DIR")
+            .unwrap_or_else(|_| "/data/acme-challenges".to_string()),
+    );
+    let certbot_path = root.join(".well-known").join("acme-challenge").join(token);
+    let flat_path = root.join(token);
+    match tokio::fs::read_to_string(&certbot_path)
+        .await
+        .or_else(|_| std::fs::read_to_string(flat_path))
+    {
         Ok(value) => Some(response_with_body(
             StatusCode::OK,
             "text/plain; charset=utf-8",
