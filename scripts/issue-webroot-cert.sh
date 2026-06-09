@@ -11,8 +11,8 @@ Issues/renews a single SAN certificate using the proxy-served HTTP-01 webroot:
   /data/acme-challenges
 
 The script writes env lines into .env so the edge container serves the trusted cert:
-  PXXL_STATIC_LOCAL_CERT=/data/letsencrypt/live/<first-domain>/fullchain.pem
-  PXXL_STATIC_LOCAL_KEY=/data/letsencrypt/live/<first-domain>/privkey.pem
+  PXXL_STATIC_LOCAL_CERT=/data/certs/<first-domain>-fullchain.pem
+  PXXL_STATIC_LOCAL_KEY=/data/certs/<first-domain>-privkey.pem
 USAGE
 }
 
@@ -75,7 +75,7 @@ done
 [ "${#unique_domains[@]}" -le 100 ] || { echo "Let's Encrypt allows at most 100 names per certificate; split the list" >&2; exit 2; }
 
 cd "$(dirname "$0")/.."
-mkdir -p data/acme-challenges data/letsencrypt
+mkdir -p data/acme-challenges data/letsencrypt data/certs
 
 if ! command -v certbot >/dev/null 2>&1; then
   echo "certbot is required. Install it first, then rerun this script." >&2
@@ -90,8 +90,14 @@ done
 
 certbot "${args[@]}"
 
-cert_path="/data/letsencrypt/live/$cert_name/fullchain.pem"
-key_path="/data/letsencrypt/live/$cert_name/privkey.pem"
+host_cert_path="$PWD/data/certs/$cert_name-fullchain.pem"
+host_key_path="$PWD/data/certs/$cert_name-privkey.pem"
+cp -L "$PWD/data/letsencrypt/live/$cert_name/fullchain.pem" "$host_cert_path"
+cp -L "$PWD/data/letsencrypt/live/$cert_name/privkey.pem" "$host_key_path"
+chmod 0644 "$host_cert_path" "$host_key_path"
+
+cert_path="/data/certs/$cert_name-fullchain.pem"
+key_path="/data/certs/$cert_name-privkey.pem"
 
 touch .env
 tmp_env="$(mktemp)"
