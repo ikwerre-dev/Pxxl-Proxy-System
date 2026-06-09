@@ -132,8 +132,14 @@ impl LocalCertificateStore {
         cert_path: &Path,
         key_path: &Path,
     ) -> Result<Option<CertificateBundle>> {
-        let cert_override = std::env::var("PXXL_STATIC_LOCAL_CERT").ok();
-        let key_override = std::env::var("PXXL_STATIC_LOCAL_KEY").ok();
+        let cert_override = std::env::var("PXXL_STATIC_LOCAL_CERT")
+            .ok()
+            .map(|value| value.trim().to_string())
+            .filter(|value| !value.is_empty());
+        let key_override = std::env::var("PXXL_STATIC_LOCAL_KEY")
+            .ok()
+            .map(|value| value.trim().to_string())
+            .filter(|value| !value.is_empty());
         let (Some(source_cert), Some(source_key)) =
             (cert_override.as_deref(), key_override.as_deref())
         else {
