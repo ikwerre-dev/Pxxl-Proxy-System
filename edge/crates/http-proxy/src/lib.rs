@@ -20,14 +20,15 @@ use hyper_util::{
     rt::{TokioExecutor, TokioIo, TokioTimer},
     server::conn::auto::Builder as AutoBuilder,
 };
+use ipnet::IpNet;
 use parking_lot::Mutex;
 use pxxl_common::{
     canonicalize_request_path, ip_allowed_for_upstream, normalize_domain, BasicAuthConfig,
     BufferingConfig, CircuitBreakerConfig, ClientCertForwardingConfig, CompressionConfig,
     ContentTypeAutoDetectConfig, DigestAuthConfig, DomainRateLimit, DomainRules, ForwardAuthConfig,
     GeoLocation, InFlightLimitConfig, InFlightLimitScope, MiddlewareDefinition,
-    PassiveHealthConfig, PxxlError, RateLimitScope, RetryConfig, RouteMatch, RouteSource,
-    StickySessionConfig, TrafficMirrorConfig, TrafficSplitRule, Upstream,
+    parse_ip_net, PassiveHealthConfig, PxxlError, RateLimitScope, RetryConfig, RouteMatch,
+    RouteSource, StickySessionConfig, TrafficMirrorConfig, TrafficSplitRule, Upstream,
 };
 use pxxl_core::{EdgeState, RequestObservation};
 use pxxl_ddos::SecurityDecision;
@@ -69,6 +70,8 @@ const DIGEST_NONCE_TTL_MS: u64 = 5 * 60 * 1_000;
 const DIGEST_NONCE_CLOCK_SKEW_MS: u64 = 30 * 1_000;
 const DIGEST_REPLAY_EVICT_AT: usize = 100_000;
 const ACME_CHALLENGE_PREFIX: &str = "/.well-known/acme-challenge/";
+const TRUSTED_CLIENT_IP_CIDRS_ENV: &str = "PXXL_TRUSTED_CLIENT_IP_CIDRS";
+const LEGACY_TRUSTED_CLIENT_IP_CIDRS_ENV: &str = "PXXL_TRUSTED_PROXY_CIDRS";
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum ProxyErrorReason {
@@ -1466,7 +1469,43 @@ pub struct ProxyServer {
     error_pages: ErrorPageRenderer,
     policy: PolicyEnforcer,
     geoip: GeoIpResolver,
+    trusted_client_ip: TrustedClientIpConfig,
     bandwidth_tracker: Option<Arc<RedisBandwidthTracker>>,
+}
+
+#[derive(Debug, Clone, Default)]
+struct TrustedClientIpConfig {
+    cidrs: Arc<Vec<IpNet>>,
+}
+
+impl TrustedClientIpConfig {
+    fn from_env() -> Self {
+        let value = std::env::var(TRUSTED_CLIENT_IP_CIDRS_ENV)
+            .or_else(|_| std::env::var(LEGACY_TRUSTED_CLIENT_IP_CIDRS_ENV))
+            .unwrap_or_default();
+        Self::parse(&value)
+    }
+
+    fn parse(value: &str) -> Self {
+        let mut cidrs = Vec::new();
+        for entry in value.split(',').map(str::trim).filter(|entry| !entry.is_empty()) {
+            match parse_ip_net(entry) {
+                Ok(network) => cidrs.push(network),
+                Err(error) => warn!(
+                    cidr = %entry,
+                    %error,
+                    "ignoring invalid trusted client IP CIDR"
+                ),
+            }
+        }
+        Self {
+            cidrs: Arc::new(cidrs),
+        }
+    }
+
+    fn trusted_peer(&self, peer_ip: IpAddr) -> bool {
+        self.cidrs.iter().any(|network| network.contains(&peer_ip))
+    }
 }
 
 fn https_connector() -> HttpsConnector<HttpConnector> {
@@ -1521,6 +1560,7 @@ impl ProxyServer {
             error_pages,
             policy,
             geoip,
+            trusted_client_ip: TrustedClientIpConfig::from_env(),
             bandwidth_tracker: None,
         }
     }
@@ -1533,7 +1573,7 @@ impl ProxyServer {
     pub async fn handle(
         &self,
         req: Request<Incoming>,
-        remote_ip: Option<IpAddr>,
+        peer_ip: Option<IpAddr>,
         scheme: RequestScheme,
         client_cert_pem: Option<String>,
     ) -> Response<BoxBody> {
@@ -1549,6 +1589,11 @@ impl ProxyServer {
 
         let method = req.method().clone();
         let original_query = req.uri().query().map(str::to_string);
+        let remote_ip = resolve_effective_client_ip(
+            req.headers(),
+            peer_ip,
+            &self.trusted_client_ip,
+        );
         let path = match canonicalize_request_path(req.uri().path()) {
             Ok(path) => path,
             Err(error) => {
@@ -3219,6 +3264,105 @@ fn strip_forwarded_request_headers(headers: &mut HeaderMap) {
     }
 }
 
+fn resolve_effective_client_ip(
+    headers: &HeaderMap,
+    peer_ip: Option<IpAddr>,
+    trusted: &TrustedClientIpConfig,
+) -> Option<IpAddr> {
+    let peer_ip = peer_ip?;
+    if !trusted.trusted_peer(peer_ip) {
+        return Some(peer_ip);
+    }
+    forwarded_client_ip(headers).or(Some(peer_ip))
+}
+
+fn forwarded_client_ip(headers: &HeaderMap) -> Option<IpAddr> {
+    for name in ["cf-connecting-ip", "x-real-ip", "true-client-ip"] {
+        if let Some(ip) = headers
+            .get(HeaderName::from_static(name))
+            .and_then(|value| value.to_str().ok())
+            .and_then(parse_forwarded_ip_value)
+        {
+            return Some(ip);
+        }
+    }
+
+    if let Some(ip) = headers
+        .get(HeaderName::from_static("x-forwarded-for"))
+        .and_then(|value| value.to_str().ok())
+        .and_then(parse_x_forwarded_for)
+    {
+        return Some(ip);
+    }
+
+    headers
+        .get(HeaderName::from_static("forwarded"))
+        .and_then(|value| value.to_str().ok())
+        .and_then(parse_forwarded_header)
+}
+
+fn parse_x_forwarded_for(value: &str) -> Option<IpAddr> {
+    value.split(',').find_map(parse_forwarded_ip_value)
+}
+
+fn parse_forwarded_header(value: &str) -> Option<IpAddr> {
+    for segment in value.split(',') {
+        for pair in segment.split(';') {
+            let pair = pair.trim();
+            let Some((name, raw_value)) = pair.split_once('=') else {
+                continue;
+            };
+            if !name.trim().eq_ignore_ascii_case("for") {
+                continue;
+            }
+            if let Some(ip) = parse_forwarded_ip_value(raw_value) {
+                return Some(ip);
+            }
+        }
+    }
+    None
+}
+
+fn parse_forwarded_ip_value(value: &str) -> Option<IpAddr> {
+    let mut value = value.trim().trim_matches('"').trim_matches('[').trim_matches(']');
+    if value.is_empty() || value.eq_ignore_ascii_case("unknown") || value.starts_with('_') {
+        return None;
+    }
+
+    if let Ok(ip) = value.parse::<IpAddr>() {
+        return is_public_client_ip(ip).then_some(ip);
+    }
+
+    if let Some((host, _port)) = value.rsplit_once(':') {
+        value = host.trim().trim_matches('[').trim_matches(']');
+        if let Ok(ip) = value.parse::<IpAddr>() {
+            return is_public_client_ip(ip).then_some(ip);
+        }
+    }
+
+    None
+}
+
+fn is_public_client_ip(ip: IpAddr) -> bool {
+    match ip {
+        IpAddr::V4(ip) => {
+            !ip.is_private()
+                && !ip.is_loopback()
+                && !ip.is_link_local()
+                && !ip.is_broadcast()
+                && !ip.is_documentation()
+                && !ip.is_unspecified()
+        }
+        IpAddr::V6(ip) => {
+            let segments = ip.segments();
+            let first = segments[0];
+            let unique_local = (first & 0xfe00) == 0xfc00;
+            let link_local = (first & 0xffc0) == 0xfe80;
+            !ip.is_loopback() && !ip.is_multicast() && !ip.is_unspecified() && !unique_local && !link_local
+        }
+    }
+}
+
 fn preserve_websocket_upgrade_headers(headers: &mut HeaderMap) {
     headers.insert(CONNECTION, HeaderValue::from_static("Upgrade"));
     headers.insert(UPGRADE, HeaderValue::from_static("websocket"));
@@ -4663,5 +4807,59 @@ mod tests {
         assert!(!path_has_long_random_segment(
             "/blog/how-to-deploy-a-normal-project"
         ));
+    }
+
+    #[test]
+    fn trusted_peer_uses_first_public_forwarded_client_ip() {
+        let trusted = TrustedClientIpConfig::parse("10.88.0.0/24");
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            HeaderName::from_static("x-forwarded-for"),
+            HeaderValue::from_static("10.0.0.7, 8.8.8.8, 1.1.1.1"),
+        );
+
+        let ip = resolve_effective_client_ip(
+            &headers,
+            Some("10.88.0.31".parse().unwrap()),
+            &trusted,
+        );
+
+        assert_eq!(ip, Some("8.8.8.8".parse().unwrap()));
+    }
+
+    #[test]
+    fn untrusted_peer_cannot_spoof_forwarded_client_ip() {
+        let trusted = TrustedClientIpConfig::parse("10.88.0.0/24");
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            HeaderName::from_static("cf-connecting-ip"),
+            HeaderValue::from_static("8.8.8.8"),
+        );
+
+        let ip = resolve_effective_client_ip(
+            &headers,
+            Some("203.0.113.10".parse().unwrap()),
+            &trusted,
+        );
+
+        assert_eq!(ip, Some("203.0.113.10".parse().unwrap()));
+    }
+
+    #[test]
+    fn forwarded_header_supports_quoted_ipv6_and_ports() {
+        let trusted = TrustedClientIpConfig::parse("10.89.0.0/16");
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            HeaderName::from_static("forwarded"),
+            HeaderValue::from_static("for=\"[2606:4700:4700::1111]:443\";proto=https"),
+        );
+
+        let ip = resolve_effective_client_ip(
+            &headers,
+            Some("10.89.2.27".parse().unwrap()),
+            &trusted,
+        );
+
+        assert_eq!(ip, Some("2606:4700:4700::1111".parse().unwrap()));
     }
 }
