@@ -23,12 +23,12 @@ use hyper_util::{
 use ipnet::IpNet;
 use parking_lot::Mutex;
 use pxxl_common::{
-    canonicalize_request_path, ip_allowed_for_upstream, normalize_domain, BasicAuthConfig,
-    BufferingConfig, CircuitBreakerConfig, ClientCertForwardingConfig, CompressionConfig,
-    ContentTypeAutoDetectConfig, DigestAuthConfig, DomainRateLimit, DomainRules, ForwardAuthConfig,
-    GeoLocation, InFlightLimitConfig, InFlightLimitScope, MiddlewareDefinition,
-    parse_ip_net, PassiveHealthConfig, PxxlError, RateLimitScope, RetryConfig, RouteMatch,
-    RouteSource, StickySessionConfig, TrafficMirrorConfig, TrafficSplitRule, Upstream,
+    canonicalize_request_path, ip_allowed_for_upstream, normalize_domain, parse_ip_net,
+    BasicAuthConfig, BufferingConfig, CircuitBreakerConfig, ClientCertForwardingConfig,
+    CompressionConfig, ContentTypeAutoDetectConfig, DigestAuthConfig, DomainRateLimit, DomainRules,
+    ForwardAuthConfig, GeoLocation, InFlightLimitConfig, InFlightLimitScope, MiddlewareDefinition,
+    PassiveHealthConfig, PxxlError, RateLimitScope, RetryConfig, RouteMatch, RouteSource,
+    StickySessionConfig, TrafficMirrorConfig, TrafficSplitRule, Upstream,
 };
 use pxxl_core::{EdgeState, RequestObservation};
 use pxxl_ddos::SecurityDecision;
@@ -1488,7 +1488,11 @@ impl TrustedClientIpConfig {
 
     fn parse(value: &str) -> Self {
         let mut cidrs = Vec::new();
-        for entry in value.split(',').map(str::trim).filter(|entry| !entry.is_empty()) {
+        for entry in value
+            .split(',')
+            .map(str::trim)
+            .filter(|entry| !entry.is_empty())
+        {
             match parse_ip_net(entry) {
                 Ok(network) => cidrs.push(network),
                 Err(error) => warn!(
@@ -1589,11 +1593,8 @@ impl ProxyServer {
 
         let method = req.method().clone();
         let original_query = req.uri().query().map(str::to_string);
-        let remote_ip = resolve_effective_client_ip(
-            req.headers(),
-            peer_ip,
-            &self.trusted_client_ip,
-        );
+        let remote_ip =
+            resolve_effective_client_ip(req.headers(), peer_ip, &self.trusted_client_ip);
         let path = match canonicalize_request_path(req.uri().path()) {
             Ok(path) => path,
             Err(error) => {
@@ -3324,7 +3325,11 @@ fn parse_forwarded_header(value: &str) -> Option<IpAddr> {
 }
 
 fn parse_forwarded_ip_value(value: &str) -> Option<IpAddr> {
-    let mut value = value.trim().trim_matches('"').trim_matches('[').trim_matches(']');
+    let mut value = value
+        .trim()
+        .trim_matches('"')
+        .trim_matches('[')
+        .trim_matches(']');
     if value.is_empty() || value.eq_ignore_ascii_case("unknown") || value.starts_with('_') {
         return None;
     }
@@ -3358,7 +3363,11 @@ fn is_public_client_ip(ip: IpAddr) -> bool {
             let first = segments[0];
             let unique_local = (first & 0xfe00) == 0xfc00;
             let link_local = (first & 0xffc0) == 0xfe80;
-            !ip.is_loopback() && !ip.is_multicast() && !ip.is_unspecified() && !unique_local && !link_local
+            !ip.is_loopback()
+                && !ip.is_multicast()
+                && !ip.is_unspecified()
+                && !unique_local
+                && !link_local
         }
     }
 }
@@ -4818,11 +4827,8 @@ mod tests {
             HeaderValue::from_static("10.0.0.7, 8.8.8.8, 1.1.1.1"),
         );
 
-        let ip = resolve_effective_client_ip(
-            &headers,
-            Some("10.88.0.31".parse().unwrap()),
-            &trusted,
-        );
+        let ip =
+            resolve_effective_client_ip(&headers, Some("10.88.0.31".parse().unwrap()), &trusted);
 
         assert_eq!(ip, Some("8.8.8.8".parse().unwrap()));
     }
@@ -4836,11 +4842,8 @@ mod tests {
             HeaderValue::from_static("8.8.8.8"),
         );
 
-        let ip = resolve_effective_client_ip(
-            &headers,
-            Some("203.0.113.10".parse().unwrap()),
-            &trusted,
-        );
+        let ip =
+            resolve_effective_client_ip(&headers, Some("203.0.113.10".parse().unwrap()), &trusted);
 
         assert_eq!(ip, Some("203.0.113.10".parse().unwrap()));
     }
@@ -4854,11 +4857,8 @@ mod tests {
             HeaderValue::from_static("for=\"[2606:4700:4700::1111]:443\";proto=https"),
         );
 
-        let ip = resolve_effective_client_ip(
-            &headers,
-            Some("10.89.2.27".parse().unwrap()),
-            &trusted,
-        );
+        let ip =
+            resolve_effective_client_ip(&headers, Some("10.89.2.27".parse().unwrap()), &trusted);
 
         assert_eq!(ip, Some("2606:4700:4700::1111".parse().unwrap()));
     }
