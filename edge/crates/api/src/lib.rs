@@ -61,6 +61,16 @@ struct ApiServer {
     auth: AdminApiAuth,
 }
 
+#[derive(Clone)]
+pub struct AdminApiRuntime {
+    pub state: EdgeState,
+    pub cert_dir: String,
+    pub tls_status: TlsCertificateRuntimeStatus,
+    pub route_store: Option<RedisRouteStore>,
+    pub database_routes: Option<DatabaseRouteRegistry>,
+    pub auth: AdminApiAuth,
+}
+
 #[derive(Clone, Debug, Default, Serialize)]
 pub struct TlsCertificateRuntimeSnapshot {
     pub last_attempt_unix_ms: Option<u128>,
@@ -267,22 +277,17 @@ struct DatabaseRouteBody {
 
 pub async fn run_admin_api(
     addr: SocketAddr,
-    state: EdgeState,
-    cert_dir: impl Into<String>,
-    tls_status: TlsCertificateRuntimeStatus,
-    route_store: Option<RedisRouteStore>,
-    database_routes: Option<DatabaseRouteRegistry>,
-    auth: AdminApiAuth,
+    runtime: AdminApiRuntime,
     shutdown: watch::Receiver<bool>,
 ) -> anyhow::Result<()> {
     let listener = TcpListener::bind(addr).await?;
     let server = ApiServer {
-        state,
-        cert_dir: cert_dir.into(),
-        tls_status,
-        route_store,
-        database_routes,
-        auth,
+        state: runtime.state,
+        cert_dir: runtime.cert_dir,
+        tls_status: runtime.tls_status,
+        route_store: runtime.route_store,
+        database_routes: runtime.database_routes,
+        auth: runtime.auth,
     };
     info!(%addr, "admin API listening");
     run_api_listener(listener, server, shutdown).await

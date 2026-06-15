@@ -8,8 +8,8 @@ use hyper_util::{
     rt::TokioExecutor,
 };
 use pxxl_api::{
-    run_admin_api, run_metrics_server, AdminApiAuth, AdminLoginAccount, MetricsAuth,
-    TlsCertificateRuntimeStatus,
+    run_admin_api, run_metrics_server, AdminApiAuth, AdminApiRuntime, AdminLoginAccount,
+    MetricsAuth, TlsCertificateRuntimeStatus,
 };
 use pxxl_common::{ip_allowed_for_upstream, parse_ip_net, PathRoute, Route, RouteSource, Upstream};
 use pxxl_config::{HealthCheckConfig, PxxlConfig};
@@ -206,12 +206,14 @@ async fn main() -> Result<()> {
         ),
         tokio::spawn(run_admin_api(
             admin_addr,
-            state.clone(),
-            config.tls.cert_dir.clone(),
-            tls_status.clone(),
-            Some(route_store.clone()),
-            Some(database_routes.clone()),
-            admin_auth,
+            AdminApiRuntime {
+                state: state.clone(),
+                cert_dir: config.tls.cert_dir.clone(),
+                tls_status: tls_status.clone(),
+                route_store: Some(route_store.clone()),
+                database_routes: Some(database_routes.clone()),
+                auth: admin_auth,
+            },
             shutdown_rx.clone(),
         )),
         tokio::spawn(run_metrics_server(

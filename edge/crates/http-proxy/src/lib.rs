@@ -129,6 +129,17 @@ struct ErrorPageTemplate {
     body: Arc<str>,
 }
 
+#[derive(Clone, Copy, Debug)]
+struct ErrorRenderContext<'a> {
+    status: StatusCode,
+    message: &'a str,
+    reason_code: &'a str,
+    domain: &'a str,
+    path: &'a str,
+    request_id: &'a str,
+    processing_time_ms: u128,
+}
+
 #[derive(Clone, Debug)]
 pub struct BandwidthExceededContext<'a> {
     status: StatusCode,
@@ -247,13 +258,15 @@ impl ErrorPageRenderer {
             .map(|template| {
                 render_error_template(
                     template.body.as_ref(),
-                    status,
-                    message,
-                    "proxy_error",
-                    domain,
-                    path,
-                    request_id,
-                    processing_time_ms,
+                    ErrorRenderContext {
+                        status,
+                        message,
+                        reason_code: "proxy_error",
+                        domain,
+                        path,
+                        request_id,
+                        processing_time_ms,
+                    },
                 )
             })
             .unwrap_or_else(|| {
@@ -280,60 +293,40 @@ impl ErrorPageRenderer {
         request_id: &str,
         processing_time_ms: u128,
     ) -> Response<BoxBody> {
-        self.response_with_reason_code(
+        self.response_with_reason_code(ErrorRenderContext {
             status,
-            reason.public_message(),
-            reason.code(),
+            message: reason.public_message(),
+            reason_code: reason.code(),
             domain,
             path,
             request_id,
             processing_time_ms,
-        )
+        })
     }
 
-    fn response_with_reason_code(
-        &self,
-        status: StatusCode,
-        message: &str,
-        reason_code: &str,
-        domain: &str,
-        path: &str,
-        request_id: &str,
-        processing_time_ms: u128,
-    ) -> Response<BoxBody> {
+    fn response_with_reason_code(&self, context: ErrorRenderContext<'_>) -> Response<BoxBody> {
         if !self.enabled {
-            return text_response(status, message);
+            return text_response(context.status, context.message);
         }
 
         let body = self
             .pages
-            .get(&status.as_u16())
+            .get(&context.status.as_u16())
             .or(self.default_page.as_ref())
-            .map(|template| {
-                render_error_template(
-                    template.body.as_ref(),
-                    status,
-                    message,
-                    reason_code,
-                    domain,
-                    path,
-                    request_id,
-                    processing_time_ms,
-                )
-            })
+            .map(|template| render_error_template(template.body.as_ref(), context))
             .unwrap_or_else(|| {
                 default_error_html(
-                    status,
-                    message,
-                    reason_code,
-                    domain,
-                    path,
-                    request_id,
-                    processing_time_ms,
+                    context.status,
+                    context.message,
+                    context.reason_code,
+                    context.domain,
+                    context.path,
+                    context.request_id,
+                    context.processing_time_ms,
                 )
             });
 
-        html_response(status, body)
+        html_response(context.status, body)
     }
 
     pub fn bandwidth_exceeded_response(
@@ -4685,13 +4678,15 @@ fn default_error_html(
 ) -> String {
     render_error_template(
         DEFAULT_ERROR_TEMPLATE,
-        status,
-        message,
-        reason_code,
-        domain,
-        path,
-        request_id,
-        processing_time_ms,
+        ErrorRenderContext {
+            status,
+            message,
+            reason_code,
+            domain,
+            path,
+            request_id,
+            processing_time_ms,
+        },
     )
 }
 
@@ -4730,30 +4725,29 @@ fn bandwidth_reset_date(reset_day: u8) -> String {
     format!("{year}-{month:02}-{day:02}")
 }
 
-fn render_error_template(
-    template: &str,
-    status: StatusCode,
-    message: &str,
-    reason_code: &str,
-    domain: &str,
-    path: &str,
-    request_id: &str,
-    processing_time_ms: u128,
-) -> String {
-    let status_code = status.as_u16().to_string();
-    let status_text = status.canonical_reason().unwrap_or("Proxy Error");
-    let domain = if domain.is_empty() { "unknown" } else { domain };
-    let path = if path.is_empty() { "/" } else { path };
-    let processing_time_ms = processing_time_ms.to_string();
+fn render_error_template(template: &str, context: ErrorRenderContext<'_>) -> String {
+    let status_code = context.status.as_u16().to_string();
+    let status_text = context.status.canonical_reason().unwrap_or("Proxy Error");
+    let domain = if context.domain.is_empty() {
+        "unknown"
+    } else {
+        context.domain
+    };
+    let path = if context.path.is_empty() {
+        "/"
+    } else {
+        context.path
+    };
+    let processing_time_ms = context.processing_time_ms.to_string();
 
     template
         .replace("{{status_code}}", &escape_html(&status_code))
         .replace("{{status_text}}", &escape_html(status_text))
-        .replace("{{message}}", &escape_html(message))
-        .replace("{{reason_code}}", &escape_html(reason_code))
+        .replace("{{message}}", &escape_html(context.message))
+        .replace("{{reason_code}}", &escape_html(context.reason_code))
         .replace("{{domain}}", &escape_html(domain))
         .replace("{{path}}", &escape_html(path))
-        .replace("{{request_id}}", &escape_html(request_id))
+        .replace("{{request_id}}", &escape_html(context.request_id))
         .replace("{{processing_time_ms}}", &escape_html(&processing_time_ms))
 }
 
@@ -4792,13 +4786,15 @@ mod tests {
     fn renders_custom_error_page_template() {
         let rendered = render_error_template(
             "<h1>{{status_code}} {{status_text}}</h1><p>{{message}}</p><b>{{reason_code}}</b><span>{{domain}}{{path}}</span><em>{{processing_time_ms}} ms</em>",
-            StatusCode::BAD_GATEWAY,
-            "upstream <failed>",
-            "upstream_tcp_unreachable",
-            "app.pxxlhost",
-            "/users?name=<x>",
-            "request-123",
-            17,
+            ErrorRenderContext {
+                status: StatusCode::BAD_GATEWAY,
+                message: "upstream <failed>",
+                reason_code: "upstream_tcp_unreachable",
+                domain: "app.pxxlhost",
+                path: "/users?name=<x>",
+                request_id: "request-123",
+                processing_time_ms: 17,
+            },
         );
 
         assert!(rendered.contains("502 Bad Gateway"));
