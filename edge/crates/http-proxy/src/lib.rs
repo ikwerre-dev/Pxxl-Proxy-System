@@ -1178,7 +1178,7 @@ impl PolicyEnforcer {
             insert_static_header(
                 headers,
                 "content-security-policy",
-                "default-src 'self'; base-uri 'self'; object-src 'none'; frame-ancestors 'none'; script-src 'self' 'unsafe-inline' https:; style-src 'self' 'unsafe-inline'; img-src 'self' data: blob: https:; font-src 'self' data:; connect-src 'self' https: wss:; frame-src 'self' https:; upgrade-insecure-requests",
+                "default-src 'self'; base-uri 'self'; object-src 'none'; frame-ancestors 'none'; script-src 'self' 'unsafe-inline' 'wasm-unsafe-eval' https:; style-src 'self' 'unsafe-inline'; img-src 'self' data: blob: https:; font-src 'self' data:; connect-src 'self' data: https: wss:; frame-src 'self' https:; upgrade-insecure-requests",
             );
         }
 
@@ -1738,6 +1738,44 @@ impl ProxyServer {
                 ));
             }
         };
+
+        if matched.route.rules.redirect_www_to_apex
+            && matched.route.rules.www_alias
+            && domain != matched.route.domain
+            && domain
+                .strip_prefix("www.")
+                .is_some_and(|base| base == matched.route.domain)
+        {
+            let scheme = if matched.route.rules.redirect_http_to_https
+                || matched.route.rules.require_https
+            {
+                "https"
+            } else {
+                scheme.as_str()
+            };
+            let mut location = format!("{scheme}://{}{}", matched.route.domain, path);
+            if let Some(query) = &original_query {
+                location.push('?');
+                location.push_str(query);
+            }
+            self.observe_request(
+                &context,
+                StatusCode::PERMANENT_REDIRECT,
+                started,
+                None,
+                0,
+                0,
+            );
+            let mut response = response_with_body(
+                StatusCode::PERMANENT_REDIRECT,
+                "text/plain; charset=utf-8",
+                String::new(),
+            );
+            if let Ok(value) = HeaderValue::from_str(&location) {
+                response.headers_mut().insert(LOCATION, value);
+            }
+            finish_response!(response);
+        }
 
         let request_origin = req.headers().get(ORIGIN).cloned();
         let request_accept_encoding = req.headers().get(ACCEPT_ENCODING).cloned();

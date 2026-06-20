@@ -12,7 +12,7 @@ use pxxl_common::{
     LoadBalancingAlgorithm, MiddlewareDefinition, PathRoute, Route, RouteSource, Upstream,
     UpstreamTransport, MAX_ROUTES_PER_SOURCE,
 };
-use pxxl_core::EdgeState;
+use pxxl_core::{route_allows_www_alias, EdgeState};
 use pxxl_database_proxy::{DatabaseProxyRoute, DatabaseRouteRegistry};
 use pxxl_metrics::PxxlMetrics;
 use pxxl_redis_sync::{RedisRouteStore, RedisTokenStore};
@@ -1303,19 +1303,33 @@ impl ApiServer {
     }
 
     async fn resync_domain_certificate(&self, domain: &str) -> Response<BoxBody> {
-        let domain = normalize_domain(domain);
-        if domain.is_empty()
-            || domain == "localhost"
-            || domain.ends_with(".local")
-            || domain.ends_with(".test")
-            || domain.contains('*')
-            || domain.parse::<IpAddr>().is_ok()
+        let requested_domain = normalize_domain(domain);
+        if requested_domain.is_empty()
+            || requested_domain == "localhost"
+            || requested_domain.ends_with(".local")
+            || requested_domain.ends_with(".test")
+            || requested_domain.contains('*')
+            || requested_domain.parse::<IpAddr>().is_ok()
         {
             return json_response(
                 StatusCode::BAD_REQUEST,
                 json!({"error": "invalid certificate domain"}),
             );
         }
+        let route = self.state.routes.find_domain(&requested_domain);
+        let domain = route
+            .as_ref()
+            .map(|route| route.domain.clone())
+            .unwrap_or_else(|| requested_domain.clone());
+        let mut certificate_domains = vec![domain.clone()];
+        if route
+            .as_ref()
+            .is_some_and(|route| route_allows_www_alias(&route.domain, route.rules.www_alias))
+        {
+            certificate_domains.push(format!("www.{}", domain));
+        }
+        certificate_domains.sort();
+        certificate_domains.dedup();
 
         let certbot = std::env::var("PXXL_CERTBOT_BIN").unwrap_or_else(|_| "certbot".to_string());
         let email =
@@ -1347,7 +1361,7 @@ impl ApiServer {
         }
 
         let cert_name = format!("pxxl-domain-{}", safe_domain_cert_name(&domain));
-        let args = vec![
+        let mut args = vec![
             "certonly".to_string(),
             "--webroot".to_string(),
             "-w".to_string(),
@@ -1365,9 +1379,11 @@ impl ApiServer {
             "--email".to_string(),
             email,
             "--keep-until-expiring".to_string(),
-            "-d".to_string(),
-            domain.clone(),
         ];
+        for cert_domain in &certificate_domains {
+            args.push("-d".to_string());
+            args.push(cert_domain.clone());
+        }
 
         let output = match time::timeout(
             Duration::from_secs(180),
@@ -1404,22 +1420,26 @@ impl ApiServer {
         }
 
         let live_dir = certbot_config.join("live").join(cert_name);
-        let domain_dir = PathBuf::from(&self.cert_dir)
-            .join("domains")
-            .join(safe_domain_cert_name(&domain));
-        if let Err(error) = tokio::fs::create_dir_all(&domain_dir).await {
-            return json_response(
-                StatusCode::INTERNAL_SERVER_ERROR,
-                json!({"error": format!("failed to create domain certificate directory: {error}")}),
-            );
-        }
-        let cert_path = domain_dir.join("fullchain.pem");
-        let key_path = domain_dir.join("privkey.pem");
-        if let Err(error) = copy_certbot_bundle(&live_dir, &cert_path, &key_path).await {
-            return json_response(
-                StatusCode::BAD_GATEWAY,
-                json!({"error": format!("certificate issued but could not be installed: {error}")}),
-            );
+        let mut installed_cert_paths = Vec::new();
+        for cert_domain in &certificate_domains {
+            let domain_dir = PathBuf::from(&self.cert_dir)
+                .join("domains")
+                .join(safe_domain_cert_name(cert_domain));
+            if let Err(error) = tokio::fs::create_dir_all(&domain_dir).await {
+                return json_response(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    json!({"error": format!("failed to create domain certificate directory: {error}")}),
+                );
+            }
+            let cert_path = domain_dir.join("fullchain.pem");
+            let key_path = domain_dir.join("privkey.pem");
+            if let Err(error) = copy_certbot_bundle(&live_dir, &cert_path, &key_path).await {
+                return json_response(
+                    StatusCode::BAD_GATEWAY,
+                    json!({"error": format!("certificate issued but could not be installed: {error}")}),
+                );
+            }
+            installed_cert_paths.push(cert_path.display().to_string());
         }
 
         json_response(
@@ -1427,7 +1447,9 @@ impl ApiServer {
             json!({
                 "status": "issued",
                 "domain": domain,
-                "certPath": cert_path.display().to_string(),
+                "domains": certificate_domains,
+                "certPath": installed_cert_paths.first().cloned().unwrap_or_default(),
+                "certPaths": installed_cert_paths,
                 "certificate": self.certificate_status(Some(&domain)).await,
                 "stdout": stdout
             }),
@@ -1449,14 +1471,28 @@ impl ApiServer {
         let routes = self.state.routes.snapshot();
         let domains = match domain_filter.map(normalize_domain) {
             Some(domain) => {
-                let maybe_route = routes.into_iter().find(|route| route.domain == domain);
-                let dedicated = domain_certificate_exists(&self.cert_dir, &domain).await;
-                vec![certificate_domain_status(
-                    &domain,
-                    maybe_route.as_ref(),
-                    generated,
-                    dedicated,
-                )]
+                let maybe_route = self.state.routes.find_domain(&domain);
+                let mut status_domains = vec![domain.clone()];
+                if let Some(route) = &maybe_route {
+                    status_domains[0] = route.domain.clone();
+                    if route_allows_www_alias(&route.domain, route.rules.www_alias) {
+                        status_domains.push(format!("www.{}", route.domain));
+                    }
+                }
+                status_domains.sort();
+                status_domains.dedup();
+
+                let mut statuses = Vec::with_capacity(status_domains.len());
+                for status_domain in status_domains {
+                    let dedicated = domain_certificate_exists(&self.cert_dir, &status_domain).await;
+                    statuses.push(certificate_domain_status(
+                        &status_domain,
+                        maybe_route.as_ref(),
+                        generated,
+                        dedicated,
+                    ));
+                }
+                statuses
             }
             None => routes
                 .iter()

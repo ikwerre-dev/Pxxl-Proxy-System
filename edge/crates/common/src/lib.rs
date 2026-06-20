@@ -177,6 +177,8 @@ impl GeoLocation {
 pub struct DomainRules {
     #[serde(default)]
     pub www_alias: bool,
+    #[serde(default)]
+    pub redirect_www_to_apex: bool,
     #[serde(default = "default_true")]
     pub allow_websocket: bool,
     #[serde(default)]
@@ -348,6 +350,7 @@ impl Default for DomainRules {
     fn default() -> Self {
         Self {
             www_alias: false,
+            redirect_www_to_apex: false,
             allow_websocket: true,
             require_https: false,
             redirect_http_to_https: false,
