@@ -108,6 +108,7 @@ run_edge() {
 
   podman run \
     --name="$name" \
+    --replace \
     -d \
     --security-opt no-new-privileges:true \
     --read-only \
