@@ -140,6 +140,8 @@ set -a
 . ./.env
 set +a
 
+export PXXL_TRUSTED_CLIENT_IP_CIDRS="${PXXL_TRUSTED_CLIENT_IP_CIDRS:-${PXXL_TRUSTED_PROXY_CIDRS:-10.88.0.0/16,10.89.0.0/16,127.0.0.1/32,::1/128}}"
+
 if [ "$PULL_LATEST" = true ] && git rev-parse --is-inside-work-tree >/dev/null 2>&1; then
   branch="$(git rev-parse --abbrev-ref HEAD)"
   log "Pulling latest code on ${branch:-$DEFAULT_BRANCH}"
