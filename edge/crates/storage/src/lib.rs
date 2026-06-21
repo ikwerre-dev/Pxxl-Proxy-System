@@ -11,7 +11,8 @@ use hyper_util::{
 use pxxl_core::RequestObservation;
 use serde::{Deserialize, Serialize};
 use tokio::sync::{mpsc, watch};
-use tracing::{debug, info, warn};
+use tokio::time::{self, Duration};
+use tracing::{info, warn};
 use url::Url;
 
 #[derive(Debug, thiserror::Error)]
@@ -22,6 +23,8 @@ pub enum StorageError {
 
 const CLICKHOUSE_ERROR_BODY_LIMIT_BYTES: u64 = 16 * 1024;
 const CLICKHOUSE_REQUEST_TIMEOUT_SECONDS: u64 = 5;
+const CLICKHOUSE_BATCH_MAX_EVENTS: usize = 250;
+const CLICKHOUSE_BATCH_FLUSH_MS: u64 = 1_000;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct StorageEndpoints {
@@ -83,6 +86,86 @@ struct ClickHouseAccessLogRow {
     bytes_received: u64,
 }
 
+fn access_log_row_from_observation(event: RequestObservation) -> ClickHouseAccessLogRow {
+    ClickHouseAccessLogRow {
+        request_id: event.request_id,
+        timestamp_unix_ms: event.timestamp_unix_ms,
+        domain: event.domain,
+        method: event.method,
+        path: event.path,
+        status: event.status,
+        latency_ms: event.latency_ms,
+        upstream: event.upstream,
+        remote_ip: event.remote_ip.map(|ip| ip.to_string()),
+        country_code: event.location.country_code,
+        country_name: event.location.country_name,
+        continent_code: event.location.continent_code,
+        continent_name: event.location.continent_name,
+        region: event.location.region,
+        city: event.location.city,
+        geo_source: event.location.source,
+        bytes_sent: event.bytes_sent,
+        bytes_received: event.bytes_received,
+    }
+}
+
+fn clickhouse_string_literal(value: &str) -> String {
+    let escaped = value.replace('\\', "\\\\").replace('\'', "\\'");
+    format!("'{escaped}'")
+}
+
+fn add_empty_stats_lists(value: &mut serde_json::Value) {
+    if let Some(object) = value.as_object_mut() {
+        object
+            .entry("top_countries")
+            .or_insert_with(|| serde_json::json!([]));
+        object
+            .entry("top_continents")
+            .or_insert_with(|| serde_json::json!([]));
+        object
+            .entry("top_paths")
+            .or_insert_with(|| serde_json::json!([]));
+        object
+            .entry("top_upstreams")
+            .or_insert_with(|| serde_json::json!([]));
+    }
+}
+
+fn access_log_row_to_visit(row: serde_json::Value) -> serde_json::Value {
+    let location = serde_json::json!({
+        "country_code": row.get("country_code").cloned().unwrap_or(serde_json::Value::Null),
+        "country_name": row.get("country_name").cloned().unwrap_or(serde_json::Value::Null),
+        "continent_code": row.get("continent_code").cloned().unwrap_or(serde_json::Value::Null),
+        "continent_name": row.get("continent_name").cloned().unwrap_or(serde_json::Value::Null),
+        "region": row.get("region").cloned().unwrap_or(serde_json::Value::Null),
+        "city": row.get("city").cloned().unwrap_or(serde_json::Value::Null),
+        "source": row
+            .get("geo_source")
+            .cloned()
+            .unwrap_or_else(|| serde_json::json!("unknown")),
+    });
+    serde_json::json!({
+        "request_id": row.get("request_id").cloned().unwrap_or(serde_json::Value::Null),
+        "domain": row.get("domain").cloned().unwrap_or(serde_json::Value::Null),
+        "method": row.get("method").cloned().unwrap_or(serde_json::Value::Null),
+        "path": row.get("path").cloned().unwrap_or(serde_json::Value::Null),
+        "status": row.get("status").cloned().unwrap_or(serde_json::Value::Null),
+        "latency_ms": row.get("latency_ms").cloned().unwrap_or(serde_json::Value::Null),
+        "upstream": row.get("upstream").cloned().unwrap_or(serde_json::Value::Null),
+        "remote_ip": row.get("remote_ip").cloned().unwrap_or(serde_json::Value::Null),
+        "location": location,
+        "timestamp_unix_ms": row
+            .get("timestamp_unix_ms")
+            .cloned()
+            .unwrap_or(serde_json::Value::Null),
+        "bytes_sent": row.get("bytes_sent").cloned().unwrap_or(serde_json::Value::Null),
+        "bytes_received": row
+            .get("bytes_received")
+            .cloned()
+            .unwrap_or(serde_json::Value::Null),
+    })
+}
+
 impl ClickHouseAnalytics {
     pub fn new(url: impl AsRef<str>) -> Result<Self> {
         let endpoint = ClickHouseEndpoint::parse(url.as_ref())?;
@@ -140,31 +223,142 @@ ORDER BY (domain, timestamp_unix_ms, request_id)
     }
 
     pub async fn insert_request(&self, event: RequestObservation) -> Result<()> {
-        let row = ClickHouseAccessLogRow {
-            request_id: event.request_id,
-            timestamp_unix_ms: event.timestamp_unix_ms,
-            domain: event.domain,
-            method: event.method,
-            path: event.path,
-            status: event.status,
-            latency_ms: event.latency_ms,
-            upstream: event.upstream,
-            remote_ip: event.remote_ip.map(|ip| ip.to_string()),
-            country_code: event.location.country_code,
-            country_name: event.location.country_name,
-            continent_code: event.location.continent_code,
-            continent_name: event.location.continent_name,
-            region: event.location.region,
-            city: event.location.city,
-            geo_source: event.location.source,
-            bytes_sent: event.bytes_sent,
-            bytes_received: event.bytes_received,
-        };
+        self.insert_requests(std::iter::once(event)).await
+    }
+
+    pub async fn insert_requests<I>(&self, events: I) -> Result<()>
+    where
+        I: IntoIterator<Item = RequestObservation>,
+    {
+        let rows = events
+            .into_iter()
+            .map(access_log_row_from_observation)
+            .map(|row| serde_json::to_string(&row))
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        if rows.is_empty() {
+            return Ok(());
+        }
         let payload = format!(
             "INSERT INTO pxxl_access_logs FORMAT JSONEachRow\n{}",
-            serde_json::to_string(&row)?
+            rows.join("\n")
         );
         self.post_sql(&payload).await
+    }
+
+    pub async fn get_domain_stats_snapshot(
+        &self,
+        domain: &str,
+    ) -> Result<Option<serde_json::Value>> {
+        let domain = clickhouse_string_literal(domain);
+        let query = format!(
+            r#"
+SELECT
+    domain,
+    count() AS requests_total,
+    countIf(status >= 200 AND status < 300) AS responses_2xx,
+    countIf(status >= 300 AND status < 400) AS responses_3xx,
+    countIf(status >= 400 AND status < 500) AS responses_4xx,
+    countIf(status >= 500) AS responses_5xx,
+    if(count() = 0, 0, avg(latency_ms)) AS average_latency_ms,
+    sum(bytes_sent) AS total_bytes_sent,
+    sum(bytes_received) AS total_bytes_received,
+    sum(bytes_sent + bytes_received) AS total_bandwidth,
+    argMax(status, timestamp_unix_ms) AS last_status,
+    max(timestamp_unix_ms) AS last_seen_unix_ms
+FROM pxxl_access_logs
+WHERE domain = {domain}
+GROUP BY domain
+"#
+        );
+        let mut rows = self.query_json(&query).await?;
+        let Some(mut stats) = rows.pop() else {
+            return Ok(None);
+        };
+        add_empty_stats_lists(&mut stats);
+        Ok(Some(stats))
+    }
+
+    pub async fn get_domain_stats_snapshots(&self, limit: usize) -> Result<Vec<serde_json::Value>> {
+        let limit = limit.clamp(1, 50_000);
+        let query = format!(
+            r#"
+SELECT
+    domain,
+    count() AS requests_total,
+    countIf(status >= 200 AND status < 300) AS responses_2xx,
+    countIf(status >= 300 AND status < 400) AS responses_3xx,
+    countIf(status >= 400 AND status < 500) AS responses_4xx,
+    countIf(status >= 500) AS responses_5xx,
+    if(count() = 0, 0, avg(latency_ms)) AS average_latency_ms,
+    sum(bytes_sent) AS total_bytes_sent,
+    sum(bytes_received) AS total_bytes_received,
+    sum(bytes_sent + bytes_received) AS total_bandwidth,
+    argMax(status, timestamp_unix_ms) AS last_status,
+    max(timestamp_unix_ms) AS last_seen_unix_ms
+FROM pxxl_access_logs
+GROUP BY domain
+ORDER BY last_seen_unix_ms DESC
+LIMIT {limit}
+"#
+        );
+        let mut rows = self.query_json(&query).await?;
+        for row in &mut rows {
+            add_empty_stats_lists(row);
+        }
+        Ok(rows)
+    }
+
+    pub async fn get_recent_visits(
+        &self,
+        domain: Option<&str>,
+        request_id: Option<&str>,
+        limit: usize,
+    ) -> Result<Vec<serde_json::Value>> {
+        let limit = limit.clamp(1, 5_000);
+        let mut filters = Vec::new();
+        if let Some(domain) = domain {
+            filters.push(format!("domain = {}", clickhouse_string_literal(domain)));
+        }
+        if let Some(request_id) = request_id {
+            filters.push(format!(
+                "request_id = {}",
+                clickhouse_string_literal(request_id)
+            ));
+        }
+        let where_clause = if filters.is_empty() {
+            String::new()
+        } else {
+            format!("WHERE {}", filters.join(" AND "))
+        };
+        let query = format!(
+            r#"
+SELECT
+    request_id,
+    domain,
+    method,
+    path,
+    status,
+    latency_ms,
+    upstream,
+    remote_ip,
+    country_code,
+    country_name,
+    continent_code,
+    continent_name,
+    region,
+    city,
+    geo_source,
+    timestamp_unix_ms,
+    bytes_sent,
+    bytes_received
+FROM pxxl_access_logs
+{where_clause}
+ORDER BY timestamp_unix_ms DESC
+LIMIT {limit}
+"#
+        );
+        let rows = self.query_json(&query).await?;
+        Ok(rows.into_iter().map(access_log_row_to_visit).collect())
     }
 
     async fn post_sql(&self, sql: &str) -> Result<()> {
@@ -238,18 +432,32 @@ pub async fn run_clickhouse_writer(
         Err(error) => warn!(%error, "could not ensure ClickHouse analytics table"),
     }
 
+    let mut buffer = Vec::with_capacity(CLICKHOUSE_BATCH_MAX_EVENTS);
+    let mut flush_interval = time::interval(Duration::from_millis(CLICKHOUSE_BATCH_FLUSH_MS));
     loop {
         tokio::select! {
             maybe_event = receiver.recv() => {
                 let Some(event) = maybe_event else {
+                    flush_clickhouse_events(&analytics, &mut buffer).await;
                     break;
                 };
-                if let Err(error) = analytics.insert_request(event).await {
-                    debug!(%error, "failed to persist request analytics event");
+                buffer.push(event);
+                if buffer.len() >= CLICKHOUSE_BATCH_MAX_EVENTS {
+                    flush_clickhouse_events(&analytics, &mut buffer).await;
                 }
+            }
+            _ = flush_interval.tick() => {
+                flush_clickhouse_events(&analytics, &mut buffer).await;
             }
             changed = shutdown.changed() => {
                 if changed.is_ok() && *shutdown.borrow() {
+                    while let Ok(event) = receiver.try_recv() {
+                        buffer.push(event);
+                        if buffer.len() >= CLICKHOUSE_BATCH_MAX_EVENTS {
+                            flush_clickhouse_events(&analytics, &mut buffer).await;
+                        }
+                    }
+                    flush_clickhouse_events(&analytics, &mut buffer).await;
                     break;
                 }
             }
@@ -257,6 +465,28 @@ pub async fn run_clickhouse_writer(
     }
 
     Ok(())
+}
+
+async fn flush_clickhouse_events(
+    analytics: &ClickHouseAnalytics,
+    buffer: &mut Vec<RequestObservation>,
+) {
+    if buffer.is_empty() {
+        return;
+    }
+    let count = buffer.len();
+    let events = std::mem::take(buffer);
+    if let Err(error) = analytics.insert_requests(events.clone()).await {
+        warn!(
+            %error,
+            count,
+            "failed to persist request analytics batch, retrying once"
+        );
+        time::sleep(Duration::from_millis(250)).await;
+        if let Err(error) = analytics.insert_requests(events).await {
+            warn!(%error, count, "dropping request analytics batch after retry failure");
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -301,7 +531,9 @@ WHERE domain = '{}'
   AND timestamp_unix_ms < {}
 GROUP BY domain
 "#,
-            domain, start_timestamp, end_timestamp
+            clickhouse_string_literal(domain),
+            start_timestamp,
+            end_timestamp
         );
 
         let result = self.query_json(&query).await?;
@@ -335,12 +567,13 @@ SELECT
     sum(bytes_sent + bytes_received) as total_bandwidth,
     count(*) as request_count
 FROM pxxl_access_logs
-WHERE domain = '{}'
+WHERE domain = {}
   AND timestamp_unix_ms >= toUnixTimestamp(now() - INTERVAL {} MONTH) * 1000
 GROUP BY domain, period
 ORDER BY period DESC
 "#,
-            domain, months
+            clickhouse_string_literal(domain),
+            months
         );
 
         let result = self.query_json(&query).await?;
@@ -365,12 +598,13 @@ SELECT
     sum(bytes_sent + bytes_received) as total_bandwidth,
     count(*) as request_count
 FROM pxxl_access_logs
-WHERE domain = '{}'
+WHERE domain = {}
   AND timestamp_unix_ms >= toUnixTimestamp(now() - INTERVAL {} HOUR) * 1000
 GROUP BY domain, period
 ORDER BY period ASC
 "#,
-            domain, hours
+            clickhouse_string_literal(domain),
+            hours
         );
 
         let result = self.query_json(&query).await?;

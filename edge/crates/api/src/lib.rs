@@ -1,4 +1,5 @@
 use bytes::{Bytes, BytesMut};
+use chrono::{Datelike, TimeZone};
 use http::{header::AUTHORIZATION, Method, Request, Response, StatusCode};
 use http_body_util::{BodyExt, Full};
 use hyper::{body::Incoming, service::service_fn};
@@ -18,6 +19,7 @@ use pxxl_database_proxy::{
 };
 use pxxl_metrics::PxxlMetrics;
 use pxxl_redis_sync::{RedisRouteStore, RedisTokenStore};
+use pxxl_storage::ClickHouseAnalytics;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use sha2::{Digest, Sha256};
@@ -61,6 +63,7 @@ struct ApiServer {
     route_store: Option<RedisRouteStore>,
     database_routes: Option<DatabaseRouteRegistry>,
     database_port_proxy: Option<DatabasePortProxyManager>,
+    analytics: Option<ClickHouseAnalytics>,
     auth: AdminApiAuth,
 }
 
@@ -72,6 +75,7 @@ pub struct AdminApiRuntime {
     pub route_store: Option<RedisRouteStore>,
     pub database_routes: Option<DatabaseRouteRegistry>,
     pub database_port_proxy: Option<DatabasePortProxyManager>,
+    pub analytics: Option<ClickHouseAnalytics>,
     pub auth: AdminApiAuth,
 }
 
@@ -355,6 +359,7 @@ pub async fn run_admin_api(
         route_store: runtime.route_store,
         database_routes: runtime.database_routes,
         database_port_proxy: runtime.database_port_proxy,
+        analytics: runtime.analytics,
         auth: runtime.auth,
     };
     info!(%addr, "admin API listening");
@@ -800,29 +805,74 @@ impl ApiServer {
                 if let Some(response) = require_scope(&principal, SCOPE_ANALYTICS_READ) {
                     return response;
                 }
-                json_response(
-                    StatusCode::OK,
-                    json!({ "domains": self.state.stats.snapshots() }),
-                )
+                let domains = match &self.analytics {
+                    Some(analytics) => match analytics.get_domain_stats_snapshots(50_000).await {
+                        Ok(domains) => domains,
+                        Err(error) => {
+                            warn!(%error, "falling back to in-memory domain stats");
+                            serde_json::to_value(self.state.stats.snapshots())
+                                .unwrap_or_default()
+                                .as_array()
+                                .cloned()
+                                .unwrap_or_default()
+                        }
+                    },
+                    None => serde_json::to_value(self.state.stats.snapshots())
+                        .unwrap_or_default()
+                        .as_array()
+                        .cloned()
+                        .unwrap_or_default(),
+                };
+                json_response(StatusCode::OK, json!({ "domains": domains }))
             }
             (Method::GET, "/v1/analytics/routes") => {
                 if let Some(response) = require_scope(&principal, SCOPE_ANALYTICS_READ) {
                     return response;
                 }
-                json_response(
-                    StatusCode::OK,
-                    json!({ "routes": self.state.stats.snapshots() }),
-                )
+                let routes = match &self.analytics {
+                    Some(analytics) => match analytics.get_domain_stats_snapshots(50_000).await {
+                        Ok(routes) => routes,
+                        Err(error) => {
+                            warn!(%error, "falling back to in-memory route analytics");
+                            serde_json::to_value(self.state.stats.snapshots())
+                                .unwrap_or_default()
+                                .as_array()
+                                .cloned()
+                                .unwrap_or_default()
+                        }
+                    },
+                    None => serde_json::to_value(self.state.stats.snapshots())
+                        .unwrap_or_default()
+                        .as_array()
+                        .cloned()
+                        .unwrap_or_default(),
+                };
+                json_response(StatusCode::OK, json!({ "routes": routes }))
             }
             (Method::GET, "/v1/analytics/visits") => {
                 if let Some(response) = require_scope(&principal, SCOPE_ANALYTICS_READ) {
                     return response;
                 }
                 let limit = query_limit(&query, 50, ANALYTICS_RECENT_LIMIT_MAX);
-                json_response(
-                    StatusCode::OK,
-                    json!({ "visits": self.state.stats.recent_visits_all(limit) }),
-                )
+                let visits = match &self.analytics {
+                    Some(analytics) => match analytics.get_recent_visits(None, None, limit).await {
+                        Ok(visits) => visits,
+                        Err(error) => {
+                            warn!(%error, "falling back to in-memory recent visits");
+                            serde_json::to_value(self.state.stats.recent_visits_all(limit))
+                                .unwrap_or_default()
+                                .as_array()
+                                .cloned()
+                                .unwrap_or_default()
+                        }
+                    },
+                    None => serde_json::to_value(self.state.stats.recent_visits_all(limit))
+                        .unwrap_or_default()
+                        .as_array()
+                        .cloned()
+                        .unwrap_or_default(),
+                };
+                json_response(StatusCode::OK, json!({ "visits": visits }))
             }
             (Method::GET, "/v1/analytics/logs") => {
                 if let Some(response) = require_scope(&principal, SCOPE_ANALYTICS_READ) {
@@ -830,14 +880,45 @@ impl ApiServer {
                 }
                 let limit = query_limit(&query, 50, ANALYTICS_RECENT_LIMIT_MAX);
                 let request_id = query_value(&query, "request_id");
-                let logs = request_id
-                    .as_deref()
-                    .map(|request_id| {
-                        self.state
-                            .stats
-                            .recent_visits_by_request_id(request_id, limit)
-                    })
-                    .unwrap_or_else(|| self.state.stats.recent_visits_all(limit));
+                let logs = match &self.analytics {
+                    Some(analytics) => match analytics
+                        .get_recent_visits(None, request_id.as_deref(), limit)
+                        .await
+                    {
+                        Ok(logs) => logs,
+                        Err(error) => {
+                            warn!(%error, "falling back to in-memory analytics logs");
+                            let logs = request_id
+                                .as_deref()
+                                .map(|request_id| {
+                                    self.state
+                                        .stats
+                                        .recent_visits_by_request_id(request_id, limit)
+                                })
+                                .unwrap_or_else(|| self.state.stats.recent_visits_all(limit));
+                            serde_json::to_value(logs)
+                                .unwrap_or_default()
+                                .as_array()
+                                .cloned()
+                                .unwrap_or_default()
+                        }
+                    },
+                    None => {
+                        let logs = request_id
+                            .as_deref()
+                            .map(|request_id| {
+                                self.state
+                                    .stats
+                                    .recent_visits_by_request_id(request_id, limit)
+                            })
+                            .unwrap_or_else(|| self.state.stats.recent_visits_all(limit));
+                        serde_json::to_value(logs)
+                            .unwrap_or_default()
+                            .as_array()
+                            .cloned()
+                            .unwrap_or_default()
+                    }
+                };
                 json_response(
                     StatusCode::OK,
                     json!({
@@ -861,29 +942,26 @@ impl ApiServer {
                     );
                 }
                 let normalized = normalize_domain(domain);
-                match self.state.stats.snapshot_domain(&normalized) {
-                    Some(stats) => json_response(StatusCode::OK, json!({ "stats": stats })),
-                    None => json_response(
-                        StatusCode::OK,
-                        json!({
-                            "stats": {
-                                "domain": normalized,
-                                "requests_total": 0,
-                                "responses_2xx": 0,
-                                "responses_3xx": 0,
-                                "responses_4xx": 0,
-                                "responses_5xx": 0,
-                                "average_latency_ms": 0.0,
-                                "last_status": null,
-                                "last_seen_unix_ms": null,
-                                "top_countries": [],
-                                "top_continents": [],
-                                "top_paths": [],
-                                "top_upstreams": []
-                            }
-                        }),
-                    ),
+                let stats = match &self.analytics {
+                    Some(analytics) => match analytics.get_domain_stats_snapshot(&normalized).await
+                    {
+                        Ok(Some(stats)) => Some(stats),
+                        Ok(None) => None,
+                        Err(error) => {
+                            warn!(%error, domain = %normalized, "falling back to in-memory domain stats");
+                            serde_json::to_value(self.state.stats.snapshot_domain(&normalized))
+                                .ok()
+                                .and_then(|value| value.as_object().cloned())
+                                .map(serde_json::Value::Object)
+                        }
+                    },
+                    None => serde_json::to_value(self.state.stats.snapshot_domain(&normalized))
+                        .ok()
+                        .and_then(|value| value.as_object().cloned())
+                        .map(serde_json::Value::Object),
                 }
+                .unwrap_or_else(|| empty_domain_stats(&normalized));
+                json_response(StatusCode::OK, json!({ "stats": stats }))
             }
             (Method::GET, path)
                 if path.starts_with("/v1/domains/") && path.ends_with("/visits") =>
@@ -903,11 +981,34 @@ impl ApiServer {
                 }
                 let normalized = normalize_domain(domain);
                 let limit = query_limit(&query, 50, ANALYTICS_RECENT_LIMIT_MAX);
+                let visits = match &self.analytics {
+                    Some(analytics) => match analytics
+                        .get_recent_visits(Some(&normalized), None, limit)
+                        .await
+                    {
+                        Ok(visits) => visits,
+                        Err(error) => {
+                            warn!(%error, domain = %normalized, "falling back to in-memory domain visits");
+                            serde_json::to_value(self.state.stats.recent_visits(&normalized, limit))
+                                .unwrap_or_default()
+                                .as_array()
+                                .cloned()
+                                .unwrap_or_default()
+                        }
+                    },
+                    None => {
+                        serde_json::to_value(self.state.stats.recent_visits(&normalized, limit))
+                            .unwrap_or_default()
+                            .as_array()
+                            .cloned()
+                            .unwrap_or_default()
+                    }
+                };
                 json_response(
                     StatusCode::OK,
                     json!({
                         "domain": normalized,
-                        "visits": self.state.stats.recent_visits(&normalized, limit)
+                        "visits": visits
                     }),
                 )
             }
@@ -928,16 +1029,51 @@ impl ApiServer {
                 let normalized = normalize_domain(domain);
                 let limit = query_limit(&query, 50, ANALYTICS_RECENT_LIMIT_MAX);
                 let request_id = query_value(&query, "request_id");
-                let logs = request_id
-                    .as_deref()
-                    .map(|request_id| {
-                        self.state.stats.recent_visits_for_domain_by_request_id(
-                            &normalized,
-                            request_id,
-                            limit,
-                        )
-                    })
-                    .unwrap_or_else(|| self.state.stats.recent_visits(&normalized, limit));
+                let logs = match &self.analytics {
+                    Some(analytics) => match analytics
+                        .get_recent_visits(Some(&normalized), request_id.as_deref(), limit)
+                        .await
+                    {
+                        Ok(logs) => logs,
+                        Err(error) => {
+                            warn!(%error, domain = %normalized, "falling back to in-memory domain logs");
+                            let logs = request_id
+                                .as_deref()
+                                .map(|request_id| {
+                                    self.state.stats.recent_visits_for_domain_by_request_id(
+                                        &normalized,
+                                        request_id,
+                                        limit,
+                                    )
+                                })
+                                .unwrap_or_else(|| {
+                                    self.state.stats.recent_visits(&normalized, limit)
+                                });
+                            serde_json::to_value(logs)
+                                .unwrap_or_default()
+                                .as_array()
+                                .cloned()
+                                .unwrap_or_default()
+                        }
+                    },
+                    None => {
+                        let logs = request_id
+                            .as_deref()
+                            .map(|request_id| {
+                                self.state.stats.recent_visits_for_domain_by_request_id(
+                                    &normalized,
+                                    request_id,
+                                    limit,
+                                )
+                            })
+                            .unwrap_or_else(|| self.state.stats.recent_visits(&normalized, limit));
+                        serde_json::to_value(logs)
+                            .unwrap_or_default()
+                            .as_array()
+                            .cloned()
+                            .unwrap_or_default()
+                    }
+                };
                 json_response(
                     StatusCode::OK,
                     json!({
@@ -2287,6 +2423,27 @@ fn query_value(query: &str, name: &str) -> Option<String> {
     })
 }
 
+fn empty_domain_stats(domain: &str) -> serde_json::Value {
+    json!({
+        "domain": domain,
+        "requests_total": 0,
+        "responses_2xx": 0,
+        "responses_3xx": 0,
+        "responses_4xx": 0,
+        "responses_5xx": 0,
+        "average_latency_ms": 0.0,
+        "total_bytes_sent": 0,
+        "total_bytes_received": 0,
+        "total_bandwidth": 0,
+        "last_status": null,
+        "last_seen_unix_ms": null,
+        "top_countries": [],
+        "top_continents": [],
+        "top_paths": [],
+        "top_upstreams": []
+    })
+}
+
 fn is_public_admin_path(method: &Method, path: &str) -> bool {
     (*method == Method::GET && matches!(path, "/healthz" | "/readyz"))
         || (*method == Method::POST && path == "/v1/auth/login")
@@ -2323,7 +2480,39 @@ async fn collect_admin_body(mut body: Incoming) -> Result<Bytes, ApiBodyError> {
 
 impl ApiServer {
     async fn get_bandwidth_usage(&self, domain: &str) -> Response<BoxBody> {
-        // Get current month bandwidth from in-memory stats
+        let now = chrono::Utc::now();
+        let start = chrono::Utc
+            .with_ymd_and_hms(now.year(), now.month(), 1, 0, 0, 0)
+            .single()
+            .unwrap_or(now);
+        let current_month = now.format("%Y-%m").to_string();
+        if let Some(analytics) = &self.analytics {
+            match analytics
+                .get_bandwidth_usage(
+                    domain,
+                    start.timestamp_millis().max(0) as u64,
+                    now.timestamp_millis().max(0) as u64,
+                )
+                .await
+            {
+                Ok(usage) => {
+                    return json_response(
+                        StatusCode::OK,
+                        json!({
+                            "domain": domain,
+                            "current_month": current_month,
+                            "bytes_sent": usage.bytes_sent,
+                            "bytes_received": usage.bytes_received,
+                            "total_bandwidth": usage.total_bandwidth,
+                            "requests": usage.request_count,
+                        }),
+                    );
+                }
+                Err(error) => {
+                    warn!(%error, domain, "falling back to in-memory bandwidth usage");
+                }
+            }
+        }
         let stats = self.state.stats.snapshot_domain(domain);
 
         if let Some(stats) = stats {
@@ -2331,7 +2520,7 @@ impl ApiServer {
                 StatusCode::OK,
                 json!({
                     "domain": domain,
-                    "current_month": chrono::Utc::now().format("%Y-%m").to_string(),
+                    "current_month": current_month,
                     "bytes_sent": stats.total_bytes_sent,
                     "bytes_received": stats.total_bytes_received,
                     "total_bandwidth": stats.total_bandwidth,
@@ -2343,7 +2532,7 @@ impl ApiServer {
                 StatusCode::OK,
                 json!({
                     "domain": domain,
-                    "current_month": chrono::Utc::now().format("%Y-%m").to_string(),
+                    "current_month": current_month,
                     "bytes_sent": 0,
                     "bytes_received": 0,
                     "total_bandwidth": 0,
@@ -2353,9 +2542,35 @@ impl ApiServer {
         }
     }
 
-    async fn get_bandwidth_history(&self, domain: &str, _months: u32) -> Response<BoxBody> {
-        // For now, return current month data from in-memory stats
-        // In production, this would query ClickHouse for historical data
+    async fn get_bandwidth_history(&self, domain: &str, months: u32) -> Response<BoxBody> {
+        if let Some(analytics) = &self.analytics {
+            match analytics.get_bandwidth_history(domain, months).await {
+                Ok(history) => {
+                    let history = history
+                        .into_iter()
+                        .map(|item| {
+                            json!({
+                                "month": item.period,
+                                "bytes_sent": item.bytes_sent,
+                                "bytes_received": item.bytes_received,
+                                "total_bandwidth": item.total_bandwidth,
+                                "requests": item.request_count,
+                            })
+                        })
+                        .collect::<Vec<_>>();
+                    return json_response(
+                        StatusCode::OK,
+                        json!({
+                            "domain": domain,
+                            "history": history,
+                        }),
+                    );
+                }
+                Err(error) => {
+                    warn!(%error, domain, "falling back to in-memory bandwidth history");
+                }
+            }
+        }
         let stats = self.state.stats.snapshot_domain(domain);
 
         let history = if let Some(stats) = stats {
@@ -2379,9 +2594,36 @@ impl ApiServer {
         )
     }
 
-    async fn get_bandwidth_realtime(&self, domain: &str, _hours: u32) -> Response<BoxBody> {
-        // Return current stats from in-memory
-        // In production, this would query ClickHouse for hourly aggregates
+    async fn get_bandwidth_realtime(&self, domain: &str, hours: u32) -> Response<BoxBody> {
+        if let Some(analytics) = &self.analytics {
+            match analytics.get_bandwidth_realtime(domain, hours).await {
+                Ok(data) => {
+                    let data = data
+                        .into_iter()
+                        .map(|item| {
+                            json!({
+                                "timestamp": item.period,
+                                "bytes_sent": item.bytes_sent,
+                                "bytes_received": item.bytes_received,
+                                "total_bandwidth": item.total_bandwidth,
+                                "requests": item.request_count,
+                            })
+                        })
+                        .collect::<Vec<_>>();
+                    return json_response(
+                        StatusCode::OK,
+                        json!({
+                            "domain": domain,
+                            "interval": "hourly",
+                            "data": data,
+                        }),
+                    );
+                }
+                Err(error) => {
+                    warn!(%error, domain, "falling back to in-memory realtime bandwidth");
+                }
+            }
+        }
         let stats = self.state.stats.snapshot_domain(domain);
 
         let data = if let Some(stats) = stats {

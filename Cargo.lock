@@ -1260,6 +1260,7 @@ dependencies = [
  "pxxl-database-proxy",
  "pxxl-metrics",
  "pxxl-redis-sync",
+ "pxxl-storage",
  "serde",
  "serde_json",
  "sha2",

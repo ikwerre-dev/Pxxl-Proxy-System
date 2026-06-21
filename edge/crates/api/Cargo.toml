@@ -10,6 +10,7 @@ pxxl-core = { path = "../core" }
 pxxl-database-proxy = { path = "../database-proxy" }
 pxxl-metrics = { path = "../metrics" }
 pxxl-redis-sync = { path = "../redis-sync" }
+pxxl-storage = { path = "../storage" }
 anyhow = { workspace = true }
 bytes = { workspace = true }
 chrono = { workspace = true }

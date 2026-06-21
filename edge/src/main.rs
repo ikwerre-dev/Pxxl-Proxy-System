@@ -26,7 +26,7 @@ use pxxl_http_proxy::{
 use pxxl_load_balancer::LoadBalancer;
 use pxxl_metrics::PxxlMetrics;
 use pxxl_redis_sync::{RedisRouteStore, RedisTokenStore};
-use pxxl_storage::run_clickhouse_writer;
+use pxxl_storage::{run_clickhouse_writer, ClickHouseAnalytics};
 use pxxl_tls::{CertificateBundle, CertificateIssuer, LocalCertificateStore};
 use redis::streams::StreamReadReply;
 use serde::Deserialize;
@@ -105,6 +105,17 @@ async fn main() -> Result<()> {
         metrics.clone(),
         analytics_tx,
     );
+    let analytics_store = if config.storage.analytics_enabled {
+        match ClickHouseAnalytics::new(config.storage.clickhouse_url.clone()) {
+            Ok(store) => Some(store),
+            Err(error) => {
+                warn!(%error, "analytics store unavailable for admin API reads");
+                None
+            }
+        }
+    } else {
+        None
+    };
     let stats_snapshot_path = stats_snapshot_path();
     match load_domain_stats_snapshot(&state, &stats_snapshot_path).await {
         Ok(count) if count > 0 => {
@@ -217,6 +228,7 @@ async fn main() -> Result<()> {
                 route_store: Some(route_store.clone()),
                 database_routes: Some(database_routes.clone()),
                 database_port_proxy: database_port_proxy.clone(),
+                analytics: analytics_store.clone(),
                 auth: admin_auth,
             },
             shutdown_rx.clone(),

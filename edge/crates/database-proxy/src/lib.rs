@@ -99,8 +99,8 @@ impl DatabaseRouteRegistry {
     pub fn list(&self) -> Vec<DatabaseProxyRoute> {
         self.metadata
             .read()
-            .iter()
-            .flat_map(|(_, by_key)| by_key.values().cloned())
+            .values()
+            .flat_map(|by_key| by_key.values().cloned())
             .collect()
     }
 
