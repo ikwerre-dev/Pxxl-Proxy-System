@@ -13,7 +13,9 @@ use pxxl_common::{
     UpstreamTransport, MAX_ROUTES_PER_SOURCE,
 };
 use pxxl_core::{route_allows_www_alias, EdgeState};
-use pxxl_database_proxy::{DatabaseProxyRoute, DatabaseRouteRegistry};
+use pxxl_database_proxy::{
+    run_database_proxy_public_port, DatabaseProxyRoute, DatabaseRouteRegistry,
+};
 use pxxl_metrics::PxxlMetrics;
 use pxxl_redis_sync::{RedisRouteStore, RedisTokenStore};
 use serde::{Deserialize, Serialize};
@@ -33,7 +35,7 @@ use tokio::{
     sync::{watch, Semaphore},
     time,
 };
-use tracing::{debug, info};
+use tracing::{debug, info, warn};
 
 type BoxError = Box<dyn std::error::Error + Send + Sync>;
 type BoxBody = http_body_util::combinators::BoxBody<Bytes, BoxError>;
@@ -58,6 +60,7 @@ struct ApiServer {
     tls_status: TlsCertificateRuntimeStatus,
     route_store: Option<RedisRouteStore>,
     database_routes: Option<DatabaseRouteRegistry>,
+    database_port_proxy: Option<DatabasePortProxyManager>,
     auth: AdminApiAuth,
 }
 
@@ -68,7 +71,67 @@ pub struct AdminApiRuntime {
     pub tls_status: TlsCertificateRuntimeStatus,
     pub route_store: Option<RedisRouteStore>,
     pub database_routes: Option<DatabaseRouteRegistry>,
+    pub database_port_proxy: Option<DatabasePortProxyManager>,
     pub auth: AdminApiAuth,
+}
+
+#[derive(Clone)]
+pub struct DatabasePortProxyManager {
+    bind_host: IpAddr,
+    min_port: u16,
+    max_port: u16,
+    registry: DatabaseRouteRegistry,
+    shutdown: watch::Receiver<bool>,
+    listeners: Arc<Mutex<HashMap<u16, bool>>>,
+}
+
+impl DatabasePortProxyManager {
+    pub fn new(
+        bind_host: IpAddr,
+        min_port: u16,
+        max_port: u16,
+        registry: DatabaseRouteRegistry,
+        shutdown: watch::Receiver<bool>,
+    ) -> Self {
+        Self {
+            bind_host,
+            min_port,
+            max_port,
+            registry,
+            shutdown,
+            listeners: Arc::new(Mutex::new(HashMap::new())),
+        }
+    }
+
+    pub fn ensure_listener(&self, public_port: u16) {
+        if public_port == 0 {
+            return;
+        }
+        if public_port < self.min_port || public_port > self.max_port {
+            warn!(
+                public_port,
+                min_port = self.min_port,
+                max_port = self.max_port,
+                "refusing database public-port proxy outside allowed range"
+            );
+            return;
+        }
+        {
+            let mut listeners = self.listeners.lock().expect("database port proxy lock");
+            if listeners.contains_key(&public_port) {
+                return;
+            }
+            listeners.insert(public_port, true);
+        }
+        let addr = SocketAddr::new(self.bind_host, public_port);
+        let registry = self.registry.clone();
+        let shutdown = self.shutdown.clone();
+        tokio::spawn(async move {
+            if let Err(error) = run_database_proxy_public_port(addr, registry, shutdown).await {
+                warn!(%addr, %error, "database public-port proxy listener failed");
+            }
+        });
+    }
 }
 
 #[derive(Clone, Debug, Default, Serialize)]
@@ -273,6 +336,10 @@ struct DatabaseRouteBody {
     database_type: String,
     key: String,
     upstream: String,
+    #[serde(default)]
+    route_host: Option<String>,
+    #[serde(default)]
+    public_port: Option<u16>,
 }
 
 pub async fn run_admin_api(
@@ -287,6 +354,7 @@ pub async fn run_admin_api(
         tls_status: runtime.tls_status,
         route_store: runtime.route_store,
         database_routes: runtime.database_routes,
+        database_port_proxy: runtime.database_port_proxy,
         auth: runtime.auth,
     };
     info!(%addr, "admin API listening");
@@ -1206,8 +1274,13 @@ impl ApiServer {
             database_type: body.database_type,
             key: body.key,
             upstream: body.upstream,
+            route_host: body.route_host.filter(|value| !value.trim().is_empty()),
+            public_port: body.public_port,
         };
         registry.upsert(route.clone());
+        if let (Some(manager), Some(public_port)) = (&self.database_port_proxy, route.public_port) {
+            manager.ensure_listener(public_port);
+        }
         json_response(
             StatusCode::OK,
             json!({ "status": "upserted", "route": route }),

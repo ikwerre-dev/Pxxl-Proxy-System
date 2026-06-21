@@ -9,7 +9,7 @@ use hyper_util::{
 };
 use pxxl_api::{
     run_admin_api, run_metrics_server, AdminApiAuth, AdminApiRuntime, AdminLoginAccount,
-    MetricsAuth, TlsCertificateRuntimeStatus,
+    DatabasePortProxyManager, MetricsAuth, TlsCertificateRuntimeStatus,
 };
 use pxxl_common::{ip_allowed_for_upstream, parse_ip_net, PathRoute, Route, RouteSource, Upstream};
 use pxxl_config::{HealthCheckConfig, PxxlConfig};
@@ -167,10 +167,14 @@ async fn main() -> Result<()> {
                 database_type: route.database_type.clone(),
                 key: route.key.clone(),
                 upstream: route.upstream.clone(),
+                route_host: route.route_host.clone(),
+                public_port: route.public_port,
             }
         }));
 
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
+    let database_port_proxy =
+        database_port_proxy_manager(&config, &database_routes, shutdown_rx.clone());
     let token_store = RedisTokenStore::new(
         config.redis.url.clone(),
         config.admin.token_store_key.clone(),
@@ -212,6 +216,7 @@ async fn main() -> Result<()> {
                 tls_status: tls_status.clone(),
                 route_store: Some(route_store.clone()),
                 database_routes: Some(database_routes.clone()),
+                database_port_proxy: database_port_proxy.clone(),
                 auth: admin_auth,
             },
             shutdown_rx.clone(),
@@ -263,6 +268,13 @@ async fn main() -> Result<()> {
                 database_routes.clone(),
                 shutdown_rx.clone(),
             )));
+        }
+        if let Some(manager) = &database_port_proxy {
+            for route in database_routes.list() {
+                if let Some(public_port) = route.public_port {
+                    manager.ensure_listener(public_port);
+                }
+            }
         }
     }
 
@@ -1068,6 +1080,46 @@ fn upsert_database_proxy_listener(config: &mut PxxlConfig, database_type: &str, 
                 listen,
             });
     }
+}
+
+fn database_port_proxy_manager(
+    config: &PxxlConfig,
+    database_routes: &DatabaseRouteRegistry,
+    shutdown: watch::Receiver<bool>,
+) -> Option<DatabasePortProxyManager> {
+    if !config.database_proxy.enabled {
+        return None;
+    }
+    let bind_host = std::env::var("PXXL_DATABASE_PROXY_PUBLIC_BIND_HOST")
+        .ok()
+        .and_then(|value| value.trim().parse::<IpAddr>().ok())
+        .unwrap_or(IpAddr::from([0, 0, 0, 0]));
+    let (min_port, max_port) = database_proxy_public_port_range();
+    Some(DatabasePortProxyManager::new(
+        bind_host,
+        min_port,
+        max_port,
+        database_routes.clone(),
+        shutdown,
+    ))
+}
+
+fn database_proxy_public_port_range() -> (u16, u16) {
+    let raw = std::env::var("PXXL_DATABASE_PROXY_PUBLIC_PORT_RANGE")
+        .unwrap_or_else(|_| "10000-65000".to_string());
+    let mut parts = raw.splitn(2, '-');
+    let min = parts
+        .next()
+        .and_then(|value| value.trim().parse::<u16>().ok())
+        .unwrap_or(10000);
+    let max = parts
+        .next()
+        .and_then(|value| value.trim().parse::<u16>().ok())
+        .unwrap_or(65000);
+    if min > max {
+        return (10000, 65000);
+    }
+    (min, max)
 }
 
 fn ensure_production_safe_config(config: &PxxlConfig) -> Result<()> {

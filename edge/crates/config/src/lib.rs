@@ -184,6 +184,10 @@ pub struct DatabaseProxyRouteConfig {
     pub database_type: String,
     pub key: String,
     pub upstream: String,
+    #[serde(default)]
+    pub route_host: Option<String>,
+    #[serde(default)]
+    pub public_port: Option<u16>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
