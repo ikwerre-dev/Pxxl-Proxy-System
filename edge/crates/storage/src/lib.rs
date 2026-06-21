@@ -638,8 +638,12 @@ ORDER BY period ASC
         .await
         .map_err(|_| anyhow::anyhow!("ClickHouse query timed out"))??;
         let status = response.status();
-        let body =
-            collect_body_limited(response.into_body(), CLICKHOUSE_ERROR_BODY_LIMIT_BYTES).await?;
+        let body_limit = if status.is_success() {
+            CLICKHOUSE_QUERY_BODY_LIMIT_BYTES
+        } else {
+            CLICKHOUSE_ERROR_BODY_LIMIT_BYTES
+        };
+        let body = collect_body_limited(response.into_body(), body_limit).await?;
         if !status.is_success() {
             anyhow::bail!(
                 "ClickHouse returned {status}: {}",
