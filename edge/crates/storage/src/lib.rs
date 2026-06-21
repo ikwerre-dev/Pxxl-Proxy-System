@@ -22,6 +22,7 @@ pub enum StorageError {
 }
 
 const CLICKHOUSE_ERROR_BODY_LIMIT_BYTES: u64 = 16 * 1024;
+const CLICKHOUSE_QUERY_BODY_LIMIT_BYTES: u64 = 64 * 1024 * 1024;
 const CLICKHOUSE_REQUEST_TIMEOUT_SECONDS: u64 = 5;
 const CLICKHOUSE_BATCH_MAX_EVENTS: usize = 250;
 const CLICKHOUSE_BATCH_FLUSH_MS: u64 = 1_000;
@@ -377,8 +378,12 @@ LIMIT {limit}
         .await
         .map_err(|_| anyhow::anyhow!("ClickHouse request timed out"))??;
         let status = response.status();
-        let body =
-            collect_body_limited(response.into_body(), CLICKHOUSE_ERROR_BODY_LIMIT_BYTES).await?;
+        let body_limit = if status.is_success() {
+            CLICKHOUSE_QUERY_BODY_LIMIT_BYTES
+        } else {
+            CLICKHOUSE_ERROR_BODY_LIMIT_BYTES
+        };
+        let body = collect_body_limited(response.into_body(), body_limit).await?;
         if !status.is_success() {
             anyhow::bail!(
                 "ClickHouse returned {status}: {}",
