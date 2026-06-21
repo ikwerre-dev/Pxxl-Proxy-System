@@ -9,5 +9,5 @@ services:
       PXXL_PODMAN_SOCKET_PATH: /var/run/podman/podman.sock
       PXXL_PODMAN_PUBLISHED_HOST: ${PXXL_PODMAN_PUBLISHED_HOST:-host.docker.internal}
     volumes:
-      - ${DOCKER_SOCKET_PATH:-/var/run/docker.sock}:/var/run/docker.sock:ro
+      - ${DOCKER_SOCKET_PATH:-/dev/null}:/var/run/docker.sock:ro
       - ${PODMAN_SOCKET_PATH:-/run/user/1002/podman/podman.sock}:/var/run/podman/podman.sock:ro
