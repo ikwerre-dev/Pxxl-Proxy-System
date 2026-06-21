@@ -78,6 +78,9 @@ common_env=(
   -e "PXXL_ACME_EMAIL=${PXXL_ACME_EMAIL:-admin@pxxl.app}"
   -e "PXXL_STATS_SNAPSHOT_PATH=${PXXL_STATS_SNAPSHOT_PATH:-/data/stats/domain-stats.json}"
   -e "PXXL_STATS_SNAPSHOT_INTERVAL_SECONDS=${PXXL_STATS_SNAPSHOT_INTERVAL_SECONDS:-10}"
+  -e "PXXL_DATABASE_PROXY_ENABLED=${PXXL_DATABASE_PROXY_ENABLED:-false}"
+  -e "PXXL_DATABASE_PROXY_PUBLIC_BIND_HOST=${PXXL_DATABASE_PROXY_PUBLIC_BIND_HOST:-0.0.0.0}"
+  -e "PXXL_DATABASE_PROXY_PUBLIC_PORT_RANGE=${PXXL_DATABASE_PROXY_PUBLIC_PORT_RANGE:-35000-35999}"
   -e "PXXL_TRUSTED_CLIENT_IP_CIDRS=${PXXL_TRUSTED_CLIENT_IP_CIDRS:-${PXXL_TRUSTED_PROXY_CIDRS:-10.88.0.0/16,10.89.0.0/16,127.0.0.1/32,::1/128}}"
   -e "RUST_LOG=${RUST_LOG:-pxxl_edge=info,pxxl=info}"
 )
@@ -90,6 +93,18 @@ run_edge() {
   local admin_port="$5"
   local metrics_bind="$6"
   local metrics_port="$7"
+  local -a port_args=(
+    -p "${http_port}:80"
+    -p "${https_port}:443"
+    -p "${admin_bind}:${admin_port}:8081"
+    -p "${metrics_bind}:${metrics_port}:9090"
+  )
+
+  if [ "$http_port" = "80" ] && [ "${PXXL_DATABASE_PROXY_ENABLED:-false}" = "true" ]; then
+    port_args+=(
+      -p "${PXXL_DATABASE_PROXY_PUBLIC_BIND_HOST:-0.0.0.0}:${PXXL_DATABASE_PROXY_PUBLIC_PORT_RANGE:-35000-35999}:${PXXL_DATABASE_PROXY_PUBLIC_PORT_RANGE:-35000-35999}"
+    )
+  fi
 
   podman run \
     --name="$name" \
@@ -103,10 +118,7 @@ run_edge() {
     -v "$PWD/data:/data" \
     --net proxy_default,frontend_default,gateway_default \
     --network-alias edge \
-    -p "${http_port}:80" \
-    -p "${https_port}:443" \
-    -p "${admin_bind}:${admin_port}:8081" \
-    -p "${metrics_bind}:${metrics_port}:9090" \
+    "${port_args[@]}" \
     --restart unless-stopped \
     --cpus "${PXXL_EDGE_CPUS:-1.0}" \
     -m "${PXXL_EDGE_MEMORY:-512m}" \
