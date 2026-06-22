@@ -117,6 +117,17 @@ fn clickhouse_string_literal(value: &str) -> String {
 
 fn add_empty_stats_lists(value: &mut serde_json::Value) {
     if let Some(object) = value.as_object_mut() {
+        normalize_number_field(object, "requests_total");
+        normalize_number_field(object, "responses_2xx");
+        normalize_number_field(object, "responses_3xx");
+        normalize_number_field(object, "responses_4xx");
+        normalize_number_field(object, "responses_5xx");
+        normalize_number_field(object, "average_latency_ms");
+        normalize_number_field(object, "total_bytes_sent");
+        normalize_number_field(object, "total_bytes_received");
+        normalize_number_field(object, "total_bandwidth");
+        normalize_number_field(object, "last_status");
+        normalize_number_field(object, "last_seen_unix_ms");
         object
             .entry("top_countries")
             .or_insert_with(|| serde_json::json!([]));
@@ -129,6 +140,51 @@ fn add_empty_stats_lists(value: &mut serde_json::Value) {
         object
             .entry("top_upstreams")
             .or_insert_with(|| serde_json::json!([]));
+    }
+}
+
+fn normalize_number_field(object: &mut serde_json::Map<String, serde_json::Value>, key: &str) {
+    let Some(value) = object.get(key).cloned() else {
+        return;
+    };
+    let Some(text) = value.as_str() else {
+        return;
+    };
+    if let Ok(number) = text.parse::<u64>() {
+        object.insert(key.to_string(), serde_json::Value::Number(number.into()));
+        return;
+    }
+    if let Ok(number) = text.parse::<f64>() {
+        if let Some(number) = serde_json::Number::from_f64(number) {
+            object.insert(key.to_string(), serde_json::Value::Number(number));
+        }
+    }
+}
+
+fn normalized_row_value(row: &serde_json::Value, key: &str) -> serde_json::Value {
+    let Some(value) = row.get(key).cloned() else {
+        return serde_json::Value::Null;
+    };
+    let Some(text) = value.as_str() else {
+        return value;
+    };
+    if let Ok(number) = text.parse::<u64>() {
+        return serde_json::Value::Number(number.into());
+    }
+    if let Ok(number) = text.parse::<f64>() {
+        return serde_json::Number::from_f64(number)
+            .map(serde_json::Value::Number)
+            .unwrap_or(value);
+    }
+    value
+}
+
+fn normalize_bandwidth_row(row: &mut serde_json::Value) {
+    if let Some(object) = row.as_object_mut() {
+        normalize_number_field(object, "bytes_sent");
+        normalize_number_field(object, "bytes_received");
+        normalize_number_field(object, "total_bandwidth");
+        normalize_number_field(object, "request_count");
     }
 }
 
@@ -150,20 +206,14 @@ fn access_log_row_to_visit(row: serde_json::Value) -> serde_json::Value {
         "domain": row.get("domain").cloned().unwrap_or(serde_json::Value::Null),
         "method": row.get("method").cloned().unwrap_or(serde_json::Value::Null),
         "path": row.get("path").cloned().unwrap_or(serde_json::Value::Null),
-        "status": row.get("status").cloned().unwrap_or(serde_json::Value::Null),
-        "latency_ms": row.get("latency_ms").cloned().unwrap_or(serde_json::Value::Null),
+        "status": normalized_row_value(&row, "status"),
+        "latency_ms": normalized_row_value(&row, "latency_ms"),
         "upstream": row.get("upstream").cloned().unwrap_or(serde_json::Value::Null),
         "remote_ip": row.get("remote_ip").cloned().unwrap_or(serde_json::Value::Null),
         "location": location,
-        "timestamp_unix_ms": row
-            .get("timestamp_unix_ms")
-            .cloned()
-            .unwrap_or(serde_json::Value::Null),
-        "bytes_sent": row.get("bytes_sent").cloned().unwrap_or(serde_json::Value::Null),
-        "bytes_received": row
-            .get("bytes_received")
-            .cloned()
-            .unwrap_or(serde_json::Value::Null),
+        "timestamp_unix_ms": normalized_row_value(&row, "timestamp_unix_ms"),
+        "bytes_sent": normalized_row_value(&row, "bytes_sent"),
+        "bytes_received": normalized_row_value(&row, "bytes_received"),
     })
 }
 
@@ -553,8 +603,9 @@ GROUP BY domain
             });
         }
 
-        serde_json::from_value(result[0].clone())
-            .context("failed to parse bandwidth usage from ClickHouse")
+        let mut row = result[0].clone();
+        normalize_bandwidth_row(&mut row);
+        serde_json::from_value(row).context("failed to parse bandwidth usage from ClickHouse")
     }
 
     pub async fn get_bandwidth_history(
@@ -584,7 +635,10 @@ ORDER BY period DESC
         let result = self.query_json(&query).await?;
         result
             .into_iter()
-            .map(|row| serde_json::from_value(row).context("failed to parse bandwidth history row"))
+            .map(|mut row| {
+                normalize_bandwidth_row(&mut row);
+                serde_json::from_value(row).context("failed to parse bandwidth history row")
+            })
             .collect()
     }
 
@@ -615,7 +669,8 @@ ORDER BY period ASC
         let result = self.query_json(&query).await?;
         result
             .into_iter()
-            .map(|row| {
+            .map(|mut row| {
+                normalize_bandwidth_row(&mut row);
                 serde_json::from_value(row).context("failed to parse bandwidth realtime row")
             })
             .collect()
