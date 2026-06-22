@@ -73,7 +73,7 @@ restore_edge_dependents() {
   local compose
   compose="$(compose_cmd)"
   [ -n "$compose" ] || return 0
-  $compose -f docker-compose.yml up -d prometheus grafana >/dev/null 2>&1 || true
+  $compose -f docker-compose.yml up -d --no-deps prometheus grafana >/dev/null 2>&1 || true
 }
 
 remove_redirects() {
