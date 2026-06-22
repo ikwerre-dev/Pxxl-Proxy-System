@@ -10,7 +10,12 @@ use hyper_util::{
 };
 use pxxl_core::RequestObservation;
 use serde::{Deserialize, Serialize};
-use std::{collections::HashMap, path::{Path, PathBuf}};
+use std::{
+    collections::{HashMap, VecDeque},
+    path::{Path, PathBuf},
+    sync::{Arc, Mutex},
+    time::Instant,
+};
 use tokio::sync::{mpsc, watch};
 use tokio::time::{self, Duration};
 use tracing::{info, warn};
@@ -28,6 +33,8 @@ const CLICKHOUSE_REQUEST_TIMEOUT_SECONDS: u64 = 5;
 const CLICKHOUSE_BATCH_MAX_EVENTS: usize = 250;
 const CLICKHOUSE_BATCH_FLUSH_MS: u64 = 1_000;
 const CLICKHOUSE_SPOOL_REPLAY_MAX_FILES: usize = 16;
+const CLICKHOUSE_READ_CACHE_TTL_SECONDS: u64 = 5;
+const CLICKHOUSE_READ_CACHE_MAX_ENTRIES: usize = 256;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct StorageEndpoints {
@@ -59,12 +66,60 @@ pub struct RequestAnalyticsEvent {
 pub struct ClickHouseAnalytics {
     endpoint: ClickHouseEndpoint,
     client: Client<HttpConnector, Full<Bytes>>,
+    read_cache: Arc<Mutex<QueryCache>>,
 }
 
 #[derive(Debug, Clone)]
 struct ClickHouseEndpoint {
     uri: Uri,
     authorization: Option<String>,
+}
+
+#[derive(Debug, Default)]
+struct QueryCache {
+    entries: HashMap<String, QueryCacheEntry>,
+    order: VecDeque<String>,
+}
+
+#[derive(Debug, Clone)]
+struct QueryCacheEntry {
+    created_at: Instant,
+    rows: Vec<serde_json::Value>,
+}
+
+impl QueryCache {
+    fn get(&mut self, key: &str) -> Option<Vec<serde_json::Value>> {
+        let entry = self.entries.get(key)?;
+        if entry.created_at.elapsed() > Duration::from_secs(CLICKHOUSE_READ_CACHE_TTL_SECONDS) {
+            self.entries.remove(key);
+            return None;
+        }
+        Some(entry.rows.clone())
+    }
+
+    fn insert(&mut self, key: String, rows: Vec<serde_json::Value>) {
+        if !self.entries.contains_key(&key) {
+            self.order.push_back(key.clone());
+        }
+        self.entries.insert(
+            key,
+            QueryCacheEntry {
+                created_at: Instant::now(),
+                rows,
+            },
+        );
+        while self.entries.len() > CLICKHOUSE_READ_CACHE_MAX_ENTRIES {
+            let Some(oldest) = self.order.pop_front() else {
+                break;
+            };
+            self.entries.remove(&oldest);
+        }
+    }
+
+    fn clear(&mut self) {
+        self.entries.clear();
+        self.order.clear();
+    }
 }
 
 #[derive(Debug, Serialize)]
@@ -255,7 +310,11 @@ impl ClickHouseAnalytics {
         let mut connector = HttpConnector::new();
         connector.enforce_http(false);
         let client = Client::builder(TokioExecutor::new()).build(connector);
-        Ok(Self { endpoint, client })
+        Ok(Self {
+            endpoint,
+            client,
+            read_cache: Arc::new(Mutex::new(QueryCache::default())),
+        })
     }
 
     pub async fn ensure_schema(&self) -> Result<()> {
@@ -304,6 +363,12 @@ ORDER BY (domain, timestamp_unix_ms, request_id)
         self.post_sql("ALTER TABLE pxxl_access_logs ADD INDEX IF NOT EXISTS idx_remote_ip remote_ip TYPE bloom_filter(0.01) GRANULARITY 4")
             .await?;
         self.post_sql("ALTER TABLE pxxl_access_logs ADD INDEX IF NOT EXISTS idx_country_code country_code TYPE set(512) GRANULARITY 4")
+            .await?;
+        self.post_sql("ALTER TABLE pxxl_access_logs ADD INDEX IF NOT EXISTS idx_request_id request_id TYPE bloom_filter(0.001) GRANULARITY 4")
+            .await?;
+        self.post_sql("ALTER TABLE pxxl_access_logs ADD INDEX IF NOT EXISTS idx_upstream upstream TYPE bloom_filter(0.01) GRANULARITY 4")
+            .await?;
+        self.post_sql("ALTER TABLE pxxl_access_logs ADD INDEX IF NOT EXISTS idx_city city TYPE set(4096) GRANULARITY 4")
             .await
     }
 
@@ -390,7 +455,11 @@ GROUP BY
             "INSERT INTO pxxl_access_logs SETTINGS async_insert=0, wait_for_async_insert=1 FORMAT JSONEachRow\n{}",
             rows.join("\n")
         );
-        self.post_sql(&payload).await
+        self.post_sql(&payload).await?;
+        if let Ok(mut cache) = self.read_cache.lock() {
+            cache.clear();
+        }
+        Ok(())
     }
 
     pub async fn get_domain_stats_snapshot(
@@ -418,7 +487,7 @@ WHERE domain = {domain_sql}
 GROUP BY domain
 "#
         );
-        let mut rows = self.query_json(&query).await?;
+        let mut rows = self.query_json_cached(&query).await?;
         let Some(mut stats) = rows.pop() else {
             return Ok(None);
         };
@@ -449,7 +518,7 @@ ORDER BY last_seen_unix_ms DESC
 LIMIT {limit}
 "#
         );
-        let mut rows = self.query_json(&query).await?;
+        let mut rows = self.query_json_cached(&query).await?;
         self.add_domain_stats_lists_bulk(&mut rows).await?;
         Ok(rows)
     }
@@ -470,7 +539,7 @@ LIMIT {limit}
             .map(|domain| clickhouse_string_literal(domain))
             .collect::<Vec<_>>()
             .join(",");
-        let top_countries = self.query_json(&format!(
+        let top_countries = self.query_json_cached(&format!(
             r#"
 SELECT domain, code, name, count
 FROM (
@@ -487,7 +556,7 @@ ORDER BY domain ASC, count DESC
 LIMIT 80 BY domain
 "#
         )).await?;
-        let top_continents = self.query_json(&format!(
+        let top_continents = self.query_json_cached(&format!(
             r#"
 SELECT domain, code, name, count
 FROM (
@@ -504,7 +573,7 @@ ORDER BY domain ASC, count DESC
 LIMIT 20 BY domain
 "#
         )).await?;
-        let top_paths = self.query_json(&format!(
+        let top_paths = self.query_json_cached(&format!(
             r#"
 SELECT domain, value, count
 FROM (
@@ -517,7 +586,7 @@ ORDER BY domain ASC, count DESC
 LIMIT 50 BY domain
 "#
         )).await?;
-        let top_upstreams = self.query_json(&format!(
+        let top_upstreams = self.query_json_cached(&format!(
             r#"
 SELECT domain, value, count
 FROM (
@@ -558,7 +627,7 @@ LIMIT 50 BY domain
             return Ok(());
         };
         let domain_sql = clickhouse_string_literal(domain);
-        let top_countries = self.query_json(&format!(
+        let top_countries = self.query_json_cached(&format!(
             r#"
 SELECT
     ifNull(nullIf(country_code, ''), 'XX') AS code,
@@ -571,7 +640,7 @@ ORDER BY count DESC
 LIMIT 80
 "#
         )).await?;
-        let top_continents = self.query_json(&format!(
+        let top_continents = self.query_json_cached(&format!(
             r#"
 SELECT
     ifNull(nullIf(continent_code, ''), 'XX') AS code,
@@ -584,7 +653,7 @@ ORDER BY count DESC
 LIMIT 20
 "#
         )).await?;
-        let top_paths = self.query_json(&format!(
+        let top_paths = self.query_json_cached(&format!(
             r#"
 SELECT path AS value, count() AS count
 FROM pxxl_access_logs
@@ -594,7 +663,7 @@ ORDER BY count DESC
 LIMIT 50
 "#
         )).await?;
-        let top_upstreams = self.query_json(&format!(
+        let top_upstreams = self.query_json_cached(&format!(
             r#"
 SELECT ifNull(upstream, 'unknown') AS value, count() AS count
 FROM pxxl_access_logs
@@ -660,7 +729,7 @@ ORDER BY timestamp_unix_ms DESC
 LIMIT {limit}
 "#
         );
-        let rows = self.query_json(&query).await?;
+        let rows = self.query_json_cached(&query).await?;
         Ok(rows.into_iter().map(access_log_row_to_visit).collect())
     }
 
@@ -919,7 +988,7 @@ GROUP BY domain
             end_timestamp
         );
 
-        let result = self.query_json(&query).await?;
+        let result = self.query_json_cached(&query).await?;
         if result.is_empty() {
             return Ok(BandwidthUsage {
                 domain: domain.to_string(),
@@ -960,7 +1029,7 @@ ORDER BY period DESC
             months
         );
 
-        let result = self.query_json(&query).await?;
+        let result = self.query_json_cached(&query).await?;
         result
             .into_iter()
             .map(|mut row| {
@@ -994,7 +1063,7 @@ ORDER BY period ASC
             hours
         );
 
-        let result = self.query_json(&query).await?;
+        let result = self.query_json_cached(&query).await?;
         result
             .into_iter()
             .map(|mut row| {
@@ -1040,6 +1109,20 @@ ORDER BY period ASC
             .filter(|line| !line.trim().is_empty())
             .map(serde_json::from_str)
             .collect::<std::result::Result<Vec<_>, _>>()?;
+        Ok(rows)
+    }
+
+    async fn query_json_cached(&self, sql: &str) -> Result<Vec<serde_json::Value>> {
+        if let Ok(mut cache) = self.read_cache.lock() {
+            if let Some(rows) = cache.get(sql) {
+                return Ok(rows);
+            }
+        }
+
+        let rows = self.query_json(sql).await?;
+        if let Ok(mut cache) = self.read_cache.lock() {
+            cache.insert(sql.to_string(), rows.clone());
+        }
         Ok(rows)
     }
 }
