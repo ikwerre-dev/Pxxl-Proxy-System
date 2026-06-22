@@ -57,7 +57,16 @@ compose_cmd() {
 }
 
 remove_edge_dependents() {
-  podman rm -f pxxl-proxy-prometheus pxxl-proxy-grafana >/dev/null 2>&1 || true
+  local dependent
+  for dependent in pxxl-proxy-grafana pxxl-proxy-prometheus; do
+    podman rm -f "$dependent" >/dev/null 2>&1 || true
+  done
+
+  for dependent in pxxl-proxy-grafana pxxl-proxy-prometheus; do
+    if podman container exists "$dependent"; then
+      die "could not remove edge dependent container: $dependent"
+    fi
+  done
 }
 
 restore_edge_dependents() {
