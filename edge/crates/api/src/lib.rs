@@ -805,23 +805,58 @@ impl ApiServer {
                 if let Some(response) = require_scope(&principal, SCOPE_ANALYTICS_READ) {
                     return response;
                 }
+                let requested_domains = query_domains(&query);
                 let domains = match &self.analytics {
-                    Some(analytics) => match analytics.get_domain_stats_snapshots(50_000).await {
+                    Some(analytics) => match if requested_domains.is_empty() {
+                        analytics.get_domain_stats_snapshots(50_000).await
+                    } else {
+                        analytics
+                            .get_domain_stats_snapshots_for_domains(&requested_domains, 50_000)
+                            .await
+                    } {
                         Ok(domains) => domains,
                         Err(error) => {
                             warn!(%error, "falling back to in-memory domain stats");
-                            serde_json::to_value(self.state.stats.snapshots())
+                            let mut snapshots = serde_json::to_value(self.state.stats.snapshots())
                                 .unwrap_or_default()
                                 .as_array()
                                 .cloned()
-                                .unwrap_or_default()
+                                .unwrap_or_default();
+                            if !requested_domains.is_empty() {
+                                snapshots.retain(|row| {
+                                    row.get("domain")
+                                        .and_then(|value| value.as_str())
+                                        .map(|domain| {
+                                            requested_domains.iter().any(|requested| {
+                                                requested.eq_ignore_ascii_case(domain)
+                                            })
+                                        })
+                                        .unwrap_or(false)
+                                });
+                            }
+                            snapshots
                         }
                     },
-                    None => serde_json::to_value(self.state.stats.snapshots())
-                        .unwrap_or_default()
-                        .as_array()
-                        .cloned()
-                        .unwrap_or_default(),
+                    None => {
+                        let mut snapshots = serde_json::to_value(self.state.stats.snapshots())
+                            .unwrap_or_default()
+                            .as_array()
+                            .cloned()
+                            .unwrap_or_default();
+                        if !requested_domains.is_empty() {
+                            snapshots.retain(|row| {
+                                row.get("domain")
+                                    .and_then(|value| value.as_str())
+                                    .map(|domain| {
+                                        requested_domains
+                                            .iter()
+                                            .any(|requested| requested.eq_ignore_ascii_case(domain))
+                                    })
+                                    .unwrap_or(false)
+                            });
+                        }
+                        snapshots
+                    }
                 };
                 json_response(StatusCode::OK, json!({ "domains": domains }))
             }
@@ -2421,6 +2456,20 @@ fn query_value(query: &str, name: &str) -> Option<String> {
             None
         }
     })
+}
+
+fn query_domains(query: &str) -> Vec<String> {
+    let Some(raw) = query_value(query, "domains") else {
+        return Vec::new();
+    };
+    let mut domains = raw
+        .split(',')
+        .map(|domain| domain.trim().trim_end_matches('.').to_ascii_lowercase())
+        .filter(|domain| !domain.is_empty())
+        .collect::<Vec<_>>();
+    domains.sort();
+    domains.dedup();
+    domains
 }
 
 fn empty_domain_stats(domain: &str) -> serde_json::Value {

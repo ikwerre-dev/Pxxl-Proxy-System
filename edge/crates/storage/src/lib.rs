@@ -179,6 +179,27 @@ fn clickhouse_string_literal(value: &str) -> String {
     format!("'{escaped}'")
 }
 
+fn clickhouse_domain_filter(domains: &[String]) -> Option<String> {
+    let mut cleaned = domains
+        .iter()
+        .map(|domain| domain.trim().trim_end_matches('.').to_ascii_lowercase())
+        .filter(|domain| !domain.is_empty())
+        .collect::<Vec<_>>();
+    cleaned.sort();
+    cleaned.dedup();
+    if cleaned.is_empty() {
+        return None;
+    }
+    Some(format!(
+        "domain IN ({})",
+        cleaned
+            .iter()
+            .map(|domain| clickhouse_string_literal(domain))
+            .collect::<Vec<_>>()
+            .join(",")
+    ))
+}
+
 fn add_empty_stats_lists(value: &mut serde_json::Value) {
     if let Some(object) = value.as_object_mut() {
         normalize_number_field(object, "requests_total");
@@ -190,6 +211,7 @@ fn add_empty_stats_lists(value: &mut serde_json::Value) {
         normalize_number_field(object, "total_bytes_sent");
         normalize_number_field(object, "total_bytes_received");
         normalize_number_field(object, "total_bandwidth");
+        normalize_number_field(object, "unique_ips");
         normalize_number_field(object, "last_status");
         normalize_number_field(object, "last_seen_unix_ms");
         object
@@ -547,7 +569,29 @@ GROUP BY domain
     }
 
     pub async fn get_domain_stats_snapshots(&self, limit: usize) -> Result<Vec<serde_json::Value>> {
+        self.get_domain_stats_snapshots_filtered(limit, None).await
+    }
+
+    pub async fn get_domain_stats_snapshots_for_domains(
+        &self,
+        domains: &[String],
+        limit: usize,
+    ) -> Result<Vec<serde_json::Value>> {
+        self.get_domain_stats_snapshots_filtered(limit, Some(domains))
+            .await
+    }
+
+    async fn get_domain_stats_snapshots_filtered(
+        &self,
+        limit: usize,
+        domains: Option<&[String]>,
+    ) -> Result<Vec<serde_json::Value>> {
         let limit = limit.clamp(1, 50_000);
+        let domain_filter = domains.and_then(clickhouse_domain_filter);
+        let raw_where = domain_filter
+            .as_ref()
+            .map(|filter| format!("WHERE {filter}"))
+            .unwrap_or_default();
         let query = format!(
             r#"
 SELECT
@@ -561,16 +605,18 @@ SELECT
     sum(bytes_sent) AS total_bytes_sent,
     sum(bytes_received) AS total_bytes_received,
     sum(bytes_sent + bytes_received) AS total_bandwidth,
+    uniqExact(remote_ip) AS unique_ips,
     argMax(status, timestamp_unix_ms) AS last_status,
     max(timestamp_unix_ms) AS last_seen_unix_ms
 FROM pxxl_access_logs
+{raw_where}
 GROUP BY domain
 ORDER BY last_seen_unix_ms DESC
 LIMIT {limit}
 "#
         );
         match self
-            .get_domain_stats_snapshots_from_rollup(limit)
+            .get_domain_stats_snapshots_from_rollup(limit, domain_filter.as_deref())
             .await
         {
             Ok(rows) if !rows.is_empty() => return Ok(rows),
@@ -590,8 +636,13 @@ LIMIT {limit}
     async fn get_domain_stats_snapshots_from_rollup(
         &self,
         limit: usize,
+        domain_filter: Option<&str>,
     ) -> Result<Vec<serde_json::Value>> {
         let days = stats_rollup_days();
+        let where_clause = match domain_filter {
+            Some(filter) => format!("day >= today() - INTERVAL {days} DAY AND {filter}"),
+            None => format!("day >= today() - INTERVAL {days} DAY"),
+        };
         let query = format!(
             r#"
 SELECT
@@ -605,10 +656,11 @@ SELECT
     sum(bytes_sent) AS total_bytes_sent,
     sum(bytes_received) AS total_bytes_received,
     sum(bytes_sent + bytes_received) AS total_bandwidth,
+    uniqCombined64Merge(unique_ips) AS unique_ips,
     toUInt16(argMax(status_class, day)) AS last_status,
     toUInt64(toUnixTimestamp(max(day)) * 1000) AS last_seen_unix_ms
 FROM pxxl_access_rollup_day
-WHERE day >= today() - INTERVAL {days} DAY
+WHERE {where_clause}
 GROUP BY domain
 ORDER BY requests_total DESC
 LIMIT {limit}
