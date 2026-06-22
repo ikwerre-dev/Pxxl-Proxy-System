@@ -540,7 +540,7 @@ impl DomainStatsCounters {
     }
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RequestObservation {
     pub request_id: String,
     pub domain: String,

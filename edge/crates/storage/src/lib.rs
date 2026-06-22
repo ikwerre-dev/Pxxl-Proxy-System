@@ -10,6 +10,7 @@ use hyper_util::{
 };
 use pxxl_core::RequestObservation;
 use serde::{Deserialize, Serialize};
+use std::path::{Path, PathBuf};
 use tokio::sync::{mpsc, watch};
 use tokio::time::{self, Duration};
 use tracing::{info, warn};
@@ -26,6 +27,7 @@ const CLICKHOUSE_QUERY_BODY_LIMIT_BYTES: u64 = 64 * 1024 * 1024;
 const CLICKHOUSE_REQUEST_TIMEOUT_SECONDS: u64 = 5;
 const CLICKHOUSE_BATCH_MAX_EVENTS: usize = 250;
 const CLICKHOUSE_BATCH_FLUSH_MS: u64 = 1_000;
+const CLICKHOUSE_SPOOL_REPLAY_MAX_FILES: usize = 16;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct StorageEndpoints {
@@ -249,10 +251,12 @@ CREATE TABLE IF NOT EXISTS pxxl_access_logs (
   bytes_sent UInt64,
   bytes_received UInt64
 ) ENGINE = MergeTree
+PARTITION BY toYYYYMM(toDateTime(timestamp_unix_ms / 1000))
 ORDER BY (domain, timestamp_unix_ms, request_id)
 "#,
         )
         .await?;
+        self.ensure_access_rollup_schema().await?;
         self.post_sql("ALTER TABLE pxxl_access_logs ADD COLUMN IF NOT EXISTS request_id String")
             .await?;
         self.post_sql(
@@ -273,6 +277,69 @@ ORDER BY (domain, timestamp_unix_ms, request_id)
             .await
     }
 
+    async fn ensure_access_rollup_schema(&self) -> Result<()> {
+        self.post_sql(
+            r#"
+CREATE TABLE IF NOT EXISTS pxxl_access_rollup_day (
+  day Date,
+  domain String,
+  country_code String,
+  country_name String,
+  continent_code String,
+  continent_name String,
+  region String,
+  city String,
+  status_class UInt16,
+  requests SimpleAggregateFunction(sum, UInt64),
+  blocked SimpleAggregateFunction(sum, UInt64),
+  errors SimpleAggregateFunction(sum, UInt64),
+  bytes_sent SimpleAggregateFunction(sum, UInt64),
+  bytes_received SimpleAggregateFunction(sum, UInt64),
+  latency_ms_sum SimpleAggregateFunction(sum, UInt64),
+  unique_ips AggregateFunction(uniqCombined64, String)
+) ENGINE = AggregatingMergeTree
+PARTITION BY toYYYYMM(day)
+ORDER BY (domain, day, country_code, continent_code, region, city, status_class)
+"#,
+        )
+        .await?;
+        self.post_sql(
+            r#"
+CREATE MATERIALIZED VIEW IF NOT EXISTS pxxl_access_rollup_day_mv
+TO pxxl_access_rollup_day AS
+SELECT
+  toDate(toDateTime(timestamp_unix_ms / 1000)) AS day,
+  domain,
+  ifNull(country_code, '') AS country_code,
+  ifNull(country_name, '') AS country_name,
+  ifNull(continent_code, '') AS continent_code,
+  ifNull(continent_name, '') AS continent_name,
+  ifNull(region, '') AS region,
+  ifNull(city, '') AS city,
+  toUInt16(intDiv(status, 100) * 100) AS status_class,
+  count() AS requests,
+  countIf(status >= 400) AS blocked,
+  countIf(status >= 500) AS errors,
+  sum(bytes_sent) AS bytes_sent,
+  sum(bytes_received) AS bytes_received,
+  sum(latency_ms) AS latency_ms_sum,
+  uniqCombined64State(ifNull(remote_ip, '')) AS unique_ips
+FROM pxxl_access_logs
+GROUP BY
+  day,
+  domain,
+  country_code,
+  country_name,
+  continent_code,
+  continent_name,
+  region,
+  city,
+  status_class
+"#,
+        )
+        .await
+    }
+
     pub async fn insert_request(&self, event: RequestObservation) -> Result<()> {
         self.insert_requests(std::iter::once(event)).await
     }
@@ -290,7 +357,7 @@ ORDER BY (domain, timestamp_unix_ms, request_id)
             return Ok(());
         }
         let payload = format!(
-            "INSERT INTO pxxl_access_logs FORMAT JSONEachRow\n{}",
+            "INSERT INTO pxxl_access_logs SETTINGS async_insert=0, wait_for_async_insert=1 FORMAT JSONEachRow\n{}",
             rows.join("\n")
         );
         self.post_sql(&payload).await
@@ -482,6 +549,7 @@ pub async fn run_clickhouse_writer(
     mut shutdown: watch::Receiver<bool>,
 ) -> Result<()> {
     let analytics = ClickHouseAnalytics::new(clickhouse_url)?;
+    let spool_dir = analytics_spool_dir();
     match analytics.ensure_schema().await {
         Ok(()) => info!("ClickHouse analytics table is ready"),
         Err(error) => warn!(%error, "could not ensure ClickHouse analytics table"),
@@ -493,26 +561,27 @@ pub async fn run_clickhouse_writer(
         tokio::select! {
             maybe_event = receiver.recv() => {
                 let Some(event) = maybe_event else {
-                    flush_clickhouse_events(&analytics, &mut buffer).await;
+                    flush_clickhouse_events(&analytics, &spool_dir, &mut buffer).await;
                     break;
                 };
                 buffer.push(event);
                 if buffer.len() >= CLICKHOUSE_BATCH_MAX_EVENTS {
-                    flush_clickhouse_events(&analytics, &mut buffer).await;
+                    flush_clickhouse_events(&analytics, &spool_dir, &mut buffer).await;
                 }
             }
             _ = flush_interval.tick() => {
-                flush_clickhouse_events(&analytics, &mut buffer).await;
+                replay_clickhouse_spool(&analytics, &spool_dir).await;
+                flush_clickhouse_events(&analytics, &spool_dir, &mut buffer).await;
             }
             changed = shutdown.changed() => {
                 if changed.is_ok() && *shutdown.borrow() {
                     while let Ok(event) = receiver.try_recv() {
                         buffer.push(event);
                         if buffer.len() >= CLICKHOUSE_BATCH_MAX_EVENTS {
-                            flush_clickhouse_events(&analytics, &mut buffer).await;
+                            flush_clickhouse_events(&analytics, &spool_dir, &mut buffer).await;
                         }
                     }
-                    flush_clickhouse_events(&analytics, &mut buffer).await;
+                    flush_clickhouse_events(&analytics, &spool_dir, &mut buffer).await;
                     break;
                 }
             }
@@ -524,6 +593,7 @@ pub async fn run_clickhouse_writer(
 
 async fn flush_clickhouse_events(
     analytics: &ClickHouseAnalytics,
+    spool_dir: &Path,
     buffer: &mut Vec<RequestObservation>,
 ) {
     if buffer.is_empty() {
@@ -538,8 +608,81 @@ async fn flush_clickhouse_events(
             "failed to persist request analytics batch, retrying once"
         );
         time::sleep(Duration::from_millis(250)).await;
-        if let Err(error) = analytics.insert_requests(events).await {
-            warn!(%error, count, "dropping request analytics batch after retry failure");
+        if let Err(error) = analytics.insert_requests(events.clone()).await {
+            warn!(
+                %error,
+                count,
+                path = %spool_dir.display(),
+                "spooling request analytics batch after retry failure"
+            );
+            if let Err(spool_error) = spool_clickhouse_events(spool_dir, &events).await {
+                warn!(%spool_error, count, "failed to spool request analytics batch");
+            }
+        }
+    }
+}
+
+fn analytics_spool_dir() -> PathBuf {
+    std::env::var("PXXL_ANALYTICS_SPOOL_DIR")
+        .map(PathBuf::from)
+        .unwrap_or_else(|_| PathBuf::from("/data/analytics-spool"))
+}
+
+async fn spool_clickhouse_events(dir: &Path, events: &[RequestObservation]) -> Result<()> {
+    tokio::fs::create_dir_all(dir).await?;
+    let stamp = Utc::now().timestamp_millis();
+    let filename = format!("analytics-{stamp}-{}.jsonl", std::process::id());
+    let final_path = dir.join(filename);
+    let temp_path = final_path.with_extension("jsonl.tmp");
+    let mut payload = String::new();
+    for event in events {
+        payload.push_str(&serde_json::to_string(event)?);
+        payload.push('\n');
+    }
+    tokio::fs::write(&temp_path, payload).await?;
+    tokio::fs::rename(&temp_path, final_path).await?;
+    Ok(())
+}
+
+async fn replay_clickhouse_spool(analytics: &ClickHouseAnalytics, dir: &Path) {
+    let Ok(mut entries) = tokio::fs::read_dir(dir).await else {
+        return;
+    };
+    let mut files = Vec::new();
+    while let Ok(Some(entry)) = entries.next_entry().await {
+        let path = entry.path();
+        if path.extension().and_then(|ext| ext.to_str()) == Some("jsonl") {
+            files.push(path);
+        }
+    }
+    files.sort();
+    for path in files.into_iter().take(CLICKHOUSE_SPOOL_REPLAY_MAX_FILES) {
+        let Ok(contents) = tokio::fs::read_to_string(&path).await else {
+            continue;
+        };
+        let mut events = Vec::new();
+        for line in contents.lines().filter(|line| !line.trim().is_empty()) {
+            match serde_json::from_str::<RequestObservation>(line) {
+                Ok(event) => events.push(event),
+                Err(error) => {
+                    warn!(%error, path = %path.display(), "skipping corrupt analytics spool row");
+                }
+            }
+        }
+        if events.is_empty() {
+            let _ = tokio::fs::remove_file(&path).await;
+            continue;
+        }
+        match analytics.insert_requests(events).await {
+            Ok(()) => {
+                if let Err(error) = tokio::fs::remove_file(&path).await {
+                    warn!(%error, path = %path.display(), "could not remove replayed analytics spool file");
+                }
+            }
+            Err(error) => {
+                warn!(%error, path = %path.display(), "analytics spool replay paused");
+                break;
+            }
         }
     }
 }
