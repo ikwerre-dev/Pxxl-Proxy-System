@@ -46,6 +46,27 @@ cleanup_candidate() {
   podman rm -f "$candidate" >/dev/null 2>&1 || true
 }
 
+compose_cmd() {
+  if command -v podman-compose >/dev/null 2>&1; then
+    printf 'podman-compose'
+  elif command -v podman >/dev/null 2>&1 && podman compose version >/dev/null 2>&1; then
+    printf 'podman compose'
+  else
+    printf ''
+  fi
+}
+
+remove_edge_dependents() {
+  podman rm -f pxxl-proxy-prometheus pxxl-proxy-grafana >/dev/null 2>&1 || true
+}
+
+restore_edge_dependents() {
+  local compose
+  compose="$(compose_cmd)"
+  [ -n "$compose" ] || return 0
+  $compose -f docker-compose.yml up -d prometheus grafana >/dev/null 2>&1 || true
+}
+
 remove_redirects() {
   sudo iptables -t nat -D PREROUTING -p tcp --dport 80 -j REDIRECT --to-ports "$CANDIDATE_HTTP_PORT" >/dev/null 2>&1 || true
   sudo iptables -t nat -D PREROUTING -p tcp --dport 443 -j REDIRECT --to-ports "$CANDIDATE_HTTPS_PORT" >/dev/null 2>&1 || true
@@ -151,6 +172,7 @@ sudo iptables -t nat -I PREROUTING 1 -p tcp --dport 443 -j REDIRECT --to-ports "
 sleep 1
 
 log "Replacing real edge container"
+remove_edge_dependents
 podman rm -f "$EDGE_NAME" >/dev/null 2>&1 || true
 run_edge "$EDGE_NAME" "80" "443" "$WG_ADMIN_BIND" "8081" "$WG_METRICS_BIND" "9090"
 wait_health "http://${WG_ADMIN_BIND}:8081/healthz" || die "new edge did not become healthy"
@@ -159,5 +181,6 @@ wait_health "http://${WG_ADMIN_BIND}:8081/readyz" || die "new edge did not becom
 log "Removing temporary redirects and candidate"
 remove_redirects
 cleanup_candidate
+restore_edge_dependents
 
 log "Edge switched successfully"
