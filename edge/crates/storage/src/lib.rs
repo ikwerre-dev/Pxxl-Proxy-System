@@ -10,7 +10,7 @@ use hyper_util::{
 };
 use pxxl_core::RequestObservation;
 use serde::{Deserialize, Serialize};
-use std::path::{Path, PathBuf};
+use std::{collections::HashMap, path::{Path, PathBuf}};
 use tokio::sync::{mpsc, watch};
 use tokio::time::{self, Duration};
 use tracing::{info, warn};
@@ -142,6 +142,36 @@ fn add_empty_stats_lists(value: &mut serde_json::Value) {
         object
             .entry("top_upstreams")
             .or_insert_with(|| serde_json::json!([]));
+    }
+}
+
+fn stats_row_domain(row: &serde_json::Value) -> Option<String> {
+    row.get("domain")
+        .and_then(|value| value.as_str())
+        .map(str::to_string)
+        .filter(|value| !value.is_empty())
+}
+
+fn collect_domain_list(
+    lists: &mut HashMap<String, serde_json::Map<String, serde_json::Value>>,
+    key: &str,
+    rows: Vec<serde_json::Value>,
+) {
+    for mut row in rows {
+        let Some(domain) = stats_row_domain(&row) else {
+            continue;
+        };
+        if let Some(object) = row.as_object_mut() {
+            object.remove("domain");
+            normalize_number_field(object, "count");
+        }
+        let domain_lists = lists.entry(domain).or_default();
+        let entry = domain_lists
+            .entry(key.to_string())
+            .or_insert_with(|| serde_json::Value::Array(Vec::new()));
+        if let Some(values) = entry.as_array_mut() {
+            values.push(row);
+        }
     }
 }
 
@@ -367,7 +397,7 @@ GROUP BY
         &self,
         domain: &str,
     ) -> Result<Option<serde_json::Value>> {
-        let domain = clickhouse_string_literal(domain);
+        let domain_sql = clickhouse_string_literal(domain);
         let query = format!(
             r#"
 SELECT
@@ -384,7 +414,7 @@ SELECT
     argMax(status, timestamp_unix_ms) AS last_status,
     max(timestamp_unix_ms) AS last_seen_unix_ms
 FROM pxxl_access_logs
-WHERE domain = {domain}
+WHERE domain = {domain_sql}
 GROUP BY domain
 "#
         );
@@ -392,7 +422,7 @@ GROUP BY domain
         let Some(mut stats) = rows.pop() else {
             return Ok(None);
         };
-        add_empty_stats_lists(&mut stats);
+        self.add_domain_stats_lists(&mut stats, domain).await?;
         Ok(Some(stats))
     }
 
@@ -420,10 +450,165 @@ LIMIT {limit}
 "#
         );
         let mut rows = self.query_json(&query).await?;
-        for row in &mut rows {
+        self.add_domain_stats_lists_bulk(&mut rows).await?;
+        Ok(rows)
+    }
+
+    async fn add_domain_stats_lists_bulk(&self, stats_rows: &mut [serde_json::Value]) -> Result<()> {
+        for row in stats_rows.iter_mut() {
             add_empty_stats_lists(row);
         }
-        Ok(rows)
+        let domains = stats_rows
+            .iter()
+            .filter_map(stats_row_domain)
+            .collect::<Vec<_>>();
+        if domains.is_empty() {
+            return Ok(());
+        }
+        let domain_sql = domains
+            .iter()
+            .map(|domain| clickhouse_string_literal(domain))
+            .collect::<Vec<_>>()
+            .join(",");
+        let top_countries = self.query_json(&format!(
+            r#"
+SELECT domain, code, name, count
+FROM (
+    SELECT
+        domain,
+        ifNull(nullIf(country_code, ''), 'XX') AS code,
+        ifNull(nullIf(argMax(country_name, timestamp_unix_ms), ''), if(code = 'XX', 'Unknown', code)) AS name,
+        count() AS count
+    FROM pxxl_access_logs
+    WHERE domain IN ({domain_sql})
+    GROUP BY domain, code
+)
+ORDER BY domain ASC, count DESC
+LIMIT 80 BY domain
+"#
+        )).await?;
+        let top_continents = self.query_json(&format!(
+            r#"
+SELECT domain, code, name, count
+FROM (
+    SELECT
+        domain,
+        ifNull(nullIf(continent_code, ''), 'XX') AS code,
+        ifNull(nullIf(argMax(continent_name, timestamp_unix_ms), ''), if(code = 'XX', 'Unknown', code)) AS name,
+        count() AS count
+    FROM pxxl_access_logs
+    WHERE domain IN ({domain_sql})
+    GROUP BY domain, code
+)
+ORDER BY domain ASC, count DESC
+LIMIT 20 BY domain
+"#
+        )).await?;
+        let top_paths = self.query_json(&format!(
+            r#"
+SELECT domain, value, count
+FROM (
+    SELECT domain, path AS value, count() AS count
+    FROM pxxl_access_logs
+    WHERE domain IN ({domain_sql})
+    GROUP BY domain, value
+)
+ORDER BY domain ASC, count DESC
+LIMIT 50 BY domain
+"#
+        )).await?;
+        let top_upstreams = self.query_json(&format!(
+            r#"
+SELECT domain, value, count
+FROM (
+    SELECT domain, ifNull(upstream, 'unknown') AS value, count() AS count
+    FROM pxxl_access_logs
+    WHERE domain IN ({domain_sql})
+    GROUP BY domain, value
+)
+ORDER BY domain ASC, count DESC
+LIMIT 50 BY domain
+"#
+        )).await?;
+
+        let mut lists: HashMap<String, serde_json::Map<String, serde_json::Value>> = HashMap::new();
+        collect_domain_list(&mut lists, "top_countries", top_countries);
+        collect_domain_list(&mut lists, "top_continents", top_continents);
+        collect_domain_list(&mut lists, "top_paths", top_paths);
+        collect_domain_list(&mut lists, "top_upstreams", top_upstreams);
+        for row in stats_rows {
+            let Some(domain) = stats_row_domain(row) else {
+                continue;
+            };
+            let Some(object) = row.as_object_mut() else {
+                continue;
+            };
+            if let Some(domain_lists) = lists.remove(&domain) {
+                for (key, value) in domain_lists {
+                    object.insert(key, value);
+                }
+            }
+        }
+        Ok(())
+    }
+
+    async fn add_domain_stats_lists(&self, stats: &mut serde_json::Value, domain: &str) -> Result<()> {
+        add_empty_stats_lists(stats);
+        let Some(object) = stats.as_object_mut() else {
+            return Ok(());
+        };
+        let domain_sql = clickhouse_string_literal(domain);
+        let top_countries = self.query_json(&format!(
+            r#"
+SELECT
+    ifNull(nullIf(country_code, ''), 'XX') AS code,
+    ifNull(nullIf(argMax(country_name, timestamp_unix_ms), ''), if(code = 'XX', 'Unknown', code)) AS name,
+    count() AS count
+FROM pxxl_access_logs
+WHERE domain = {domain_sql}
+GROUP BY code
+ORDER BY count DESC
+LIMIT 80
+"#
+        )).await?;
+        let top_continents = self.query_json(&format!(
+            r#"
+SELECT
+    ifNull(nullIf(continent_code, ''), 'XX') AS code,
+    ifNull(nullIf(argMax(continent_name, timestamp_unix_ms), ''), if(code = 'XX', 'Unknown', code)) AS name,
+    count() AS count
+FROM pxxl_access_logs
+WHERE domain = {domain_sql}
+GROUP BY code
+ORDER BY count DESC
+LIMIT 20
+"#
+        )).await?;
+        let top_paths = self.query_json(&format!(
+            r#"
+SELECT path AS value, count() AS count
+FROM pxxl_access_logs
+WHERE domain = {domain_sql}
+GROUP BY path
+ORDER BY count DESC
+LIMIT 50
+"#
+        )).await?;
+        let top_upstreams = self.query_json(&format!(
+            r#"
+SELECT ifNull(upstream, 'unknown') AS value, count() AS count
+FROM pxxl_access_logs
+WHERE domain = {domain_sql}
+GROUP BY value
+ORDER BY count DESC
+LIMIT 50
+"#
+        )).await?;
+        object.insert("top_countries".to_string(), serde_json::Value::Array(top_countries));
+        object.insert("top_continents".to_string(), serde_json::Value::Array(top_continents));
+        object.insert("top_paths".to_string(), serde_json::Value::Array(top_paths));
+        object.insert("top_upstreams".to_string(), serde_json::Value::Array(top_upstreams));
+        Ok(())
     }
 
     pub async fn get_recent_visits(
@@ -724,7 +909,7 @@ SELECT
     sum(bytes_sent + bytes_received) as total_bandwidth,
     count(*) as request_count
 FROM pxxl_access_logs
-WHERE domain = '{}' 
+WHERE domain = {} 
   AND timestamp_unix_ms >= {}
   AND timestamp_unix_ms < {}
 GROUP BY domain
