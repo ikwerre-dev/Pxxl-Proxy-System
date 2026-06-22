@@ -47,6 +47,7 @@ use tracing::{info, warn};
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt, EnvFilter};
 
 const DEFAULT_STATS_SNAPSHOT_PATH: &str = "/data/stats/domain-stats.json";
+const DEFAULT_ANALYTICS_SPOOL_DIR: &str = "/data/analytics-spool";
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -93,10 +94,15 @@ async fn main() -> Result<()> {
     let routes = Arc::new(RouteRegistry::new(initial_routes));
     let load_balancer = Arc::new(LoadBalancer::new());
     let (analytics_tx, analytics_rx) = if config.storage.analytics_enabled {
-        let (tx, rx) = mpsc::channel(4096);
+        let (tx, rx) = mpsc::channel(65_536);
         (Some(tx), Some(rx))
     } else {
         (None, None)
+    };
+    let analytics_spool_dir = if config.storage.analytics_enabled {
+        Some(analytics_spool_dir())
+    } else {
+        None
     };
     let state = EdgeState::new_with_stats_sink(
         routes,
@@ -104,6 +110,7 @@ async fn main() -> Result<()> {
         load_balancer,
         metrics.clone(),
         analytics_tx,
+        analytics_spool_dir,
     );
     let analytics_store = if config.storage.analytics_enabled {
         match ClickHouseAnalytics::new(config.storage.clickhouse_url.clone()) {
@@ -401,6 +408,14 @@ fn stats_snapshot_path() -> PathBuf {
         .filter(|path| !path.trim().is_empty())
         .map(PathBuf::from)
         .unwrap_or_else(|| PathBuf::from(DEFAULT_STATS_SNAPSHOT_PATH))
+}
+
+fn analytics_spool_dir() -> PathBuf {
+    std::env::var("PXXL_ANALYTICS_SPOOL_DIR")
+        .ok()
+        .filter(|path| !path.trim().is_empty())
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from(DEFAULT_ANALYTICS_SPOOL_DIR))
 }
 
 async fn load_domain_stats_snapshot(state: &EdgeState, path: &Path) -> Result<usize> {

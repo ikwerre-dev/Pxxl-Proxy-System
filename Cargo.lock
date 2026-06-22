@@ -1308,6 +1308,7 @@ dependencies = [
  "pxxl-load-balancer",
  "pxxl-metrics",
  "serde",
+ "serde_json",
  "tokio",
  "tracing",
 ]

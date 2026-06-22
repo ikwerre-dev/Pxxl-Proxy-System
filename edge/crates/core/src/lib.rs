@@ -10,14 +10,17 @@ use pxxl_metrics::PxxlMetrics;
 use serde::{Deserialize, Serialize};
 use std::{
     collections::{BTreeMap, HashMap, VecDeque},
+    fs::{self, OpenOptions},
+    io::Write,
     net::IpAddr,
+    path::PathBuf,
     sync::{
         atomic::{AtomicU64, Ordering},
         Arc,
     },
 };
 use tokio::sync::mpsc;
-use tracing::info;
+use tracing::{info, warn};
 
 const RECENT_VISIT_LIMIT: usize = 5000;
 const MAX_COUNTER_KEYS: usize = 1_000;
@@ -205,7 +208,7 @@ impl EdgeState {
         load_balancer: Arc<LoadBalancer>,
         metrics: Arc<PxxlMetrics>,
     ) -> Self {
-        Self::new_with_stats_sink(routes, security, load_balancer, metrics, None)
+        Self::new_with_stats_sink(routes, security, load_balancer, metrics, None, None)
     }
 
     pub fn new_with_stats_sink(
@@ -214,6 +217,7 @@ impl EdgeState {
         load_balancer: Arc<LoadBalancer>,
         metrics: Arc<PxxlMetrics>,
         stats_sink: Option<mpsc::Sender<RequestObservation>>,
+        analytics_overflow_spool_dir: Option<PathBuf>,
     ) -> Self {
         refresh_route_metrics(&routes, &metrics);
         Self {
@@ -221,7 +225,10 @@ impl EdgeState {
             security,
             load_balancer,
             metrics,
-            stats: Arc::new(DomainStatsRegistry::new_with_sink(stats_sink)),
+            stats: Arc::new(DomainStatsRegistry::new_with_sink_and_spool(
+                stats_sink,
+                analytics_overflow_spool_dir,
+            )),
         }
     }
 
@@ -267,6 +274,7 @@ impl EdgeState {
 pub struct DomainStatsRegistry {
     domains: DashMap<String, Arc<DomainStatsCounters>>,
     sink: Option<mpsc::Sender<RequestObservation>>,
+    overflow_spool: Option<Arc<AnalyticsOverflowSpool>>,
 }
 
 impl DomainStatsRegistry {
@@ -275,15 +283,38 @@ impl DomainStatsRegistry {
     }
 
     pub fn new_with_sink(sink: Option<mpsc::Sender<RequestObservation>>) -> Self {
+        Self::new_with_sink_and_spool(sink, None)
+    }
+
+    pub fn new_with_sink_and_spool(
+        sink: Option<mpsc::Sender<RequestObservation>>,
+        overflow_spool_dir: Option<PathBuf>,
+    ) -> Self {
         Self {
             domains: DashMap::new(),
             sink,
+            overflow_spool: overflow_spool_dir.map(AnalyticsOverflowSpool::new).map(Arc::new),
         }
     }
 
     pub fn record(&self, event: RequestObservation) {
         if let Some(sink) = &self.sink {
-            let _ = sink.try_send(event.clone());
+            if let Err(error) = sink.try_send(event.clone()) {
+                match error {
+                    mpsc::error::TrySendError::Full(event) => {
+                        if let Some(spool) = &self.overflow_spool {
+                            if let Err(error) = spool.append(&event) {
+                                warn!(%error, "failed to spool analytics event after queue overflow");
+                            }
+                        } else {
+                            warn!("analytics queue full and no overflow spool is configured");
+                        }
+                    }
+                    mpsc::error::TrySendError::Closed(_) => {
+                        warn!("analytics queue closed before request event was persisted");
+                    }
+                }
+            }
         }
         let counters = self
             .domains
@@ -364,6 +395,51 @@ impl DomainStatsRegistry {
             .map(|entry| entry.value().recent_visits_by_request_id(request_id, limit))
             .unwrap_or_default()
     }
+}
+
+#[derive(Debug)]
+struct AnalyticsOverflowSpool {
+    dir: PathBuf,
+    file: Mutex<Option<std::fs::File>>,
+}
+
+impl AnalyticsOverflowSpool {
+    fn new(dir: PathBuf) -> Self {
+        Self {
+            dir,
+            file: Mutex::new(None),
+        }
+    }
+
+    fn append(&self, event: &RequestObservation) -> std::io::Result<()> {
+        fs::create_dir_all(&self.dir)?;
+        let mut file_guard = self.file.lock();
+        if file_guard.is_none() {
+            let filename = format!(
+                "analytics-overflow-{}-{}.jsonl",
+                std::process::id(),
+                unix_day_bucket()
+            );
+            let file = OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(self.dir.join(filename))?;
+            *file_guard = Some(file);
+        }
+        if let Some(file) = file_guard.as_mut() {
+            serde_json::to_writer(&mut *file, event)?;
+            file.write_all(b"\n")?;
+            file.flush()?;
+        }
+        Ok(())
+    }
+}
+
+fn unix_day_bucket() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|duration| duration.as_secs() / 86_400)
+        .unwrap_or_default()
 }
 
 #[derive(Debug, Default)]
