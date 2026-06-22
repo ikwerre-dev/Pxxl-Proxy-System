@@ -169,6 +169,15 @@ wait_health() {
   return 1
 }
 
+ensure_real_edge_running() {
+  if ! podman container exists "$EDGE_NAME"; then
+    log "Real edge container missing after dependent restore; recreating before traffic switch"
+    run_edge "$EDGE_NAME" "80" "443" "$WG_ADMIN_BIND" "8081" "$WG_METRICS_BIND" "9090"
+  fi
+  wait_health "http://${WG_ADMIN_BIND}:8081/healthz" || die "real edge is not healthy"
+  wait_health "http://${WG_ADMIN_BIND}:8081/readyz" || die "real edge is not ready"
+}
+
 log "Starting candidate $candidate on alternate ports"
 run_edge "$candidate" "$CANDIDATE_HTTP_PORT" "$CANDIDATE_HTTPS_PORT" "127.0.0.1" "$CANDIDATE_ADMIN_PORT" "127.0.0.1" "$CANDIDATE_METRICS_PORT"
 wait_health "http://127.0.0.1:${CANDIDATE_ADMIN_PORT}/healthz" || die "candidate did not become healthy"
@@ -186,10 +195,11 @@ podman rm -f "$EDGE_NAME" >/dev/null 2>&1 || true
 run_edge "$EDGE_NAME" "80" "443" "$WG_ADMIN_BIND" "8081" "$WG_METRICS_BIND" "9090"
 wait_health "http://${WG_ADMIN_BIND}:8081/healthz" || die "new edge did not become healthy"
 wait_health "http://${WG_ADMIN_BIND}:8081/readyz" || die "new edge did not become ready"
+restore_edge_dependents
+ensure_real_edge_running
 
 log "Removing temporary redirects and candidate"
 remove_redirects
 cleanup_candidate
-restore_edge_dependents
 
 log "Edge switched successfully"
