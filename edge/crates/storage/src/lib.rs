@@ -37,6 +37,11 @@ const CLICKHOUSE_READ_CACHE_TTL_SECONDS: u64 = 5;
 const CLICKHOUSE_READ_CACHE_MAX_ENTRIES: usize = 256;
 const CLICKHOUSE_ROLLUP_BACKFILL_PAUSE_MS: u64 = 100;
 const CLICKHOUSE_ROLLUP_DEFAULT_DAYS: u32 = 30;
+const CLICKHOUSE_ROLLUP_LIST_DOMAIN_LIMIT: usize = 500;
+const CLICKHOUSE_ROLLUP_TOP_COUNTRIES_PER_DOMAIN: usize = 10;
+const CLICKHOUSE_ROLLUP_TOP_CONTINENTS_PER_DOMAIN: usize = 8;
+const CLICKHOUSE_ROLLUP_TOP_REGIONS_PER_DOMAIN: usize = 10;
+const CLICKHOUSE_ROLLUP_TOP_CITIES_PER_DOMAIN: usize = 10;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct StorageEndpoints {
@@ -628,6 +633,7 @@ LIMIT {limit}
         let domains = stats_rows
             .iter()
             .filter_map(stats_row_domain)
+            .take(CLICKHOUSE_ROLLUP_LIST_DOMAIN_LIMIT)
             .collect::<Vec<_>>();
         if domains.is_empty() {
             return Ok(());
@@ -651,7 +657,7 @@ FROM (
     GROUP BY domain, code
 )
 ORDER BY domain ASC, count DESC
-LIMIT 80 BY domain
+LIMIT {CLICKHOUSE_ROLLUP_TOP_COUNTRIES_PER_DOMAIN} BY domain
 "#
         )).await?;
         let top_continents = self.query_json_cached(&format!(
@@ -668,7 +674,7 @@ FROM (
     GROUP BY domain, code
 )
 ORDER BY domain ASC, count DESC
-LIMIT 20 BY domain
+LIMIT {CLICKHOUSE_ROLLUP_TOP_CONTINENTS_PER_DOMAIN} BY domain
 "#
         )).await?;
         let top_regions = self.query_json_cached(&format!(
@@ -684,7 +690,7 @@ FROM (
     GROUP BY domain, name
 )
 ORDER BY domain ASC, count DESC
-LIMIT 20 BY domain
+LIMIT {CLICKHOUSE_ROLLUP_TOP_REGIONS_PER_DOMAIN} BY domain
 "#
         )).await?;
         let top_cities = self.query_json_cached(&format!(
@@ -701,7 +707,7 @@ FROM (
     GROUP BY domain, name, country
 )
 ORDER BY domain ASC, count DESC
-LIMIT 20 BY domain
+LIMIT {CLICKHOUSE_ROLLUP_TOP_CITIES_PER_DOMAIN} BY domain
 "#
         )).await?;
 
