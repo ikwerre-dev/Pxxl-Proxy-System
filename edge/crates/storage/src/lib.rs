@@ -1,7 +1,7 @@
 use anyhow::{Context, Result};
 use base64::{engine::general_purpose::STANDARD, Engine};
 use bytes::{Bytes, BytesMut};
-use chrono::{Datelike, Utc};
+use chrono::{Datelike, Duration as ChronoDuration, NaiveDate, Utc};
 use http::{header::AUTHORIZATION, Request, Uri};
 use http_body_util::{BodyExt, Full};
 use hyper_util::{
@@ -35,6 +35,8 @@ const CLICKHOUSE_BATCH_FLUSH_MS: u64 = 1_000;
 const CLICKHOUSE_SPOOL_REPLAY_MAX_FILES: usize = 16;
 const CLICKHOUSE_READ_CACHE_TTL_SECONDS: u64 = 5;
 const CLICKHOUSE_READ_CACHE_MAX_ENTRIES: usize = 256;
+const CLICKHOUSE_ROLLUP_BACKFILL_PAUSE_MS: u64 = 100;
+const CLICKHOUSE_ROLLUP_DEFAULT_DAYS: u32 = 30;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct StorageEndpoints {
@@ -197,6 +199,42 @@ fn add_empty_stats_lists(value: &mut serde_json::Value) {
         object
             .entry("top_upstreams")
             .or_insert_with(|| serde_json::json!([]));
+        object
+            .entry("top_regions")
+            .or_insert_with(|| serde_json::json!([]));
+        object
+            .entry("top_cities")
+            .or_insert_with(|| serde_json::json!([]));
+    }
+}
+
+fn stats_row_domain(row: &serde_json::Value) -> Option<String> {
+    row.get("domain")
+        .and_then(|value| value.as_str())
+        .map(str::to_string)
+        .filter(|value| !value.is_empty())
+}
+
+fn collect_domain_list(
+    lists: &mut HashMap<String, serde_json::Map<String, serde_json::Value>>,
+    key: &str,
+    rows: Vec<serde_json::Value>,
+) {
+    for mut row in rows {
+        let Some(domain) = stats_row_domain(&row) else {
+            continue;
+        };
+        if let Some(object) = row.as_object_mut() {
+            object.remove("domain");
+            normalize_number_field(object, "count");
+        }
+        let domain_lists = lists.entry(domain).or_default();
+        let entry = domain_lists
+            .entry(key.to_string())
+            .or_insert_with(|| serde_json::Value::Array(Vec::new()));
+        if let Some(values) = entry.as_array_mut() {
+            values.push(row);
+        }
     }
 }
 
@@ -234,6 +272,32 @@ fn normalized_row_value(row: &serde_json::Value, key: &str) -> serde_json::Value
             .unwrap_or(value);
     }
     value
+}
+
+fn numeric_field(row: &serde_json::Value, key: &str) -> u64 {
+    let Some(value) = row.get(key) else {
+        return 0;
+    };
+    if let Some(number) = value.as_u64() {
+        return number;
+    }
+    value.as_str()
+        .and_then(|text| text.parse::<u64>().ok())
+        .unwrap_or(0)
+}
+
+fn date_field(row: &serde_json::Value, key: &str) -> Option<NaiveDate> {
+    row.get(key)
+        .and_then(|value| value.as_str())
+        .and_then(|value| NaiveDate::parse_from_str(value, "%Y-%m-%d").ok())
+}
+
+fn stats_rollup_days() -> u32 {
+    std::env::var("PXXL_STATS_ROLLUP_DAYS")
+        .ok()
+        .and_then(|value| value.parse::<u32>().ok())
+        .filter(|days| *days > 0)
+        .unwrap_or(CLICKHOUSE_ROLLUP_DEFAULT_DAYS)
 }
 
 fn normalize_bandwidth_row(row: &mut serde_json::Value) {
@@ -370,6 +434,20 @@ ORDER BY (domain, day, country_code, continent_code, region, city, status_class)
         .await?;
         self.post_sql(
             r#"
+CREATE TABLE IF NOT EXISTS pxxl_access_rollup_backfill_state (
+  day Date,
+  completed_at DateTime
+) ENGINE = ReplacingMergeTree(completed_at)
+ORDER BY day
+"#,
+        )
+        .await?;
+        self.post_sql("ALTER TABLE pxxl_access_rollup_day ADD INDEX IF NOT EXISTS idx_rollup_day day TYPE minmax GRANULARITY 1")
+            .await?;
+        self.post_sql("ALTER TABLE pxxl_access_rollup_day ADD INDEX IF NOT EXISTS idx_rollup_domain domain TYPE set(100000) GRANULARITY 4")
+            .await?;
+        self.post_sql(
+            r#"
 CREATE MATERIALIZED VIEW IF NOT EXISTS pxxl_access_rollup_day_mv
 TO pxxl_access_rollup_day AS
 SELECT
@@ -426,9 +504,7 @@ GROUP BY
             rows.join("\n")
         );
         self.post_sql(&payload).await?;
-        if let Ok(mut cache) = self.read_cache.lock() {
-            cache.clear();
-        }
+        self.clear_read_cache();
         Ok(())
     }
 
@@ -488,11 +564,166 @@ ORDER BY last_seen_unix_ms DESC
 LIMIT {limit}
 "#
         );
+        match self
+            .get_domain_stats_snapshots_from_rollup(limit)
+            .await
+        {
+            Ok(rows) if !rows.is_empty() => return Ok(rows),
+            Ok(_) => {}
+            Err(error) => {
+                warn!(%error, "falling back to raw access logs for domain stats snapshots");
+            }
+        }
+
         let mut rows = self.query_json_cached(&query).await?;
         for row in rows.iter_mut() {
             add_empty_stats_lists(row);
         }
         Ok(rows)
+    }
+
+    async fn get_domain_stats_snapshots_from_rollup(
+        &self,
+        limit: usize,
+    ) -> Result<Vec<serde_json::Value>> {
+        let days = stats_rollup_days();
+        let query = format!(
+            r#"
+SELECT
+    domain,
+    sum(requests) AS requests_total,
+    sumIf(requests, status_class = 200) AS responses_2xx,
+    sumIf(requests, status_class = 300) AS responses_3xx,
+    sumIf(requests, status_class = 400) AS responses_4xx,
+    sumIf(requests, status_class = 500) AS responses_5xx,
+    if(sum(requests) = 0, 0, sum(latency_ms_sum) / sum(requests)) AS average_latency_ms,
+    sum(bytes_sent) AS total_bytes_sent,
+    sum(bytes_received) AS total_bytes_received,
+    sum(bytes_sent + bytes_received) AS total_bandwidth,
+    toUInt16(argMax(status_class, day)) AS last_status,
+    toUInt64(toUnixTimestamp(max(day)) * 1000) AS last_seen_unix_ms
+FROM pxxl_access_rollup_day
+WHERE day >= today() - INTERVAL {days} DAY
+GROUP BY domain
+ORDER BY requests_total DESC
+LIMIT {limit}
+"#
+        );
+        let mut rows = self.query_json_cached(&query).await?;
+        if rows.is_empty() {
+            return Ok(rows);
+        }
+        self.add_rollup_stats_lists_bulk(&mut rows, days).await?;
+        Ok(rows)
+    }
+
+    async fn add_rollup_stats_lists_bulk(
+        &self,
+        stats_rows: &mut [serde_json::Value],
+        days: u32,
+    ) -> Result<()> {
+        for row in stats_rows.iter_mut() {
+            add_empty_stats_lists(row);
+        }
+        let domains = stats_rows
+            .iter()
+            .filter_map(stats_row_domain)
+            .collect::<Vec<_>>();
+        if domains.is_empty() {
+            return Ok(());
+        }
+        let domain_sql = domains
+            .iter()
+            .map(|domain| clickhouse_string_literal(domain))
+            .collect::<Vec<_>>()
+            .join(",");
+        let top_countries = self.query_json_cached(&format!(
+            r#"
+SELECT domain, code, name, count
+FROM (
+    SELECT
+        domain,
+        ifNull(nullIf(country_code, ''), 'XX') AS code,
+        ifNull(nullIf(any(country_name), ''), if(code = 'XX', 'Unknown', code)) AS name,
+        sum(requests) AS count
+    FROM pxxl_access_rollup_day
+    WHERE domain IN ({domain_sql}) AND day >= today() - INTERVAL {days} DAY
+    GROUP BY domain, code
+)
+ORDER BY domain ASC, count DESC
+LIMIT 80 BY domain
+"#
+        )).await?;
+        let top_continents = self.query_json_cached(&format!(
+            r#"
+SELECT domain, code, name, count
+FROM (
+    SELECT
+        domain,
+        ifNull(nullIf(continent_code, ''), 'XX') AS code,
+        ifNull(nullIf(any(continent_name), ''), if(code = 'XX', 'Unknown', code)) AS name,
+        sum(requests) AS count
+    FROM pxxl_access_rollup_day
+    WHERE domain IN ({domain_sql}) AND day >= today() - INTERVAL {days} DAY
+    GROUP BY domain, code
+)
+ORDER BY domain ASC, count DESC
+LIMIT 20 BY domain
+"#
+        )).await?;
+        let top_regions = self.query_json_cached(&format!(
+            r#"
+SELECT domain, name, count
+FROM (
+    SELECT
+        domain,
+        ifNull(nullIf(region, ''), 'Unknown') AS name,
+        sum(requests) AS count
+    FROM pxxl_access_rollup_day
+    WHERE domain IN ({domain_sql}) AND day >= today() - INTERVAL {days} DAY
+    GROUP BY domain, name
+)
+ORDER BY domain ASC, count DESC
+LIMIT 20 BY domain
+"#
+        )).await?;
+        let top_cities = self.query_json_cached(&format!(
+            r#"
+SELECT domain, name, country, count
+FROM (
+    SELECT
+        domain,
+        ifNull(nullIf(city, ''), 'Unknown') AS name,
+        ifNull(nullIf(country_code, ''), 'XX') AS country,
+        sum(requests) AS count
+    FROM pxxl_access_rollup_day
+    WHERE domain IN ({domain_sql}) AND day >= today() - INTERVAL {days} DAY
+    GROUP BY domain, name, country
+)
+ORDER BY domain ASC, count DESC
+LIMIT 20 BY domain
+"#
+        )).await?;
+
+        let mut lists: HashMap<String, serde_json::Map<String, serde_json::Value>> = HashMap::new();
+        collect_domain_list(&mut lists, "top_countries", top_countries);
+        collect_domain_list(&mut lists, "top_continents", top_continents);
+        collect_domain_list(&mut lists, "top_regions", top_regions);
+        collect_domain_list(&mut lists, "top_cities", top_cities);
+        for row in stats_rows {
+            let Some(domain) = stats_row_domain(row) else {
+                continue;
+            };
+            let Some(object) = row.as_object_mut() else {
+                continue;
+            };
+            if let Some(domain_lists) = lists.remove(&domain) {
+                for (key, value) in domain_lists {
+                    object.insert(key, value);
+                }
+            }
+        }
+        Ok(())
     }
 
     async fn add_domain_stats_lists(&self, stats: &mut serde_json::Value, domain: &str) -> Result<()> {
@@ -637,6 +868,136 @@ LIMIT {limit}
         }
         Ok(())
     }
+
+    pub async fn backfill_access_rollup_days(&self) -> Result<()> {
+        let range_rows = self.query_json(
+            r#"
+SELECT
+    count() AS raw_rows,
+    min(toDate(toDateTime(timestamp_unix_ms / 1000))) AS min_day,
+    max(toDate(toDateTime(timestamp_unix_ms / 1000))) AS max_day
+FROM pxxl_access_logs
+WHERE timestamp_unix_ms < toUnixTimestamp(today()) * 1000
+"#,
+        ).await?;
+        let Some(range) = range_rows.first() else {
+            return Ok(());
+        };
+        if numeric_field(range, "raw_rows") == 0 {
+            return Ok(());
+        }
+        let Some(min_day) = date_field(range, "min_day") else {
+            return Ok(());
+        };
+        let Some(max_day) = date_field(range, "max_day") else {
+            return Ok(());
+        };
+        if max_day < min_day {
+            return Ok(());
+        }
+
+        let mut day = min_day;
+        while day <= max_day {
+            if self.rollup_day_already_backfilled(day).await? {
+                day = day + ChronoDuration::days(1);
+                continue;
+            }
+            if self.rollup_day_has_rows(day).await? {
+                self.mark_rollup_day_backfilled(day).await?;
+                day = day + ChronoDuration::days(1);
+                continue;
+            }
+
+            let day_sql = clickhouse_string_literal(&day.to_string());
+            self.post_sql(&format!(
+                r#"
+INSERT INTO pxxl_access_rollup_day
+SELECT
+  toDate(toDateTime(timestamp_unix_ms / 1000)) AS day,
+  domain,
+  ifNull(country_code, '') AS country_code,
+  ifNull(country_name, '') AS country_name,
+  ifNull(continent_code, '') AS continent_code,
+  ifNull(continent_name, '') AS continent_name,
+  ifNull(region, '') AS region,
+  ifNull(city, '') AS city,
+  toUInt16(intDiv(status, 100) * 100) AS status_class,
+  count() AS requests,
+  countIf(status >= 400) AS blocked,
+  countIf(status >= 500) AS errors,
+  sum(bytes_sent) AS bytes_sent,
+  sum(bytes_received) AS bytes_received,
+  sum(latency_ms) AS latency_ms_sum,
+  uniqCombined64State(ifNull(remote_ip, '')) AS unique_ips
+FROM pxxl_access_logs
+WHERE toDate(toDateTime(timestamp_unix_ms / 1000)) = toDate({day_sql})
+GROUP BY
+  day,
+  domain,
+  country_code,
+  country_name,
+  continent_code,
+  continent_name,
+  region,
+  city,
+  status_class
+"#
+            ))
+            .await?;
+            self.mark_rollup_day_backfilled(day).await?;
+            self.clear_read_cache();
+            time::sleep(Duration::from_millis(CLICKHOUSE_ROLLUP_BACKFILL_PAUSE_MS)).await;
+            day = day + ChronoDuration::days(1);
+        }
+        Ok(())
+    }
+
+    async fn rollup_day_already_backfilled(&self, day: NaiveDate) -> Result<bool> {
+        let day_sql = clickhouse_string_literal(&day.to_string());
+        let rows = self.query_json(&format!(
+            r#"
+SELECT count() AS count
+FROM pxxl_access_rollup_backfill_state FINAL
+WHERE day = toDate({day_sql})
+"#
+        )).await?;
+        Ok(rows
+            .first()
+            .map(|row| numeric_field(row, "count") > 0)
+            .unwrap_or(false))
+    }
+
+    async fn rollup_day_has_rows(&self, day: NaiveDate) -> Result<bool> {
+        let day_sql = clickhouse_string_literal(&day.to_string());
+        let rows = self.query_json(&format!(
+            r#"
+SELECT count() AS count
+FROM pxxl_access_rollup_day
+WHERE day = toDate({day_sql})
+"#
+        )).await?;
+        Ok(rows
+            .first()
+            .map(|row| numeric_field(row, "count") > 0)
+            .unwrap_or(false))
+    }
+
+    async fn mark_rollup_day_backfilled(&self, day: NaiveDate) -> Result<()> {
+        let day_sql = clickhouse_string_literal(&day.to_string());
+        self.post_sql(&format!(
+            r#"
+INSERT INTO pxxl_access_rollup_backfill_state (day, completed_at)
+VALUES (toDate({day_sql}), now())
+"#
+        ))
+        .await
+    }
+
+    fn clear_read_cache(&self) {
+        if let Ok(mut cache) = self.read_cache.lock() {
+            cache.clear();
+        }
+    }
 }
 
 async fn collect_body_limited(mut body: hyper::body::Incoming, max_bytes: u64) -> Result<Bytes> {
@@ -682,6 +1043,13 @@ pub async fn run_clickhouse_writer(
         Ok(()) => info!("ClickHouse analytics table is ready"),
         Err(error) => warn!(%error, "could not ensure ClickHouse analytics table"),
     }
+    let backfill_analytics = analytics.clone();
+    tokio::spawn(async move {
+        match backfill_analytics.backfill_access_rollup_days().await {
+            Ok(()) => info!("ClickHouse access rollup backfill completed"),
+            Err(error) => warn!(%error, "ClickHouse access rollup backfill did not complete"),
+        }
+    });
 
     let mut buffer = Vec::with_capacity(CLICKHOUSE_BATCH_MAX_EVENTS);
     let mut flush_interval = time::interval(Duration::from_millis(CLICKHOUSE_BATCH_FLUSH_MS));
