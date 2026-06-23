@@ -15,7 +15,8 @@ use pxxl_common::{
 };
 use pxxl_core::{route_allows_www_alias, EdgeState};
 use pxxl_database_proxy::{
-    run_database_proxy_public_port, DatabaseProxyRoute, DatabaseRouteRegistry,
+    run_database_proxy_public_port, save_database_routes_to_file, DatabaseProxyRoute,
+    DatabaseRouteRegistry,
 };
 use pxxl_metrics::PxxlMetrics;
 use pxxl_redis_sync::{RedisRouteStore, RedisTokenStore};
@@ -62,6 +63,7 @@ struct ApiServer {
     tls_status: TlsCertificateRuntimeStatus,
     route_store: Option<RedisRouteStore>,
     database_routes: Option<DatabaseRouteRegistry>,
+    database_routes_store_path: Option<PathBuf>,
     database_port_proxy: Option<DatabasePortProxyManager>,
     analytics: Option<ClickHouseAnalytics>,
     auth: AdminApiAuth,
@@ -74,6 +76,7 @@ pub struct AdminApiRuntime {
     pub tls_status: TlsCertificateRuntimeStatus,
     pub route_store: Option<RedisRouteStore>,
     pub database_routes: Option<DatabaseRouteRegistry>,
+    pub database_routes_store_path: Option<PathBuf>,
     pub database_port_proxy: Option<DatabasePortProxyManager>,
     pub analytics: Option<ClickHouseAnalytics>,
     pub auth: AdminApiAuth,
@@ -358,6 +361,7 @@ pub async fn run_admin_api(
         tls_status: runtime.tls_status,
         route_store: runtime.route_store,
         database_routes: runtime.database_routes,
+        database_routes_store_path: runtime.database_routes_store_path,
         database_port_proxy: runtime.database_port_proxy,
         analytics: runtime.analytics,
         auth: runtime.auth,
@@ -1425,6 +1429,16 @@ impl ApiServer {
         json_response(StatusCode::OK, json!({ "routes": registry.list() }))
     }
 
+    async fn persist_database_routes(
+        &self,
+        registry: &DatabaseRouteRegistry,
+    ) -> anyhow::Result<()> {
+        let Some(path) = &self.database_routes_store_path else {
+            return Ok(());
+        };
+        save_database_routes_to_file(path, &registry.list()).await
+    }
+
     async fn upsert_database_route(&self, req: Request<Incoming>) -> Response<BoxBody> {
         let Some(registry) = &self.database_routes else {
             return json_response(
@@ -1471,9 +1485,16 @@ impl ApiServer {
         if let (Some(manager), Some(public_port)) = (&self.database_port_proxy, route.public_port) {
             manager.ensure_listener(public_port);
         }
+        if let Err(error) = self.persist_database_routes(registry).await {
+            warn!(%error, "failed to persist database proxy routes");
+            return json_response(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                json!({"error": "database route was updated in memory but could not be persisted"}),
+            );
+        }
         json_response(
             StatusCode::OK,
-            json!({ "status": "upserted", "route": route }),
+            json!({ "status": "upserted", "route": route, "persisted": true }),
         )
     }
 
@@ -1495,9 +1516,18 @@ impl ApiServer {
             );
         }
         let deleted = registry.delete(parts[0], parts[1]);
+        if deleted {
+            if let Err(error) = self.persist_database_routes(registry).await {
+                warn!(%error, "failed to persist database proxy routes after delete");
+                return json_response(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    json!({"error": "database route was deleted in memory but could not be persisted"}),
+                );
+            }
+        }
         json_response(
             StatusCode::OK,
-            json!({"status": if deleted { "deleted" } else { "not_found" }}),
+            json!({"status": if deleted { "deleted" } else { "not_found" }, "persisted": deleted}),
         )
     }
 

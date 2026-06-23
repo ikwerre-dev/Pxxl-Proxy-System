@@ -14,7 +14,9 @@ use pxxl_api::{
 use pxxl_common::{ip_allowed_for_upstream, parse_ip_net, PathRoute, Route, RouteSource, Upstream};
 use pxxl_config::{HealthCheckConfig, PxxlConfig};
 use pxxl_core::{route_allows_www_alias, EdgeState, RouteRegistry};
-use pxxl_database_proxy::{run_database_proxy, DatabaseProxyRoute, DatabaseRouteRegistry};
+use pxxl_database_proxy::{
+    load_database_routes_from_file, run_database_proxy, DatabaseProxyRoute, DatabaseRouteRegistry,
+};
 use pxxl_ddos::{BlacklistEngine, RateLimitConfig, RateLimiter, SecurityEngine};
 use pxxl_docker_discovery::{run_docker_polling, DockerDiscovery};
 use pxxl_geo::GeoIpResolver;
@@ -48,6 +50,7 @@ use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt, EnvFilte
 
 const DEFAULT_STATS_SNAPSHOT_PATH: &str = "/data/stats/domain-stats.json";
 const DEFAULT_ANALYTICS_SPOOL_DIR: &str = "/data/analytics-spool";
+const DEFAULT_DATABASE_ROUTES_PATH: &str = "/data/database-routes.json";
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -179,6 +182,7 @@ async fn main() -> Result<()> {
     let https_addr = parse_addr("listeners.https", &config.listeners.https)?;
     let admin_addr = parse_addr("listeners.admin", &config.listeners.admin)?;
     let metrics_addr = parse_addr("listeners.metrics", &config.listeners.metrics)?;
+    let database_routes_store_path = database_routes_store_path();
     let database_routes =
         DatabaseRouteRegistry::new(config.database_proxy.routes.iter().map(|route| {
             DatabaseProxyRoute {
@@ -189,6 +193,28 @@ async fn main() -> Result<()> {
                 public_port: route.public_port,
             }
         }));
+    match load_database_routes_from_file(&database_routes_store_path).await {
+        Ok(routes) => {
+            let count = routes.len();
+            for route in routes {
+                database_routes.upsert(route);
+            }
+            if count > 0 {
+                info!(
+                    path = %database_routes_store_path.display(),
+                    count,
+                    "loaded persisted database proxy routes"
+                );
+            }
+        }
+        Err(error) => {
+            warn!(
+                path = %database_routes_store_path.display(),
+                %error,
+                "could not load persisted database proxy routes"
+            );
+        }
+    }
 
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
     let database_port_proxy =
@@ -234,6 +260,7 @@ async fn main() -> Result<()> {
                 tls_status: tls_status.clone(),
                 route_store: Some(route_store.clone()),
                 database_routes: Some(database_routes.clone()),
+                database_routes_store_path: Some(database_routes_store_path.clone()),
                 database_port_proxy: database_port_proxy.clone(),
                 analytics: analytics_store.clone(),
                 auth: admin_auth,
@@ -1129,6 +1156,12 @@ fn database_port_proxy_manager(
         database_routes.clone(),
         shutdown,
     ))
+}
+
+fn database_routes_store_path() -> PathBuf {
+    std::env::var("PXXL_DATABASE_PROXY_ROUTES_PATH")
+        .unwrap_or_else(|_| DEFAULT_DATABASE_ROUTES_PATH.to_string())
+        .into()
 }
 
 fn database_proxy_public_port_range() -> (u16, u16) {

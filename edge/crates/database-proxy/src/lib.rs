@@ -5,10 +5,12 @@ use std::{
     collections::{BTreeMap, HashMap},
     env,
     net::SocketAddr,
+    path::Path,
     sync::Arc,
     time::Duration,
 };
 use tokio::{
+    fs,
     io::{self, AsyncReadExt, AsyncWriteExt},
     net::{TcpListener, TcpStream},
     sync::{watch, Semaphore},
@@ -31,6 +33,65 @@ pub struct DatabaseProxyRoute {
     pub route_host: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub public_port: Option<u16>,
+}
+
+pub async fn load_database_routes_from_file(
+    path: impl AsRef<Path>,
+) -> Result<Vec<DatabaseProxyRoute>> {
+    let path = path.as_ref();
+    let bytes = match fs::read(path).await {
+        Ok(bytes) => bytes,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(error) => return Err(error).with_context(|| format!("reading {}", path.display())),
+    };
+    if bytes.iter().all(u8::is_ascii_whitespace) {
+        return Ok(Vec::new());
+    }
+    serde_json::from_slice::<Vec<DatabaseProxyRoute>>(&bytes)
+        .with_context(|| format!("parsing {}", path.display()))
+}
+
+pub async fn save_database_routes_to_file(
+    path: impl AsRef<Path>,
+    routes: &[DatabaseProxyRoute],
+) -> Result<()> {
+    let path = path.as_ref();
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)
+            .await
+            .with_context(|| format!("creating {}", parent.display()))?;
+    }
+
+    let mut routes = routes.to_vec();
+    routes.sort_by(|left, right| {
+        (
+            left.database_type.as_str(),
+            left.key.as_str(),
+            left.route_host.as_deref().unwrap_or_default(),
+            left.public_port.unwrap_or_default(),
+        )
+            .cmp(&(
+                right.database_type.as_str(),
+                right.key.as_str(),
+                right.route_host.as_deref().unwrap_or_default(),
+                right.public_port.unwrap_or_default(),
+            ))
+    });
+
+    let bytes = serde_json::to_vec_pretty(&routes)?;
+    let temp_path = path.with_extension(format!(
+        "{}.tmp",
+        path.extension()
+            .and_then(|extension| extension.to_str())
+            .unwrap_or("json")
+    ));
+    fs::write(&temp_path, bytes)
+        .await
+        .with_context(|| format!("writing {}", temp_path.display()))?;
+    fs::rename(&temp_path, path)
+        .await
+        .with_context(|| format!("renaming {} to {}", temp_path.display(), path.display()))?;
+    Ok(())
 }
 
 #[derive(Clone, Debug, Default)]
