@@ -1329,6 +1329,25 @@ impl ApiServer {
                 }
                 self.download_public_certificate().await
             }
+            (Method::GET, path)
+                if path.starts_with("/v1/domains/") && path.ends_with("/cert/public") =>
+            {
+                if let Some(response) = require_scope(&principal, SCOPE_ROUTES_READ) {
+                    return response;
+                }
+                let domain = path
+                    .trim_start_matches("/v1/domains/")
+                    .trim_end_matches("/cert/public")
+                    .trim_matches('/');
+                if domain.is_empty() {
+                    return json_response(
+                        StatusCode::BAD_REQUEST,
+                        json!({"error": "missing domain"}),
+                    );
+                }
+                self.download_domain_public_certificate(&normalize_domain(domain))
+                    .await
+            }
             (Method::POST, path) if path.starts_with("/v1/blacklist/") => {
                 if let Some(response) = require_scope(&principal, SCOPE_ROUTES_WRITE) {
                     return response;
@@ -1761,13 +1780,34 @@ impl ApiServer {
 
     async fn download_public_certificate(&self) -> Response<BoxBody> {
         let cert_path = PathBuf::from(&self.cert_dir).join("local-dev-cert.pem");
-        match tokio::fs::read_to_string(&cert_path).await {
+        self.download_certificate_file(&cert_path, "pxxl-proxy-public-cert.pem")
+            .await
+    }
+
+    async fn download_domain_public_certificate(&self, domain: &str) -> Response<BoxBody> {
+        let domain_cert_path = domain_certificate_path(&self.cert_dir, domain);
+        let fallback_cert_path = PathBuf::from(&self.cert_dir).join("local-dev-cert.pem");
+        let cert_path = if tokio::fs::metadata(&domain_cert_path).await.is_ok() {
+            domain_cert_path
+        } else {
+            fallback_cert_path
+        };
+        let filename = format!("{}_public_certificate.pem", safe_domain_cert_name(domain));
+        self.download_certificate_file(&cert_path, &filename).await
+    }
+
+    async fn download_certificate_file(
+        &self,
+        cert_path: &Path,
+        filename: &str,
+    ) -> Response<BoxBody> {
+        match tokio::fs::read_to_string(cert_path).await {
             Ok(pem) => Response::builder()
                 .status(StatusCode::OK)
                 .header("content-type", "application/x-pem-file")
                 .header(
                     "content-disposition",
-                    "attachment; filename=\"pxxl-proxy-public-cert.pem\"",
+                    format!("attachment; filename=\"{filename}\""),
                 )
                 .body(
                     Full::new(Bytes::from(pem))
