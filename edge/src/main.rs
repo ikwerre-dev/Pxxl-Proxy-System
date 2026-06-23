@@ -50,7 +50,7 @@ use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt, EnvFilte
 
 const DEFAULT_STATS_SNAPSHOT_PATH: &str = "/data/stats/domain-stats.json";
 const DEFAULT_ANALYTICS_SPOOL_DIR: &str = "/data/analytics-spool";
-const DEFAULT_DATABASE_ROUTES_PATH: &str = "/data/database-routes.json";
+const DEFAULT_DATABASE_ROUTES_PATH: &str = "/data/database-routes/routes.json";
 
 #[tokio::main]
 async fn main() -> Result<()> {

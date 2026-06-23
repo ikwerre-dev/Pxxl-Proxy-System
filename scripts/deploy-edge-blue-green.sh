@@ -31,6 +31,10 @@ CANDIDATE_ADMIN_PORT="${PXXL_EDGE_CANDIDATE_ADMIN_PORT:-18081}"
 CANDIDATE_METRICS_PORT="${PXXL_EDGE_CANDIDATE_METRICS_PORT:-19090}"
 DATABASE_PROXY_ENABLED="${PXXL_EDGE_DATABASE_PROXY_ENABLED_OVERRIDE:-${PXXL_DATABASE_PROXY_ENABLED:-false}}"
 DATABASE_PROXY_PUBLIC_PORTS_EXPOSED="${PXXL_DATABASE_PROXY_PUBLIC_PORTS_EXPOSED:-${DATABASE_PROXY_ENABLED}}"
+DATABASE_PROXY_ROUTES_PATH="${PXXL_DATABASE_PROXY_ROUTES_PATH:-/data/database-routes/routes.json}"
+if [ "${DATABASE_PROXY_ROUTES_PATH%/*}" = "/data" ]; then
+  DATABASE_PROXY_ROUTES_PATH="/data/database-routes/routes.json"
+fi
 
 if [ "$PULL_LATEST" = true ] && git rev-parse --is-inside-work-tree >/dev/null 2>&1; then
   branch="$(git rev-parse --abbrev-ref HEAD)"
@@ -44,6 +48,14 @@ fi
 sha="$(git rev-parse --short=12 HEAD)"
 image="localhost/pxxl-edge:${sha}"
 candidate="${EDGE_NAME}-candidate-${sha}"
+
+database_routes_dir="${DATABASE_PROXY_ROUTES_PATH%/*}"
+case "$database_routes_dir" in
+  /data/*) database_routes_host_dir="$PWD/data/${database_routes_dir#/data/}" ;;
+  *) die "PXXL_DATABASE_PROXY_ROUTES_PATH must live under /data" ;;
+esac
+mkdir -p "$database_routes_host_dir"
+chmod 0777 "$database_routes_host_dir"
 
 cleanup_candidate() {
   podman rm -f "$candidate" >/dev/null 2>&1 || true
@@ -114,7 +126,7 @@ common_env=(
   -e "PXXL_DATABASE_PROXY_ENABLED=${DATABASE_PROXY_ENABLED}"
   -e "PXXL_DATABASE_PROXY_PUBLIC_BIND_HOST=${PXXL_DATABASE_PROXY_PUBLIC_BIND_HOST:-0.0.0.0}"
   -e "PXXL_DATABASE_PROXY_PUBLIC_PORT_RANGE=${PXXL_DATABASE_PROXY_PUBLIC_PORT_RANGE:-35000-35999}"
-  -e "PXXL_DATABASE_PROXY_ROUTES_PATH=${PXXL_DATABASE_PROXY_ROUTES_PATH:-/data/database-routes.json}"
+  -e "PXXL_DATABASE_PROXY_ROUTES_PATH=${DATABASE_PROXY_ROUTES_PATH}"
   -e "PXXL_TRUSTED_CLIENT_IP_CIDRS=${PXXL_TRUSTED_CLIENT_IP_CIDRS:-${PXXL_TRUSTED_PROXY_CIDRS:-10.88.0.0/16,10.89.0.0/16,127.0.0.1/32,::1/128}}"
   -e "RUST_LOG=${RUST_LOG:-pxxl_edge=info,pxxl=info}"
 )
