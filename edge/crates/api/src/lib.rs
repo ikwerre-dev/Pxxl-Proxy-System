@@ -1155,6 +1155,25 @@ impl ApiServer {
                 }
                 self.resync_domain_certificate(domain).await
             }
+            (Method::GET, path)
+                if path.starts_with("/v1/domains/") && path.ends_with("/cert/public") =>
+            {
+                if let Some(response) = require_scope(&principal, SCOPE_ROUTES_READ) {
+                    return response;
+                }
+                let domain = path
+                    .trim_start_matches("/v1/domains/")
+                    .trim_end_matches("/cert/public")
+                    .trim_matches('/');
+                if domain.is_empty() {
+                    return json_response(
+                        StatusCode::BAD_REQUEST,
+                        json!({"error": "missing domain"}),
+                    );
+                }
+                self.download_domain_public_certificate(&normalize_domain(domain))
+                    .await
+            }
             (Method::GET, path) if path.starts_with("/v1/domains/") => {
                 if let Some(response) = require_scope(&principal, SCOPE_ROUTES_READ) {
                     return response;
@@ -1328,25 +1347,6 @@ impl ApiServer {
                     return response;
                 }
                 self.download_public_certificate().await
-            }
-            (Method::GET, path)
-                if path.starts_with("/v1/domains/") && path.ends_with("/cert/public") =>
-            {
-                if let Some(response) = require_scope(&principal, SCOPE_ROUTES_READ) {
-                    return response;
-                }
-                let domain = path
-                    .trim_start_matches("/v1/domains/")
-                    .trim_end_matches("/cert/public")
-                    .trim_matches('/');
-                if domain.is_empty() {
-                    return json_response(
-                        StatusCode::BAD_REQUEST,
-                        json!({"error": "missing domain"}),
-                    );
-                }
-                self.download_domain_public_certificate(&normalize_domain(domain))
-                    .await
             }
             (Method::POST, path) if path.starts_with("/v1/blacklist/") => {
                 if let Some(response) = require_scope(&principal, SCOPE_ROUTES_WRITE) {
