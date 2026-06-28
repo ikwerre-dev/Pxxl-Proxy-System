@@ -822,7 +822,8 @@ impl ApiServer {
                 }
                 self.create_domain(req).await
             }
-            (Method::GET, "/internal/routes/snapshot") => {
+            (Method::GET, "/internal/routes/snapshot")
+            | (Method::GET, "/internal/route-snapshot") => {
                 if let Some(response) = require_scope(&principal, SCOPE_ROUTES_READ) {
                     return response;
                 }
@@ -833,7 +834,8 @@ impl ApiServer {
                     }),
                 )
             }
-            (Method::POST, "/internal/routes/reconcile") => {
+            (Method::POST, "/internal/routes/reconcile")
+            | (Method::POST, "/internal/route-reconcile") => {
                 if let Some(response) = require_scope(&principal, SCOPE_ROUTES_WRITE) {
                     return response;
                 }
