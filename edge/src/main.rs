@@ -1166,18 +1166,18 @@ fn database_routes_store_path() -> PathBuf {
 
 fn database_proxy_public_port_range() -> (u16, u16) {
     let raw = std::env::var("PXXL_DATABASE_PROXY_PUBLIC_PORT_RANGE")
-        .unwrap_or_else(|_| "10000-65000".to_string());
+        .unwrap_or_else(|_| "25000-40000".to_string());
     let mut parts = raw.splitn(2, '-');
     let min = parts
         .next()
         .and_then(|value| value.trim().parse::<u16>().ok())
-        .unwrap_or(10000);
+        .unwrap_or(25000);
     let max = parts
         .next()
         .and_then(|value| value.trim().parse::<u16>().ok())
-        .unwrap_or(65000);
+        .unwrap_or(40000);
     if min > max {
-        return (10000, 65000);
+        return (25000, 40000);
     }
     (min, max)
 }
