@@ -32,6 +32,7 @@ CANDIDATE_METRICS_PORT="${PXXL_EDGE_CANDIDATE_METRICS_PORT:-19090}"
 DATABASE_PROXY_ENABLED="${PXXL_EDGE_DATABASE_PROXY_ENABLED_OVERRIDE:-${PXXL_DATABASE_PROXY_ENABLED:-false}}"
 DATABASE_PROXY_PUBLIC_PORTS_EXPOSED="${PXXL_DATABASE_PROXY_PUBLIC_PORTS_EXPOSED:-${DATABASE_PROXY_ENABLED}}"
 DATABASE_PROXY_ROUTES_PATH="${PXXL_DATABASE_PROXY_ROUTES_PATH:-/data/database-routes/routes.json}"
+HTTP_ROUTE_SNAPSHOT_PATH="${PXXL_ROUTE_SNAPSHOT_PATH:-/data/routes/routes.snapshot.json}"
 if [ "${DATABASE_PROXY_ROUTES_PATH%/*}" = "/data" ]; then
   DATABASE_PROXY_ROUTES_PATH="/data/database-routes/routes.json"
 fi
@@ -56,6 +57,13 @@ case "$database_routes_dir" in
 esac
 mkdir -p "$database_routes_host_dir"
 chmod 0777 "$database_routes_host_dir"
+http_routes_dir="${HTTP_ROUTE_SNAPSHOT_PATH%/*}"
+case "$http_routes_dir" in
+  /data/*) http_routes_host_dir="$PWD/data/${http_routes_dir#/data/}" ;;
+  *) die "PXXL_ROUTE_SNAPSHOT_PATH must live under /data" ;;
+esac
+mkdir -p "$http_routes_host_dir"
+chmod 0777 "$http_routes_host_dir"
 
 cleanup_candidate() {
   podman rm -f "$candidate" >/dev/null 2>&1 || true
@@ -123,7 +131,7 @@ common_env=(
   -e "PXXL_ACME_EMAIL=${PXXL_ACME_EMAIL:-admin@pxxl.app}"
   -e "PXXL_STATS_SNAPSHOT_PATH=${PXXL_STATS_SNAPSHOT_PATH:-/data/stats/domain-stats.json}"
   -e "PXXL_STATS_SNAPSHOT_INTERVAL_SECONDS=${PXXL_STATS_SNAPSHOT_INTERVAL_SECONDS:-10}"
-  -e "PXXL_ROUTE_SNAPSHOT_PATH=${PXXL_ROUTE_SNAPSHOT_PATH:-/data/routes.snapshot.json}"
+  -e "PXXL_ROUTE_SNAPSHOT_PATH=${HTTP_ROUTE_SNAPSHOT_PATH}"
   -e "PXXL_DATABASE_PROXY_ENABLED=${DATABASE_PROXY_ENABLED}"
   -e "PXXL_DATABASE_PROXY_PUBLIC_BIND_HOST=${PXXL_DATABASE_PROXY_PUBLIC_BIND_HOST:-0.0.0.0}"
   -e "PXXL_DATABASE_PROXY_PUBLIC_PORT_RANGE=${PXXL_DATABASE_PROXY_PUBLIC_PORT_RANGE:-25000-40000}"
