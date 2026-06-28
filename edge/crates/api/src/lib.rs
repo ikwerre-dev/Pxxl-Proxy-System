@@ -64,6 +64,7 @@ struct ApiServer {
     route_store: Option<RedisRouteStore>,
     database_routes: Option<DatabaseRouteRegistry>,
     database_routes_store_path: Option<PathBuf>,
+    route_snapshot_path: Option<PathBuf>,
     database_port_proxy: Option<DatabasePortProxyManager>,
     analytics: Option<ClickHouseAnalytics>,
     auth: AdminApiAuth,
@@ -77,6 +78,7 @@ pub struct AdminApiRuntime {
     pub route_store: Option<RedisRouteStore>,
     pub database_routes: Option<DatabaseRouteRegistry>,
     pub database_routes_store_path: Option<PathBuf>,
+    pub route_snapshot_path: Option<PathBuf>,
     pub database_port_proxy: Option<DatabasePortProxyManager>,
     pub analytics: Option<ClickHouseAnalytics>,
     pub auth: AdminApiAuth,
@@ -285,6 +287,39 @@ struct DomainRouteBody {
 }
 
 #[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct InternalRouteBody {
+    #[serde(default)]
+    host: Option<String>,
+    #[serde(default)]
+    domain: Option<String>,
+    #[serde(default)]
+    path: Option<String>,
+    #[serde(default)]
+    project_id: Option<String>,
+    #[serde(default)]
+    deployment_id: Option<String>,
+    #[serde(default)]
+    container_id: Option<String>,
+    #[serde(default)]
+    upstream: Option<String>,
+    #[serde(default)]
+    upstream_url: Option<String>,
+    #[serde(default)]
+    upstream_host: Option<String>,
+    #[serde(default)]
+    upstream_port: Option<u16>,
+    #[serde(default)]
+    route_version: Option<u64>,
+    #[serde(default)]
+    status: Option<String>,
+    #[serde(default)]
+    tls: Option<bool>,
+    #[serde(default)]
+    rules: DomainRules,
+}
+
+#[derive(Debug, Deserialize)]
 struct PathBody {
     #[serde(default = "root_path")]
     prefix: String,
@@ -362,6 +397,7 @@ pub async fn run_admin_api(
         route_store: runtime.route_store,
         database_routes: runtime.database_routes,
         database_routes_store_path: runtime.database_routes_store_path,
+        route_snapshot_path: runtime.route_snapshot_path,
         database_port_proxy: runtime.database_port_proxy,
         analytics: runtime.analytics,
         auth: runtime.auth,
@@ -785,6 +821,66 @@ impl ApiServer {
                     return response;
                 }
                 self.create_domain(req).await
+            }
+            (Method::GET, "/internal/routes/snapshot") => {
+                if let Some(response) = require_scope(&principal, SCOPE_ROUTES_READ) {
+                    return response;
+                }
+                json_response(
+                    StatusCode::OK,
+                    json!({
+                        "routes": redact_routes(api_routes_snapshot(&self.state)),
+                    }),
+                )
+            }
+            (Method::POST, "/internal/routes/reconcile") => {
+                if let Some(response) = require_scope(&principal, SCOPE_ROUTES_WRITE) {
+                    return response;
+                }
+                if let Err(error) = self.persist_route_snapshot().await {
+                    return json_response(
+                        StatusCode::BAD_GATEWAY,
+                        json!({"error": format!("route reconcile snapshot failed: {error}")}),
+                    );
+                }
+                json_response(
+                    StatusCode::OK,
+                    json!({
+                        "status": "reconciled",
+                        "routes": api_routes_snapshot(&self.state).len(),
+                    }),
+                )
+            }
+            (Method::PUT, path) if path.starts_with("/internal/routes/") => {
+                if let Some(response) = require_scope(&principal, SCOPE_ROUTES_WRITE) {
+                    return response;
+                }
+                self.upsert_internal_route(req, path).await
+            }
+            (Method::GET, path) if path.starts_with("/internal/routes/") => {
+                if let Some(response) = require_scope(&principal, SCOPE_ROUTES_READ) {
+                    return response;
+                }
+                let domain =
+                    normalize_domain(path.trim_start_matches("/internal/routes/").trim_matches('/'));
+                if domain.is_empty() {
+                    return json_response(
+                        StatusCode::BAD_REQUEST,
+                        json!({"error": "missing host"}),
+                    );
+                }
+                match self.state.routes.find_domain(&domain) {
+                    Some(route) if route.source == RouteSource::Api => {
+                        json_response(StatusCode::OK, json!({ "route": redact_route(route) }))
+                    }
+                    _ => json_response(StatusCode::NOT_FOUND, json!({"error": "route not found"})),
+                }
+            }
+            (Method::DELETE, path) if path.starts_with("/internal/routes/") => {
+                if let Some(response) = require_scope(&principal, SCOPE_ROUTES_WRITE) {
+                    return response;
+                }
+                self.delete_internal_route(path).await
             }
             (Method::POST, "/v1/auth/login") => self.login(req, remote_ip).await,
             (Method::POST, "/v1/auth/tokens") => {
@@ -1223,6 +1319,12 @@ impl ApiServer {
                     },
                     None => false,
                 };
+                if let Err(error) = self.persist_route_snapshot().await {
+                    return json_response(
+                        StatusCode::BAD_GATEWAY,
+                        json!({"error": format!("failed to persist route snapshot: {error}")}),
+                    );
+                }
                 json_response(
                     StatusCode::OK,
                     json!({
@@ -1498,6 +1600,135 @@ impl ApiServer {
         )
     }
 
+    async fn persist_route_snapshot(&self) -> Result<(), BoxError> {
+        let Some(path) = &self.route_snapshot_path else {
+            return Ok(());
+        };
+        save_http_routes_to_file(path, &api_routes_snapshot(&self.state)).await
+    }
+
+    async fn persist_route_stores(&self, route: &Route) -> Result<(), String> {
+        if let Some(store) = &self.route_store {
+            store
+                .upsert_route(route)
+                .await
+                .map_err(|error| format!("failed to persist Redis route: {error}"))?;
+        }
+        self.persist_route_snapshot()
+            .await
+            .map_err(|error| format!("failed to persist route snapshot: {error}"))?;
+        Ok(())
+    }
+
+    async fn upsert_internal_route(
+        &self,
+        req: Request<Incoming>,
+        path: &str,
+    ) -> Response<BoxBody> {
+        let path_host = normalize_domain(
+            path.trim_start_matches("/internal/routes/")
+                .trim_matches('/'),
+        );
+        if path_host.is_empty() {
+            return json_response(StatusCode::BAD_REQUEST, json!({"error": "missing host"}));
+        }
+
+        let collected = match collect_admin_body(req.into_body()).await {
+            Ok(collected) => collected,
+            Err(ApiBodyError::TooLarge) => {
+                return json_response(
+                    StatusCode::PAYLOAD_TOO_LARGE,
+                    json!({"error": "request body is too large"}),
+                );
+            }
+            Err(ApiBodyError::Body(error)) => {
+                return json_response(StatusCode::BAD_REQUEST, json!({"error": error}));
+            }
+        };
+        let body = match serde_json::from_slice::<InternalRouteBody>(&collected) {
+            Ok(body) => body,
+            Err(error) => {
+                return json_response(StatusCode::BAD_REQUEST, json!({"error": error.to_string()}));
+            }
+        };
+        let route = match body.into_route(path_host.clone()) {
+            Ok(route) => route,
+            Err(error) => return json_response(StatusCode::BAD_REQUEST, json!({"error": error})),
+        };
+        if route.domain != path_host {
+            return json_response(
+                StatusCode::BAD_REQUEST,
+                json!({"error": "route host does not match URL host"}),
+            );
+        }
+        if let Some(existing) = self.state.routes.find_domain(&route.domain) {
+            if existing.source == RouteSource::Api && existing.route_version > route.route_version {
+                return json_response(
+                    StatusCode::CONFLICT,
+                    json!({
+                        "error": "stale route update",
+                        "host": route.domain,
+                        "current_route_version": existing.route_version,
+                        "route_version": route.route_version,
+                    }),
+                );
+            }
+        }
+        if let Err(error) = validate_api_route_network_safety(&route).await {
+            return json_response(StatusCode::BAD_REQUEST, json!({"error": error}));
+        }
+
+        self.state.upsert_api_route(route.clone());
+        if let Err(error) = self.persist_route_stores(&route).await {
+            return json_response(StatusCode::BAD_GATEWAY, json!({"error": error}));
+        }
+        json_response(
+            StatusCode::OK,
+            json!({
+                "status": "active",
+                "host": route.domain,
+                "route_version": route.route_version,
+                "route": redact_route(route),
+            }),
+        )
+    }
+
+    async fn delete_internal_route(&self, path: &str) -> Response<BoxBody> {
+        let domain =
+            normalize_domain(path.trim_start_matches("/internal/routes/").trim_matches('/'));
+        if domain.is_empty() {
+            return json_response(StatusCode::BAD_REQUEST, json!({"error": "missing host"}));
+        }
+        let memory_deleted = self.state.delete_api_domain(&domain);
+        let store_deleted = match &self.route_store {
+            Some(store) => match store.delete_domain(&domain).await {
+                Ok(deleted) => deleted,
+                Err(error) => {
+                    return json_response(
+                        StatusCode::BAD_GATEWAY,
+                        json!({"error": format!("failed to delete Redis route: {error}")}),
+                    );
+                }
+            },
+            None => false,
+        };
+        if let Err(error) = self.persist_route_snapshot().await {
+            return json_response(
+                StatusCode::BAD_GATEWAY,
+                json!({"error": format!("failed to persist route snapshot: {error}")}),
+            );
+        }
+        json_response(
+            StatusCode::OK,
+            json!({
+                "status": "deleted",
+                "host": domain,
+                "memory_deleted": memory_deleted,
+                "store_deleted": store_deleted,
+            }),
+        )
+    }
+
     async fn delete_database_route(&self, path: &str) -> Response<BoxBody> {
         let Some(registry) = &self.database_routes else {
             return json_response(
@@ -1574,16 +1805,10 @@ impl ApiServer {
             );
         }
 
-        if let Some(store) = &self.route_store {
-            if let Err(error) = store.upsert_route(&route).await {
-                return json_response(
-                    StatusCode::BAD_GATEWAY,
-                    json!({"error": format!("failed to persist Redis route: {error}")}),
-                );
-            }
-        }
-
         self.state.upsert_api_route(route.clone());
+        if let Err(error) = self.persist_route_stores(&route).await {
+            return json_response(StatusCode::BAD_GATEWAY, json!({"error": error}));
+        }
         let certificate = self.certificate_status(Some(&route.domain)).await;
         json_response(
             StatusCode::CREATED,
@@ -2072,6 +2297,84 @@ impl DomainRouteBody {
     }
 }
 
+impl InternalRouteBody {
+    fn into_route(self, fallback_host: String) -> Result<Route, String> {
+        let domain = normalize_domain(
+            self.host
+                .as_deref()
+                .or(self.domain.as_deref())
+                .unwrap_or(&fallback_host),
+        );
+        if domain.is_empty() {
+            return Err("host is required".to_string());
+        }
+        let upstream_url = self.upstream_url().ok_or_else(|| {
+            "upstream or upstreamHost/upstreamPort is required for route update".to_string()
+        })?;
+        let mut route = Route::new(
+            domain.clone(),
+            vec![PathRoute::new(
+                self.path.unwrap_or_else(root_path),
+                vec![Upstream::new(upstream_url)],
+            )],
+            RouteSource::Api,
+        )
+        .with_id(format!("runtime-{domain}"));
+        route.tls = self.tls.unwrap_or(true);
+        route.route_version = self.route_version.unwrap_or(0);
+        route.rules = self.rules;
+        route.rules.allow_websocket = true;
+        route.rules.www_alias = true;
+        if let Some(project_id) = self.project_id.filter(|value| !value.trim().is_empty()) {
+            route
+                .rules
+                .add_request_headers
+                .insert("x-pxxl-project-id".to_string(), project_id);
+        }
+        if let Some(deployment_id) = self.deployment_id.filter(|value| !value.trim().is_empty()) {
+            route
+                .rules
+                .add_request_headers
+                .insert("x-pxxl-deployment-id".to_string(), deployment_id);
+        }
+        if let Some(container_id) = self.container_id.filter(|value| !value.trim().is_empty()) {
+            route
+                .rules
+                .add_request_headers
+                .insert("x-pxxl-container-id".to_string(), container_id);
+        }
+        if let Some(status) = self.status.filter(|value| !value.trim().is_empty()) {
+            route
+                .rules
+                .add_request_headers
+                .insert("x-pxxl-route-status".to_string(), status);
+        }
+        route.validate_for_dynamic_control_plane()?;
+        Ok(route)
+    }
+
+    fn upstream_url(&self) -> Option<String> {
+        if let Some(upstream) = self
+            .upstream
+            .as_deref()
+            .or(self.upstream_url.as_deref())
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+        {
+            if upstream.starts_with("http://") || upstream.starts_with("https://") {
+                return Some(upstream.to_string());
+            }
+            return Some(format!("http://{upstream}"));
+        }
+        let host = self.upstream_host.as_deref()?.trim();
+        let port = self.upstream_port?;
+        if host.is_empty() || port == 0 {
+            return None;
+        }
+        Some(format!("http://{host}:{port}"))
+    }
+}
+
 impl UpstreamBody {
     fn into_upstream(self) -> Upstream {
         Upstream {
@@ -2226,6 +2529,46 @@ fn hmac_sha256(key: &[u8], data: &[u8]) -> [u8; 32] {
 
 fn redact_routes(routes: Vec<Route>) -> Vec<Route> {
     routes.into_iter().map(redact_route).collect()
+}
+
+fn api_routes_snapshot(state: &EdgeState) -> Vec<Route> {
+    let mut routes = state
+        .routes
+        .snapshot()
+        .into_iter()
+        .filter(|route| route.source == RouteSource::Api)
+        .collect::<Vec<_>>();
+    routes.sort_by(|left, right| left.domain.cmp(&right.domain).then(left.id.cmp(&right.id)));
+    routes
+}
+
+pub async fn save_http_routes_to_file(path: &Path, routes: &[Route]) -> Result<(), BoxError> {
+    if let Some(parent) = path.parent() {
+        tokio::fs::create_dir_all(parent).await?;
+    }
+    let bytes = serde_json::to_vec_pretty(routes)?;
+    let temp_path = path.with_extension("json.tmp");
+    tokio::fs::write(&temp_path, bytes).await?;
+    tokio::fs::rename(&temp_path, path).await?;
+    Ok(())
+}
+
+pub async fn load_http_routes_from_file(path: &Path) -> Result<Vec<Route>, BoxError> {
+    let bytes = tokio::fs::read(path).await?;
+    if bytes.is_empty() {
+        return Ok(Vec::new());
+    }
+    let routes = serde_json::from_slice::<Vec<Route>>(&bytes)?
+        .into_iter()
+        .map(|mut route| {
+            route.source = RouteSource::Api;
+            route.domain = normalize_domain(&route.domain);
+            route
+        })
+        .filter(|route| !route.domain.is_empty())
+        .take(MAX_ROUTES_PER_SOURCE)
+        .collect::<Vec<_>>();
+    Ok(routes)
 }
 
 async fn copy_certbot_bundle(

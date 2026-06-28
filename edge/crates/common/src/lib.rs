@@ -883,6 +883,8 @@ pub struct Route {
     #[serde(default)]
     pub rules: DomainRules,
     pub source: RouteSource,
+    #[serde(default)]
+    pub route_version: u64,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
 }
@@ -903,6 +905,7 @@ impl Route {
             algorithm: LoadBalancingAlgorithm::RoundRobin,
             rules: DomainRules::default(),
             source,
+            route_version: 0,
             created_at: now,
             updated_at: now,
         }

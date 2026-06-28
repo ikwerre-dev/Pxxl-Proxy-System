@@ -8,8 +8,9 @@ use hyper_util::{
     rt::TokioExecutor,
 };
 use pxxl_api::{
-    run_admin_api, run_metrics_server, AdminApiAuth, AdminApiRuntime, AdminLoginAccount,
-    DatabasePortProxyManager, MetricsAuth, TlsCertificateRuntimeStatus,
+    load_http_routes_from_file, run_admin_api, run_metrics_server, save_http_routes_to_file,
+    AdminApiAuth, AdminApiRuntime, AdminLoginAccount, DatabasePortProxyManager, MetricsAuth,
+    TlsCertificateRuntimeStatus,
 };
 use pxxl_common::{ip_allowed_for_upstream, parse_ip_net, PathRoute, Route, RouteSource, Upstream};
 use pxxl_config::{HealthCheckConfig, PxxlConfig};
@@ -51,6 +52,7 @@ use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt, EnvFilte
 const DEFAULT_STATS_SNAPSHOT_PATH: &str = "/data/stats/domain-stats.json";
 const DEFAULT_ANALYTICS_SPOOL_DIR: &str = "/data/analytics-spool";
 const DEFAULT_DATABASE_ROUTES_PATH: &str = "/data/database-routes/routes.json";
+const DEFAULT_ROUTE_SNAPSHOT_PATH: &str = "/var/lib/pxxl-proxy/routes.snapshot.json";
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -74,6 +76,28 @@ async fn main() -> Result<()> {
     ensure_production_safe_config(&config)?;
 
     let mut initial_routes = config.static_routes()?;
+    let route_snapshot_path = route_snapshot_path();
+    match load_http_routes_from_file(&route_snapshot_path).await {
+        Ok(routes) => {
+            let count = routes.len();
+            initial_routes.extend(routes);
+            if count > 0 {
+                info!(
+                    count,
+                    path = %route_snapshot_path.display(),
+                    "loaded persisted HTTP route snapshot"
+                );
+            }
+        }
+        Err(error) if route_snapshot_path.exists() => {
+            warn!(
+                %error,
+                path = %route_snapshot_path.display(),
+                "could not load persisted HTTP route snapshot"
+            );
+        }
+        Err(_) => {}
+    }
     let route_store = RedisRouteStore::new(config.redis.url.clone(), "pxxl:routes");
     match route_store.load_routes().await {
         Ok(routes) => {
@@ -261,6 +285,7 @@ async fn main() -> Result<()> {
                 route_store: Some(route_store.clone()),
                 database_routes: Some(database_routes.clone()),
                 database_routes_store_path: Some(database_routes_store_path.clone()),
+                route_snapshot_path: Some(route_snapshot_path.clone()),
                 database_port_proxy: database_port_proxy.clone(),
                 analytics: analytics_store.clone(),
                 auth: admin_auth,
@@ -301,6 +326,7 @@ async fn main() -> Result<()> {
             "pxxl:route_events".to_string(),
             state.clone(),
             route_store.clone(),
+            route_snapshot_path.clone(),
             shutdown_rx.clone(),
         )));
     }
@@ -445,6 +471,14 @@ fn analytics_spool_dir() -> PathBuf {
         .unwrap_or_else(|| PathBuf::from(DEFAULT_ANALYTICS_SPOOL_DIR))
 }
 
+fn route_snapshot_path() -> PathBuf {
+    std::env::var("PXXL_ROUTE_SNAPSHOT_PATH")
+        .ok()
+        .filter(|path| !path.trim().is_empty())
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from(DEFAULT_ROUTE_SNAPSHOT_PATH))
+}
+
 async fn load_domain_stats_snapshot(state: &EdgeState, path: &Path) -> Result<usize> {
     if !path.exists() {
         return Ok(0);
@@ -510,6 +544,7 @@ async fn run_route_event_consumer(
     stream: String,
     state: EdgeState,
     route_store: RedisRouteStore,
+    route_snapshot_path: PathBuf,
     mut shutdown: watch::Receiver<bool>,
 ) -> Result<()> {
     let client = redis::Client::open(redis_url.as_str())?;
@@ -537,7 +572,7 @@ async fn run_route_event_consumer(
                             for id in key.ids {
                                 last_id = id.id.clone();
                                 if let Some(event) = runtime_route_event_from_fields(id.map) {
-                                    if let Err(error) = apply_runtime_route_event(&state, &route_store, event).await {
+                                    if let Err(error) = apply_runtime_route_event(&state, &route_store, &route_snapshot_path, event).await {
                                         warn!(%error, "failed to apply runtime route event");
                                     }
                                 }
@@ -570,6 +605,7 @@ fn runtime_route_event_from_fields(
 async fn apply_runtime_route_event(
     state: &EdgeState,
     route_store: &RedisRouteStore,
+    route_snapshot_path: &Path,
     event: RuntimeRouteEvent,
 ) -> Result<()> {
     let event_type = event.event_type.trim();
@@ -608,6 +644,9 @@ async fn apply_runtime_route_event(
         .map_err(|reason| anyhow::anyhow!("invalid runtime route event for {domain}: {reason}"))?;
     state.routes.upsert_api_route(route.clone());
     route_store.upsert_route(&route).await?;
+    save_http_routes_to_file(route_snapshot_path, &api_routes_for_snapshot(state))
+        .await
+        .map_err(|error| anyhow::anyhow!("persist route snapshot: {error}"))?;
     info!(
         domain = %domain,
         upstream = %upstream_url,
@@ -617,6 +656,17 @@ async fn apply_runtime_route_event(
         "applied runtime route event"
     );
     Ok(())
+}
+
+fn api_routes_for_snapshot(state: &EdgeState) -> Vec<Route> {
+    let mut routes = state
+        .routes
+        .snapshot()
+        .into_iter()
+        .filter(|route| route.source == RouteSource::Api)
+        .collect::<Vec<_>>();
+    routes.sort_by(|left, right| left.domain.cmp(&right.domain).then(left.id.cmp(&right.id)));
+    routes
 }
 
 fn runtime_route_upstream_url(event: &RuntimeRouteEvent) -> String {
