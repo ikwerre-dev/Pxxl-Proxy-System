@@ -107,7 +107,11 @@ remove_redirects() {
 trap 'remove_redirects; cleanup_candidate' EXIT
 
 log "Building candidate image while current edge keeps serving"
-podman build -f ./edge/docker/Dockerfile -t "$image" .
+build_args=(-f ./edge/docker/Dockerfile -t "$image")
+if [ "${PXXL_EDGE_BUILD_NO_CACHE:-false}" = "true" ]; then
+  build_args=(--no-cache "${build_args[@]}")
+fi
+podman build "${build_args[@]}" .
 
 cleanup_candidate
 
