@@ -18,7 +18,7 @@ use pxxl_core::{route_allows_www_alias, EdgeState, RouteRegistry};
 use pxxl_database_proxy::{
     load_database_routes_from_file, run_database_proxy, DatabaseProxyRoute, DatabaseRouteRegistry,
 };
-use pxxl_ddos::{BlacklistEngine, RateLimitConfig, RateLimiter, SecurityEngine};
+use pxxl_ddos::{AdaptiveBlocker, BlacklistEngine, RateLimitConfig, RateLimiter, SecurityEngine};
 use pxxl_docker_discovery::{run_docker_polling, DockerDiscovery};
 use pxxl_geo::GeoIpResolver;
 use pxxl_http_proxy::{
@@ -117,7 +117,12 @@ async fn main() -> Result<()> {
         requests_per_second: config.security.rate_limits.requests_per_second,
         burst: config.security.rate_limits.burst,
     }));
-    let security = Arc::new(SecurityEngine::new(blacklist, rate_limiter));
+    let adaptive_blocker = Arc::new(AdaptiveBlocker::new(config.security.auto_block.clone()));
+    let security = Arc::new(SecurityEngine::new_with_adaptive_blocker(
+        blacklist,
+        rate_limiter,
+        adaptive_blocker,
+    ));
     let routes = Arc::new(RouteRegistry::new(initial_routes));
     let load_balancer = Arc::new(LoadBalancer::new());
     let (analytics_tx, analytics_rx) = if config.storage.analytics_enabled {

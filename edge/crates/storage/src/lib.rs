@@ -308,7 +308,8 @@ fn numeric_field(row: &serde_json::Value, key: &str) -> u64 {
     if let Some(number) = value.as_u64() {
         return number;
     }
-    value.as_str()
+    value
+        .as_str()
         .and_then(|text| text.parse::<u64>().ok())
         .unwrap_or(0)
 }
@@ -695,8 +696,9 @@ LIMIT {limit}
             .map(|domain| clickhouse_string_literal(domain))
             .collect::<Vec<_>>()
             .join(",");
-        let top_countries = self.query_json_cached(&format!(
-            r#"
+        let top_countries = self
+            .query_json_cached(&format!(
+                r#"
 SELECT domain, code, name, count
 FROM (
     SELECT
@@ -711,9 +713,11 @@ FROM (
 ORDER BY domain ASC, count DESC
 LIMIT {CLICKHOUSE_ROLLUP_TOP_COUNTRIES_PER_DOMAIN} BY domain
 "#
-        )).await?;
-        let top_continents = self.query_json_cached(&format!(
-            r#"
+            ))
+            .await?;
+        let top_continents = self
+            .query_json_cached(&format!(
+                r#"
 SELECT domain, code, name, count
 FROM (
     SELECT
@@ -728,9 +732,11 @@ FROM (
 ORDER BY domain ASC, count DESC
 LIMIT {CLICKHOUSE_ROLLUP_TOP_CONTINENTS_PER_DOMAIN} BY domain
 "#
-        )).await?;
-        let top_regions = self.query_json_cached(&format!(
-            r#"
+            ))
+            .await?;
+        let top_regions = self
+            .query_json_cached(&format!(
+                r#"
 SELECT domain, name, count
 FROM (
     SELECT
@@ -744,9 +750,11 @@ FROM (
 ORDER BY domain ASC, count DESC
 LIMIT {CLICKHOUSE_ROLLUP_TOP_REGIONS_PER_DOMAIN} BY domain
 "#
-        )).await?;
-        let top_cities = self.query_json_cached(&format!(
-            r#"
+            ))
+            .await?;
+        let top_cities = self
+            .query_json_cached(&format!(
+                r#"
 SELECT domain, name, country, count
 FROM (
     SELECT
@@ -761,7 +769,8 @@ FROM (
 ORDER BY domain ASC, count DESC
 LIMIT {CLICKHOUSE_ROLLUP_TOP_CITIES_PER_DOMAIN} BY domain
 "#
-        )).await?;
+            ))
+            .await?;
 
         let mut lists: HashMap<String, serde_json::Map<String, serde_json::Value>> = HashMap::new();
         collect_domain_list(&mut lists, "top_countries", top_countries);
@@ -784,7 +793,11 @@ LIMIT {CLICKHOUSE_ROLLUP_TOP_CITIES_PER_DOMAIN} BY domain
         Ok(())
     }
 
-    async fn add_domain_stats_lists(&self, stats: &mut serde_json::Value, domain: &str) -> Result<()> {
+    async fn add_domain_stats_lists(
+        &self,
+        stats: &mut serde_json::Value,
+        domain: &str,
+    ) -> Result<()> {
         add_empty_stats_lists(stats);
         let Some(object) = stats.as_object_mut() else {
             return Ok(());
@@ -816,8 +829,9 @@ ORDER BY count DESC
 LIMIT 20
 "#
         )).await?;
-        let top_paths = self.query_json_cached(&format!(
-            r#"
+        let top_paths = self
+            .query_json_cached(&format!(
+                r#"
 SELECT path AS value, count() AS count
 FROM pxxl_access_logs
 WHERE domain = {domain_sql}
@@ -825,9 +839,11 @@ GROUP BY path
 ORDER BY count DESC
 LIMIT 50
 "#
-        )).await?;
-        let top_upstreams = self.query_json_cached(&format!(
-            r#"
+            ))
+            .await?;
+        let top_upstreams = self
+            .query_json_cached(&format!(
+                r#"
 SELECT ifNull(upstream, 'unknown') AS value, count() AS count
 FROM pxxl_access_logs
 WHERE domain = {domain_sql}
@@ -835,11 +851,21 @@ GROUP BY value
 ORDER BY count DESC
 LIMIT 50
 "#
-        )).await?;
-        object.insert("top_countries".to_string(), serde_json::Value::Array(top_countries));
-        object.insert("top_continents".to_string(), serde_json::Value::Array(top_continents));
+            ))
+            .await?;
+        object.insert(
+            "top_countries".to_string(),
+            serde_json::Value::Array(top_countries),
+        );
+        object.insert(
+            "top_continents".to_string(),
+            serde_json::Value::Array(top_continents),
+        );
         object.insert("top_paths".to_string(), serde_json::Value::Array(top_paths));
-        object.insert("top_upstreams".to_string(), serde_json::Value::Array(top_upstreams));
+        object.insert(
+            "top_upstreams".to_string(),
+            serde_json::Value::Array(top_upstreams),
+        );
         Ok(())
     }
 
@@ -928,8 +954,9 @@ LIMIT {limit}
     }
 
     pub async fn backfill_access_rollup_days(&self) -> Result<()> {
-        let range_rows = self.query_json(
-            r#"
+        let range_rows = self
+            .query_json(
+                r#"
 SELECT
     count() AS raw_rows,
     min(toDate(toDateTime(timestamp_unix_ms / 1000))) AS min_day,
@@ -937,7 +964,8 @@ SELECT
 FROM pxxl_access_logs
 WHERE timestamp_unix_ms < toUnixTimestamp(today()) * 1000
 "#,
-        ).await?;
+            )
+            .await?;
         let Some(range) = range_rows.first() else {
             return Ok(());
         };
@@ -1012,13 +1040,15 @@ GROUP BY
 
     async fn rollup_day_already_backfilled(&self, day: NaiveDate) -> Result<bool> {
         let day_sql = clickhouse_string_literal(&day.to_string());
-        let rows = self.query_json(&format!(
-            r#"
+        let rows = self
+            .query_json(&format!(
+                r#"
 SELECT count() AS count
 FROM pxxl_access_rollup_backfill_state FINAL
 WHERE day = toDate({day_sql})
 "#
-        )).await?;
+            ))
+            .await?;
         Ok(rows
             .first()
             .map(|row| numeric_field(row, "count") > 0)
@@ -1027,13 +1057,15 @@ WHERE day = toDate({day_sql})
 
     async fn rollup_day_has_rows(&self, day: NaiveDate) -> Result<bool> {
         let day_sql = clickhouse_string_literal(&day.to_string());
-        let rows = self.query_json(&format!(
-            r#"
+        let rows = self
+            .query_json(&format!(
+                r#"
 SELECT count() AS count
 FROM pxxl_access_rollup_day
 WHERE day = toDate({day_sql})
 "#
-        )).await?;
+            ))
+            .await?;
         Ok(rows
             .first()
             .map(|row| numeric_field(row, "count") > 0)

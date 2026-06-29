@@ -32,6 +32,9 @@ pub struct PxxlMetrics {
     pub mirror_requests_total: IntCounterVec,
     pub circuit_breaker_open_total: IntCounterVec,
     pub in_flight_limited_total: IntCounterVec,
+    pub adaptive_blocks_total: IntCounterVec,
+    pub adaptive_active_blocks: IntGauge,
+    pub adaptive_observed_ips: IntGauge,
 }
 
 impl PxxlMetrics {
@@ -141,6 +144,21 @@ impl PxxlMetrics {
             ),
             &["domain", "scope"],
         )?;
+        let adaptive_blocks_total = IntCounterVec::new(
+            Opts::new(
+                "pxxl_adaptive_blocks_total",
+                "Temporary adaptive IP blocks created by reason",
+            ),
+            &["reason"],
+        )?;
+        let adaptive_active_blocks = IntGauge::new(
+            "pxxl_adaptive_active_blocks",
+            "Currently active adaptive IP blocks",
+        )?;
+        let adaptive_observed_ips = IntGauge::new(
+            "pxxl_adaptive_observed_ips",
+            "Currently tracked IP windows for adaptive blocking",
+        )?;
 
         registry.register(Box::new(requests_total.clone()))?;
         registry.register(Box::new(active_connections.clone()))?;
@@ -160,6 +178,9 @@ impl PxxlMetrics {
         registry.register(Box::new(mirror_requests_total.clone()))?;
         registry.register(Box::new(circuit_breaker_open_total.clone()))?;
         registry.register(Box::new(in_flight_limited_total.clone()))?;
+        registry.register(Box::new(adaptive_blocks_total.clone()))?;
+        registry.register(Box::new(adaptive_active_blocks.clone()))?;
+        registry.register(Box::new(adaptive_observed_ips.clone()))?;
 
         Ok(Self {
             registry,
@@ -181,6 +202,9 @@ impl PxxlMetrics {
             mirror_requests_total,
             circuit_breaker_open_total,
             in_flight_limited_total,
+            adaptive_blocks_total,
+            adaptive_active_blocks,
+            adaptive_observed_ips,
         })
     }
 

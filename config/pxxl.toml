@@ -59,6 +59,23 @@ burst = 5000
 [security.blacklists]
 cidrs = []
 
+[security.auto_block]
+enabled = true
+window_seconds = 300
+block_seconds = 1800
+request_threshold = 300
+domain_threshold = 25
+high_request_threshold = 1200
+high_request_domain_threshold = 8
+suspicious_path_threshold = 25
+suspicious_path_domain_threshold = 5
+failure_threshold = 200
+failure_domain_threshold = 15
+max_tracked_ips = 100000
+bucket_seconds = 10
+snapshot_path = "/data/security/auto-blocks.json"
+exempt_cidrs = ["127.0.0.0/8", "::1/128", "10.88.0.0/24"]
+
 [redis]
 url = "redis://redis:6379"
 blacklist_channel = "pxxl:blacklist"

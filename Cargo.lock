@@ -1289,6 +1289,7 @@ version = "0.1.0"
 dependencies = [
  "ipnet",
  "pxxl-common",
+ "pxxl-ddos",
  "serde",
  "tempfile",
  "thiserror 2.0.18",
@@ -1333,7 +1334,9 @@ dependencies = [
  "ipnet",
  "parking_lot",
  "serde",
+ "serde_json",
  "tokio",
+ "tracing",
 ]
 
 [[package]]

@@ -3,6 +3,7 @@ use pxxl_common::{
     normalize_path_prefix, parse_ip_net, DomainRules, ListenerConfig, LoadBalancingAlgorithm,
     PathRoute, Route, RouteSource, Upstream,
 };
+use pxxl_ddos::AdaptiveBlockConfig;
 use serde::{de, Deserialize, Deserializer, Serialize};
 use std::{path::Path, time::Duration};
 
@@ -285,6 +286,8 @@ pub struct SecurityConfig {
     pub rate_limits: RateLimitConfig,
     #[serde(default)]
     pub blacklists: BlacklistConfig,
+    #[serde(default)]
+    pub auto_block: AdaptiveBlockConfig,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

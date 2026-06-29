@@ -31,7 +31,7 @@ use pxxl_common::{
     StickySessionConfig, TrafficMirrorConfig, TrafficSplitRule, Upstream,
 };
 use pxxl_core::{EdgeState, RequestObservation};
-use pxxl_ddos::SecurityDecision;
+use pxxl_ddos::{RequestObservationInput, SecurityDecision};
 use pxxl_geo::GeoIpResolver;
 use pxxl_redis_sync::RedisBandwidthTracker;
 use rustls::ServerConfig;
@@ -2809,6 +2809,30 @@ impl ProxyServer {
             bytes_sent,
             bytes_received,
         });
+        if let Some(ip) = context.remote_ip {
+            let adaptive_blocker = self.state.security.adaptive_blocker();
+            if let Some(block) = self.state.security.record_request(RequestObservationInput {
+                ip,
+                domain: context.domain,
+                path: context.path,
+                status: status.as_u16(),
+                timestamp_unix_ms: context.timestamp_unix_ms,
+            }) {
+                self.state
+                    .metrics
+                    .adaptive_blocks_total
+                    .with_label_values(&[&block.reason])
+                    .inc();
+            }
+            self.state
+                .metrics
+                .adaptive_active_blocks
+                .set(adaptive_blocker.active_block_count() as i64);
+            self.state
+                .metrics
+                .adaptive_observed_ips
+                .set(adaptive_blocker.observed_ip_count() as i64);
+        }
     }
 
     fn select_upstream_pool<'a>(

@@ -293,7 +293,9 @@ impl DomainStatsRegistry {
         Self {
             domains: DashMap::new(),
             sink,
-            overflow_spool: overflow_spool_dir.map(AnalyticsOverflowSpool::new).map(Arc::new),
+            overflow_spool: overflow_spool_dir
+                .map(AnalyticsOverflowSpool::new)
+                .map(Arc::new),
         }
     }
 

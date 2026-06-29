@@ -13,7 +13,10 @@ use pxxl_common::{
     RouteSource, StickySessionConfig, TrafficSplitRule, Upstream,
 };
 use pxxl_core::{EdgeState, RouteRegistry};
-use pxxl_ddos::{BlacklistEngine, RateLimitConfig, RateLimiter, SecurityEngine};
+use pxxl_ddos::{
+    AdaptiveBlockConfig, AdaptiveBlocker, BlacklistEngine, RateLimitConfig, RateLimiter,
+    SecurityEngine,
+};
 use pxxl_http_proxy::run_http_proxy_on_listener;
 use pxxl_load_balancer::LoadBalancer;
 use pxxl_metrics::PxxlMetrics;
@@ -280,6 +283,81 @@ async fn rejects_websocket_when_domain_rule_disables_it() {
     server.await.unwrap().unwrap();
 
     assert_eq!(status, StatusCode::FORBIDDEN);
+}
+
+#[tokio::test]
+async fn adaptive_blocker_blocks_cross_domain_abuse_after_threshold() {
+    let upstream_addr = spawn_upstream("ok").await;
+    let proxy_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let proxy_addr = proxy_listener.local_addr().unwrap();
+    let (shutdown_tx, shutdown_rx) = watch::channel(false);
+
+    let routes = (0..3)
+        .map(|i| {
+            Route::new(
+                &format!("site-{i}.pxxlhost"),
+                vec![PathRoute::new(
+                    "/",
+                    vec![Upstream::new(format!("http://{upstream_addr}"))],
+                )],
+                RouteSource::Static,
+            )
+        })
+        .collect::<Vec<_>>();
+    let state = test_state_with_adaptive(
+        routes,
+        AdaptiveBlockConfig {
+            request_threshold: 3,
+            domain_threshold: 3,
+            high_request_threshold: 1000,
+            suspicious_path_threshold: 1000,
+            failure_threshold: 1000,
+            exempt_cidrs: Vec::new(),
+            snapshot_path: std::env::temp_dir().join(format!(
+                "pxxl-http-auto-block-test-{}.json",
+                std::process::id()
+            )),
+            ..AdaptiveBlockConfig::default()
+        },
+    );
+    let metrics_state = state.clone();
+    let server = tokio::spawn(run_http_proxy_on_listener(
+        proxy_listener,
+        state,
+        shutdown_rx,
+    ));
+    let client: Client<HttpConnector, Empty<Bytes>> =
+        Client::builder(TokioExecutor::new()).build_http();
+
+    let mut statuses = Vec::new();
+    for i in 0..3 {
+        let req = Request::builder()
+            .method("GET")
+            .uri(format!("http://{proxy_addr}/"))
+            .header("host", format!("site-{i}.pxxlhost"))
+            .body(Empty::<Bytes>::new())
+            .unwrap();
+        statuses.push(client.request(req).await.unwrap().status());
+    }
+    let blocked = Request::builder()
+        .method("GET")
+        .uri(format!("http://{proxy_addr}/"))
+        .header("host", "site-0.pxxlhost")
+        .body(Empty::<Bytes>::new())
+        .unwrap();
+    let blocked_status = client.request(blocked).await.unwrap().status();
+
+    shutdown_tx.send(true).unwrap();
+    server.await.unwrap().unwrap();
+
+    assert_eq!(
+        statuses,
+        vec![StatusCode::OK, StatusCode::OK, StatusCode::OK]
+    );
+    assert_eq!(blocked_status, StatusCode::FORBIDDEN);
+    let metrics = metrics_state.metrics.gather().unwrap();
+    assert!(metrics.contains("pxxl_blocked_total"));
+    assert!(metrics.contains("adaptive_ip_block"));
 }
 
 #[tokio::test]
@@ -1253,15 +1331,35 @@ async fn spawn_flaky_upstream() -> SocketAddr {
 }
 
 fn test_state(routes: Vec<Route>) -> EdgeState {
-    let metrics = Arc::new(PxxlMetrics::new().unwrap());
+    test_state_with_security(
+        routes,
+        SecurityEngine::new(
+            Arc::new(BlacklistEngine::new()),
+            Arc::new(RateLimiter::new(RateLimitConfig {
+                requests_per_second: 1000,
+                burst: 1000,
+            })),
+        ),
+    )
+}
+
+fn test_state_with_adaptive(routes: Vec<Route>, config: AdaptiveBlockConfig) -> EdgeState {
     let blacklist = Arc::new(BlacklistEngine::new());
     let rate_limiter = Arc::new(RateLimiter::new(RateLimitConfig {
         requests_per_second: 1000,
         burst: 1000,
     }));
-    let security = Arc::new(SecurityEngine::new(blacklist, rate_limiter));
+    let adaptive_blocker = Arc::new(AdaptiveBlocker::new(config));
+    test_state_with_security(
+        routes,
+        SecurityEngine::new_with_adaptive_blocker(blacklist, rate_limiter, adaptive_blocker),
+    )
+}
+
+fn test_state_with_security(routes: Vec<Route>, security: SecurityEngine) -> EdgeState {
+    let metrics = Arc::new(PxxlMetrics::new().unwrap());
     let registry = Arc::new(RouteRegistry::new(routes));
     let load_balancer = Arc::new(LoadBalancer::new());
 
-    EdgeState::new(registry, security, load_balancer, metrics)
+    EdgeState::new(registry, Arc::new(security), load_balancer, metrics)
 }

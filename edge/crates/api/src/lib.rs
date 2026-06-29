@@ -863,8 +863,10 @@ impl ApiServer {
                 if let Some(response) = require_scope(&principal, SCOPE_ROUTES_READ) {
                     return response;
                 }
-                let domain =
-                    normalize_domain(path.trim_start_matches("/internal/routes/").trim_matches('/'));
+                let domain = normalize_domain(
+                    path.trim_start_matches("/internal/routes/")
+                        .trim_matches('/'),
+                );
                 if domain.is_empty() {
                     return json_response(
                         StatusCode::BAD_REQUEST,
@@ -1366,6 +1368,54 @@ impl ApiServer {
                     .collect::<Vec<_>>();
                 json_response(StatusCode::OK, json!({ "upstreams": upstreams }))
             }
+            (Method::GET, "/v1/security/auto-blocks") => {
+                if let Some(response) = require_scope(&principal, SCOPE_ROUTES_READ) {
+                    return response;
+                }
+                let blocks = self.state.security.adaptive_blocker().active_blocks();
+                self.state
+                    .metrics
+                    .adaptive_active_blocks
+                    .set(blocks.len() as i64);
+                self.state
+                    .metrics
+                    .adaptive_observed_ips
+                    .set(self.state.security.adaptive_blocker().observed_ip_count() as i64);
+                json_response(
+                    StatusCode::OK,
+                    json!({
+                        "blocks": blocks,
+                        "count": blocks.len(),
+                    }),
+                )
+            }
+            (Method::DELETE, path) if path.starts_with("/v1/security/auto-blocks/") => {
+                if let Some(response) = require_scope(&principal, SCOPE_ROUTES_WRITE) {
+                    return response;
+                }
+                let ip_value = path
+                    .trim_start_matches("/v1/security/auto-blocks/")
+                    .trim_matches('/');
+                match ip_value.parse::<IpAddr>() {
+                    Ok(ip) => {
+                        let removed = self.state.security.adaptive_blocker().unblock(ip);
+                        self.state.metrics.adaptive_active_blocks.set(
+                            self.state.security.adaptive_blocker().active_block_count() as i64,
+                        );
+                        json_response(
+                            StatusCode::OK,
+                            json!({
+                                "status": if removed { "removed" } else { "not_found" },
+                                "ip": ip,
+                                "removed": removed,
+                            }),
+                        )
+                    }
+                    Err(error) => {
+                        json_response(StatusCode::BAD_REQUEST, json!({"error": error.to_string()}))
+                    }
+                }
+            }
             (Method::GET, "/v1/database-routes") => {
                 if let Some(response) = require_scope(&principal, SCOPE_ROUTES_READ) {
                     return response;
@@ -1622,11 +1672,7 @@ impl ApiServer {
         Ok(())
     }
 
-    async fn upsert_internal_route(
-        &self,
-        req: Request<Incoming>,
-        path: &str,
-    ) -> Response<BoxBody> {
+    async fn upsert_internal_route(&self, req: Request<Incoming>, path: &str) -> Response<BoxBody> {
         let path_host = normalize_domain(
             path.trim_start_matches("/internal/routes/")
                 .trim_matches('/'),
@@ -1696,8 +1742,10 @@ impl ApiServer {
     }
 
     async fn delete_internal_route(&self, path: &str) -> Response<BoxBody> {
-        let domain =
-            normalize_domain(path.trim_start_matches("/internal/routes/").trim_matches('/'));
+        let domain = normalize_domain(
+            path.trim_start_matches("/internal/routes/")
+                .trim_matches('/'),
+        );
         if domain.is_empty() {
             return json_response(StatusCode::BAD_REQUEST, json!({"error": "missing host"}));
         }
