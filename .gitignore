@@ -4,6 +4,14 @@
 /data/secrets/*
 /data/*.sock
 /data/clickhouse/
+/data/acme-challenges/
+/data/cert-requests/
+/data/database-routes/
+/data/letsencrypt/
+/data/letsencrypt-logs/
+/data/routes/
+/data/security/
+/data/stats/
 /data/grafana/
 /data/loki/
 /data/postgres/
@@ -16,6 +24,8 @@
 *.env
 *.prod
 .DS_Store
+docker-compose.yml.before-*
+oom
 config/geoip/*.mmdb
 *.swp
 *.swo
