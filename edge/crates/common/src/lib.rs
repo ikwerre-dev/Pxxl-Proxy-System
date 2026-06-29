@@ -7,7 +7,7 @@ use uuid::Uuid;
 
 pub type DomainId = String;
 
-pub const MAX_ROUTES_PER_SOURCE: usize = 10_000;
+pub const MAX_ROUTES_PER_SOURCE: usize = 100_000;
 pub const MAX_PATHS_PER_ROUTE: usize = 64;
 pub const MAX_UPSTREAMS_PER_ROUTE: usize = 128;
 pub const MAX_MIRROR_UPSTREAMS_PER_ROUTE: usize = 16;
