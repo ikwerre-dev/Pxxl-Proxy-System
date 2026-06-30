@@ -39,6 +39,7 @@ struct RouteTable {
 
 impl RouteTable {
     fn new(routes: Vec<Route>) -> Self {
+        let routes = dedupe_routes(routes);
         let mut by_domain: HashMap<String, Vec<Route>> = HashMap::new();
         for route in &routes {
             by_domain
@@ -49,6 +50,26 @@ impl RouteTable {
 
         Self { routes, by_domain }
     }
+}
+
+fn dedupe_routes(routes: Vec<Route>) -> Vec<Route> {
+    let mut merged = Vec::with_capacity(routes.len());
+    let mut positions: HashMap<String, usize> = HashMap::new();
+
+    for route in routes {
+        let key = match route.source {
+            RouteSource::Api => format!("api:{}", route.domain),
+            _ => format!("{:?}:{}:{}", route.source, route.domain, route.id),
+        };
+        if let Some(index) = positions.get(&key).copied() {
+            merged[index] = route;
+        } else {
+            positions.insert(key, merged.len());
+            merged.push(route);
+        }
+    }
+
+    merged
 }
 
 impl Default for RouteRegistry {
@@ -969,6 +990,29 @@ mod tests {
         let matched = registry.find("app.pxxlhost", "/").unwrap();
 
         assert_eq!(matched.route.source, RouteSource::Api);
+    }
+
+    #[test]
+    fn registry_dedupes_api_routes_by_domain_with_latest_winning() {
+        let old_api_route = Route::new(
+            "app.pxxlhost",
+            vec![PathRoute::new("/", vec![Upstream::new("http://old:3000")])],
+            RouteSource::Api,
+        )
+        .with_id("old-route");
+        let new_api_route = Route::new(
+            "app.pxxlhost",
+            vec![PathRoute::new("/", vec![Upstream::new("http://new:3000")])],
+            RouteSource::Api,
+        )
+        .with_id("new-route");
+        let registry = RouteRegistry::new(vec![old_api_route, new_api_route]);
+
+        let routes = registry.snapshot();
+        let matched = registry.find("app.pxxlhost", "/").unwrap();
+
+        assert_eq!(routes.len(), 1);
+        assert_eq!(matched.path.upstreams[0].url, "http://new:3000");
     }
 
     #[test]
