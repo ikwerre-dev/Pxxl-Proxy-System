@@ -52,6 +52,12 @@ pub struct AdaptiveBlockConfig {
     pub suspicious_path_threshold: u64,
     #[serde(default = "default_suspicious_path_domain_threshold")]
     pub suspicious_path_domain_threshold: usize,
+    #[serde(default = "default_watchlist_suspicious_path_threshold")]
+    pub watchlist_suspicious_path_threshold: u64,
+    #[serde(default = "default_watchlist_suspicious_path_domain_threshold")]
+    pub watchlist_suspicious_path_domain_threshold: usize,
+    #[serde(default = "default_watchlist_ttl_seconds")]
+    pub watchlist_ttl_seconds: u64,
     #[serde(default = "default_failure_threshold")]
     pub failure_threshold: u64,
     #[serde(default = "default_failure_domain_threshold")]
@@ -62,6 +68,8 @@ pub struct AdaptiveBlockConfig {
     pub bucket_seconds: u64,
     #[serde(default = "default_snapshot_path")]
     pub snapshot_path: PathBuf,
+    #[serde(default = "default_watchlist_snapshot_path")]
+    pub watchlist_snapshot_path: PathBuf,
     #[serde(default = "default_exempt_cidrs")]
     pub exempt_cidrs: Vec<IpNet>,
     #[serde(default)]
@@ -80,11 +88,16 @@ impl Default for AdaptiveBlockConfig {
             high_request_domain_threshold: default_high_request_domain_threshold(),
             suspicious_path_threshold: default_suspicious_path_threshold(),
             suspicious_path_domain_threshold: default_suspicious_path_domain_threshold(),
+            watchlist_suspicious_path_threshold: default_watchlist_suspicious_path_threshold(),
+            watchlist_suspicious_path_domain_threshold:
+                default_watchlist_suspicious_path_domain_threshold(),
+            watchlist_ttl_seconds: default_watchlist_ttl_seconds(),
             failure_threshold: default_failure_threshold(),
             failure_domain_threshold: default_failure_domain_threshold(),
             max_tracked_ips: default_max_tracked_ips(),
             bucket_seconds: default_bucket_seconds(),
             snapshot_path: default_snapshot_path(),
+            watchlist_snapshot_path: default_watchlist_snapshot_path(),
             exempt_cidrs: default_exempt_cidrs(),
             suspicious_path_prefixes: Vec::new(),
         }
@@ -127,6 +140,18 @@ fn default_suspicious_path_domain_threshold() -> usize {
     5
 }
 
+fn default_watchlist_suspicious_path_threshold() -> u64 {
+    5
+}
+
+fn default_watchlist_suspicious_path_domain_threshold() -> usize {
+    3
+}
+
+fn default_watchlist_ttl_seconds() -> u64 {
+    86_400
+}
+
 fn default_failure_threshold() -> u64 {
     200
 }
@@ -145,6 +170,10 @@ fn default_bucket_seconds() -> u64 {
 
 fn default_snapshot_path() -> PathBuf {
     PathBuf::from("/data/security/auto-blocks.json")
+}
+
+fn default_watchlist_snapshot_path() -> PathBuf {
+    PathBuf::from("/data/security/watchlist.json")
 }
 
 fn default_exempt_cidrs() -> Vec<IpNet> {
@@ -178,6 +207,23 @@ pub struct AdaptiveBlockSnapshot {
     pub sample_domains: Vec<String>,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SuspiciousIpWatchlistEntry {
+    pub ip: IpAddr,
+    pub reason: String,
+    pub first_seen_unix_ms: u64,
+    pub last_seen_unix_ms: u64,
+    pub expires_at_unix_ms: u64,
+    pub requests: u64,
+    pub domains: usize,
+    pub failures: u64,
+    pub failure_domains: usize,
+    pub suspicious_paths: u64,
+    pub suspicious_domains: usize,
+    pub sample_domains: Vec<String>,
+    pub sample_paths: Vec<String>,
+}
+
 #[derive(Debug, Default)]
 struct TrafficBucket {
     start_ms: u64,
@@ -187,6 +233,7 @@ struct TrafficBucket {
     domains: HashSet<String>,
     failure_domains: HashSet<String>,
     suspicious_domains: HashSet<String>,
+    suspicious_path_samples: HashSet<String>,
 }
 
 #[derive(Debug, Default)]
@@ -204,6 +251,7 @@ struct WindowTotals {
     suspicious_paths: u64,
     suspicious_domains: usize,
     sample_domains: Vec<String>,
+    sample_paths: Vec<String>,
 }
 
 #[derive(Debug)]
@@ -211,6 +259,7 @@ pub struct AdaptiveBlocker {
     config: AdaptiveBlockConfig,
     windows: DashMap<IpAddr, Mutex<IpWindow>>,
     blocks: DashMap<IpAddr, AdaptiveBlockSnapshot>,
+    watchlist: DashMap<IpAddr, SuspiciousIpWatchlistEntry>,
     last_eviction: Mutex<Instant>,
     last_snapshot: Mutex<Instant>,
 }
@@ -223,10 +272,12 @@ impl AdaptiveBlocker {
             config,
             windows: DashMap::new(),
             blocks: DashMap::new(),
+            watchlist: DashMap::new(),
             last_eviction: Mutex::new(Instant::now()),
             last_snapshot: Mutex::new(Instant::now()),
         };
         blocker.load_snapshot();
+        blocker.load_watchlist_snapshot();
         blocker
     }
 
@@ -316,9 +367,15 @@ impl AdaptiveBlocker {
         if suspicious {
             bucket.suspicious_paths += 1;
             bucket.suspicious_domains.insert(domain);
+            bucket
+                .suspicious_path_samples
+                .insert(normalize_path_for_tracking(event.path));
         }
 
         let totals = window_totals(&window);
+        if self.should_watch(&totals) {
+            self.watch_ip(event.ip, "suspicious_path_watch".to_string(), &totals, event.timestamp_unix_ms);
+        }
         let reason = self.trigger_reason(&totals);
         drop(window);
 
@@ -329,6 +386,14 @@ impl AdaptiveBlocker {
         let removed = self.blocks.remove(&ip).is_some();
         if removed {
             self.persist_snapshot();
+        }
+        removed
+    }
+
+    pub fn unwatch(&self, ip: IpAddr) -> bool {
+        let removed = self.watchlist.remove(&ip).is_some();
+        if removed {
+            self.persist_watchlist_snapshot();
         }
         removed
     }
@@ -346,6 +411,21 @@ impl AdaptiveBlocker {
 
     pub fn active_block_count(&self) -> usize {
         self.blocks.len()
+    }
+
+    pub fn watchlist(&self) -> Vec<SuspiciousIpWatchlistEntry> {
+        let now_ms = now_unix_ms();
+        self.watchlist
+            .iter()
+            .filter_map(|entry| {
+                let watch = entry.value();
+                (watch.expires_at_unix_ms > now_ms).then(|| watch.clone())
+            })
+            .collect()
+    }
+
+    pub fn watchlist_count(&self) -> usize {
+        self.watchlist.len()
     }
 
     pub fn observed_ip_count(&self) -> usize {
@@ -381,6 +461,57 @@ impl AdaptiveBlocker {
             return Some("cross_domain_failures".to_string());
         }
         None
+    }
+
+    fn should_watch(&self, totals: &WindowTotals) -> bool {
+        totals.suspicious_paths >= self.config.watchlist_suspicious_path_threshold
+            && totals.suspicious_domains
+                >= self.config.watchlist_suspicious_path_domain_threshold
+    }
+
+    fn watch_ip(
+        &self,
+        ip: IpAddr,
+        reason: String,
+        totals: &WindowTotals,
+        now_ms: u64,
+    ) -> SuspiciousIpWatchlistEntry {
+        let expires_at_unix_ms = now_ms + self.config.watchlist_ttl_seconds.max(60) * 1000;
+        let first_seen_unix_ms = self
+            .watchlist
+            .get(&ip)
+            .map(|existing| existing.first_seen_unix_ms)
+            .unwrap_or(now_ms);
+        let entry = SuspiciousIpWatchlistEntry {
+            ip,
+            reason,
+            first_seen_unix_ms,
+            last_seen_unix_ms: now_ms,
+            expires_at_unix_ms,
+            requests: totals.requests,
+            domains: totals.domains,
+            failures: totals.failures,
+            failure_domains: totals.failure_domains,
+            suspicious_paths: totals.suspicious_paths,
+            suspicious_domains: totals.suspicious_domains,
+            sample_domains: totals.sample_domains.clone(),
+            sample_paths: totals.sample_paths.clone(),
+        };
+        let is_new = !self.watchlist.contains_key(&ip);
+        self.watchlist.insert(ip, entry.clone());
+        if is_new {
+            self.persist_watchlist_snapshot();
+            info!(
+                ip = %entry.ip,
+                reason = %entry.reason,
+                suspicious_paths = entry.suspicious_paths,
+                suspicious_domains = entry.suspicious_domains,
+                sample_domains = ?entry.sample_domains,
+                sample_paths = ?entry.sample_paths,
+                "suspicious IP added to watchlist"
+            );
+        }
+        entry
     }
 
     fn block_ip(
@@ -429,6 +560,8 @@ impl AdaptiveBlocker {
         self.evict_stale(now_ms);
         self.blocks
             .retain(|_, block| block.expires_at_unix_ms > now_ms);
+        self.watchlist
+            .retain(|_, entry| entry.expires_at_unix_ms > now_ms);
     }
 
     fn evict_stale(&self, now_ms: u64) {
@@ -446,6 +579,7 @@ impl AdaptiveBlocker {
         }
         *last = now;
         self.persist_snapshot();
+        self.persist_watchlist_snapshot();
     }
 
     fn load_snapshot(&self) {
@@ -508,6 +642,67 @@ impl AdaptiveBlocker {
             warn!(%error, path = %path.display(), "could not replace adaptive IP block snapshot");
         }
     }
+
+    fn load_watchlist_snapshot(&self) {
+        let path = &self.config.watchlist_snapshot_path;
+        let Ok(bytes) = std::fs::read(path) else {
+            return;
+        };
+        match serde_json::from_slice::<Vec<SuspiciousIpWatchlistEntry>>(&bytes) {
+            Ok(entries) => {
+                let now_ms = now_unix_ms();
+                let mut loaded = 0usize;
+                for entry in entries {
+                    if entry.expires_at_unix_ms > now_ms && !self.is_exempt(entry.ip) {
+                        self.watchlist.insert(entry.ip, entry);
+                        loaded += 1;
+                    }
+                }
+                if loaded > 0 {
+                    info!(loaded, path = %path.display(), "loaded suspicious IP watchlist snapshot");
+                }
+            }
+            Err(error) => {
+                warn!(%error, path = %path.display(), "could not parse suspicious IP watchlist snapshot");
+            }
+        }
+    }
+
+    fn persist_watchlist_snapshot(&self) {
+        let path = &self.config.watchlist_snapshot_path;
+        let now_ms = now_unix_ms();
+        let entries = self
+            .watchlist
+            .iter()
+            .filter_map(|entry| {
+                let watch = entry.value();
+                (watch.expires_at_unix_ms > now_ms).then(|| watch.clone())
+            })
+            .collect::<Vec<_>>();
+
+        if let Some(parent) = path.parent() {
+            if let Err(error) = std::fs::create_dir_all(parent) {
+                warn!(%error, path = %parent.display(), "could not create suspicious IP watchlist directory");
+                return;
+            }
+        }
+
+        let tmp_path = path.with_extension("json.tmp");
+        let payload = match serde_json::to_vec_pretty(&entries) {
+            Ok(payload) => payload,
+            Err(error) => {
+                warn!(%error, "could not serialize suspicious IP watchlist snapshot");
+                return;
+            }
+        };
+        if let Err(error) = std::fs::write(&tmp_path, payload) {
+            warn!(%error, path = %tmp_path.display(), "could not write suspicious IP watchlist snapshot");
+            return;
+        }
+        if let Err(error) = std::fs::rename(&tmp_path, path) {
+            warn!(%error, path = %path.display(), "could not replace suspicious IP watchlist snapshot");
+        }
+    }
 }
 
 fn trim_buckets(window: &mut IpWindow, oldest_allowed: u64) {
@@ -524,6 +719,7 @@ fn window_totals(window: &IpWindow) -> WindowTotals {
     let mut domains = HashSet::new();
     let mut failure_domains = HashSet::new();
     let mut suspicious_domains = HashSet::new();
+    let mut suspicious_path_samples = HashSet::new();
     let mut requests = 0;
     let mut failures = 0;
     let mut suspicious_paths = 0;
@@ -535,10 +731,13 @@ fn window_totals(window: &IpWindow) -> WindowTotals {
         domains.extend(bucket.domains.iter().cloned());
         failure_domains.extend(bucket.failure_domains.iter().cloned());
         suspicious_domains.extend(bucket.suspicious_domains.iter().cloned());
+        suspicious_path_samples.extend(bucket.suspicious_path_samples.iter().cloned());
     }
 
     let mut sample_domains = domains.iter().take(8).cloned().collect::<Vec<_>>();
     sample_domains.sort();
+    let mut sample_paths = suspicious_path_samples.iter().take(8).cloned().collect::<Vec<_>>();
+    sample_paths.sort();
 
     WindowTotals {
         requests,
@@ -548,11 +747,26 @@ fn window_totals(window: &IpWindow) -> WindowTotals {
         suspicious_paths,
         suspicious_domains: suspicious_domains.len(),
         sample_domains,
+        sample_paths,
     }
 }
 
 fn normalize_domain_for_tracking(domain: &str) -> String {
     domain.trim().trim_end_matches('.').to_ascii_lowercase()
+}
+
+fn normalize_path_for_tracking(path: &str) -> String {
+    let value = path.trim();
+    if value.is_empty() {
+        return "/".to_string();
+    }
+    let without_query = value.split('?').next().unwrap_or(value);
+    let normalized = if without_query.starts_with('/') {
+        without_query.to_string()
+    } else {
+        format!("/{without_query}")
+    };
+    normalized.chars().take(160).collect::<String>()
 }
 
 fn is_suspicious_path(path: &str, configured_prefixes: &[String]) -> bool {
@@ -845,12 +1059,12 @@ mod tests {
     }
 
     fn test_blocker() -> AdaptiveBlocker {
+        let suffix = format!("{}-{}", std::process::id(), now_unix_ms());
         AdaptiveBlocker::new(AdaptiveBlockConfig {
-            snapshot_path: std::env::temp_dir().join(format!(
-                "pxxl-auto-block-test-{}-{}.json",
-                std::process::id(),
-                now_unix_ms()
-            )),
+            snapshot_path: std::env::temp_dir()
+                .join(format!("pxxl-auto-block-test-{suffix}.json")),
+            watchlist_snapshot_path: std::env::temp_dir()
+                .join(format!("pxxl-watchlist-test-{suffix}.json")),
             exempt_cidrs: vec!["10.88.0.0/24".parse().unwrap()],
             ..AdaptiveBlockConfig::default()
         })
@@ -898,18 +1112,63 @@ mod tests {
     }
 
     #[test]
+    fn adaptive_blocker_watchlists_suspicious_path_scanner_before_blocking() {
+        let blocker = AdaptiveBlocker::new(AdaptiveBlockConfig {
+            suspicious_path_threshold: 25,
+            suspicious_path_domain_threshold: 5,
+            watchlist_suspicious_path_threshold: 3,
+            watchlist_suspicious_path_domain_threshold: 3,
+            snapshot_path: std::env::temp_dir().join(format!(
+                "pxxl-auto-block-watch-test-{}-{}.json",
+                std::process::id(),
+                now_unix_ms()
+            )),
+            watchlist_snapshot_path: std::env::temp_dir().join(format!(
+                "pxxl-watchlist-watch-test-{}-{}.json",
+                std::process::id(),
+                now_unix_ms()
+            )),
+            exempt_cidrs: Vec::new(),
+            ..AdaptiveBlockConfig::default()
+        });
+        let ip = "203.0.113.14".parse().unwrap();
+        let start = now_unix_ms();
+
+        for i in 0..3 {
+            blocker.record(RequestObservationInput {
+                ip,
+                domain: &format!("site-{i}.example"),
+                path: "/.env",
+                status: 404,
+                timestamp_unix_ms: start + i,
+            });
+        }
+
+        assert!(blocker.check(ip).is_none());
+        let watched = blocker
+            .watchlist()
+            .into_iter()
+            .find(|entry| entry.ip == ip)
+            .expect("ip should be watchlisted");
+        assert_eq!(watched.reason, "suspicious_path_watch");
+        assert_eq!(watched.suspicious_paths, 3);
+        assert_eq!(watched.suspicious_domains, 3);
+        assert!(watched.sample_paths.iter().any(|path| path == "/.env"));
+    }
+
+    #[test]
     fn adaptive_blocker_blocks_high_volume_with_fewer_domains() {
+        let suffix = format!("{}-{}", std::process::id(), now_unix_ms());
         let blocker = AdaptiveBlocker::new(AdaptiveBlockConfig {
             high_request_threshold: 10,
             high_request_domain_threshold: 2,
             request_threshold: 1000,
             suspicious_path_threshold: 1000,
             failure_threshold: 1000,
-            snapshot_path: std::env::temp_dir().join(format!(
-                "pxxl-auto-block-high-volume-test-{}-{}.json",
-                std::process::id(),
-                now_unix_ms()
-            )),
+            snapshot_path: std::env::temp_dir()
+                .join(format!("pxxl-auto-block-high-volume-test-{suffix}.json")),
+            watchlist_snapshot_path: std::env::temp_dir()
+                .join(format!("pxxl-watchlist-high-volume-test-{suffix}.json")),
             exempt_cidrs: Vec::new(),
             ..AdaptiveBlockConfig::default()
         });
@@ -1012,6 +1271,11 @@ mod tests {
 
         let blocker = AdaptiveBlocker::new(AdaptiveBlockConfig {
             snapshot_path: path,
+            watchlist_snapshot_path: std::env::temp_dir().join(format!(
+                "pxxl-watchlist-reload-test-{}-{}.json",
+                std::process::id(),
+                now_unix_ms()
+            )),
             exempt_cidrs: Vec::new(),
             ..AdaptiveBlockConfig::default()
         });
@@ -1021,5 +1285,65 @@ mod tests {
             Some(SecurityDecision::Blocked { .. })
         ));
         assert!(blocker.check(expired_ip).is_none());
+    }
+
+    #[test]
+    fn adaptive_blocker_reloads_watchlist_snapshot_and_ignores_expired() {
+        let path = std::env::temp_dir().join(format!(
+            "pxxl-watchlist-reload-only-test-{}-{}.json",
+            std::process::id(),
+            now_unix_ms()
+        ));
+        let now = now_unix_ms();
+        let active_ip: IpAddr = "203.0.113.30".parse().unwrap();
+        let expired_ip: IpAddr = "203.0.113.31".parse().unwrap();
+        let entries = vec![
+            SuspiciousIpWatchlistEntry {
+                ip: active_ip,
+                reason: "suspicious_path_watch".to_string(),
+                first_seen_unix_ms: now,
+                last_seen_unix_ms: now,
+                expires_at_unix_ms: now + 60_000,
+                requests: 5,
+                domains: 3,
+                failures: 5,
+                failure_domains: 3,
+                suspicious_paths: 5,
+                suspicious_domains: 3,
+                sample_domains: vec!["active.example".to_string()],
+                sample_paths: vec!["/.env".to_string()],
+            },
+            SuspiciousIpWatchlistEntry {
+                ip: expired_ip,
+                reason: "expired".to_string(),
+                first_seen_unix_ms: now.saturating_sub(120_000),
+                last_seen_unix_ms: now.saturating_sub(120_000),
+                expires_at_unix_ms: now.saturating_sub(60_000),
+                requests: 5,
+                domains: 3,
+                failures: 5,
+                failure_domains: 3,
+                suspicious_paths: 5,
+                suspicious_domains: 3,
+                sample_domains: vec!["expired.example".to_string()],
+                sample_paths: vec!["/.git/config".to_string()],
+            },
+        ];
+        std::fs::write(&path, serde_json::to_vec(&entries).unwrap()).unwrap();
+
+        let blocker = AdaptiveBlocker::new(AdaptiveBlockConfig {
+            snapshot_path: std::env::temp_dir().join(format!(
+                "pxxl-auto-block-watchlist-reload-test-{}-{}.json",
+                std::process::id(),
+                now_unix_ms()
+            )),
+            watchlist_snapshot_path: path,
+            exempt_cidrs: Vec::new(),
+            ..AdaptiveBlockConfig::default()
+        });
+
+        let watchlist = blocker.watchlist();
+        assert!(watchlist.iter().any(|entry| entry.ip == active_ip));
+        assert!(!watchlist.iter().any(|entry| entry.ip == expired_ip));
     }
 }

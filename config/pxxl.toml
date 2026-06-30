@@ -69,12 +69,16 @@ high_request_threshold = 1200
 high_request_domain_threshold = 8
 suspicious_path_threshold = 25
 suspicious_path_domain_threshold = 5
+watchlist_suspicious_path_threshold = 5
+watchlist_suspicious_path_domain_threshold = 3
+watchlist_ttl_seconds = 86400
 failure_threshold = 200
 failure_domain_threshold = 15
 max_tracked_ips = 100000
 bucket_seconds = 10
 snapshot_path = "/data/security/auto-blocks.json"
-exempt_cidrs = ["127.0.0.0/8", "::1/128", "10.88.0.0/24"]
+watchlist_snapshot_path = "/data/security/watchlist.json"
+exempt_cidrs = ["127.0.0.0/8", "::1/128", "10.88.0.0/16", "10.89.0.0/16"]
 
 [redis]
 url = "redis://redis:6379"

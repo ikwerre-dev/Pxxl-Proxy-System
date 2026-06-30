@@ -33,7 +33,7 @@ use std::{
     time::{Duration, UNIX_EPOCH},
 };
 use tokio::{
-    net::TcpListener,
+    net::{lookup_host, TcpListener},
     process::Command,
     sync::{watch, Semaphore},
     time,
@@ -1389,6 +1389,19 @@ impl ApiServer {
                     }),
                 )
             }
+            (Method::GET, "/v1/security/watchlist") => {
+                if let Some(response) = require_scope(&principal, SCOPE_ROUTES_READ) {
+                    return response;
+                }
+                let watchlist = self.state.security.adaptive_blocker().watchlist();
+                json_response(
+                    StatusCode::OK,
+                    json!({
+                        "watchlist": watchlist,
+                        "count": watchlist.len(),
+                    }),
+                )
+            }
             (Method::DELETE, path) if path.starts_with("/v1/security/auto-blocks/") => {
                 if let Some(response) = require_scope(&principal, SCOPE_ROUTES_WRITE) {
                     return response;
@@ -1402,6 +1415,30 @@ impl ApiServer {
                         self.state.metrics.adaptive_active_blocks.set(
                             self.state.security.adaptive_blocker().active_block_count() as i64,
                         );
+                        json_response(
+                            StatusCode::OK,
+                            json!({
+                                "status": if removed { "removed" } else { "not_found" },
+                                "ip": ip,
+                                "removed": removed,
+                            }),
+                        )
+                    }
+                    Err(error) => {
+                        json_response(StatusCode::BAD_REQUEST, json!({"error": error.to_string()}))
+                    }
+                }
+            }
+            (Method::DELETE, path) if path.starts_with("/v1/security/watchlist/") => {
+                if let Some(response) = require_scope(&principal, SCOPE_ROUTES_WRITE) {
+                    return response;
+                }
+                let ip_value = path
+                    .trim_start_matches("/v1/security/watchlist/")
+                    .trim_matches('/');
+                match ip_value.parse::<IpAddr>() {
+                    Ok(ip) => {
+                        let removed = self.state.security.adaptive_blocker().unwatch(ip);
                         json_response(
                             StatusCode::OK,
                             json!({
@@ -1890,11 +1927,39 @@ impl ApiServer {
             .map(|route| route.domain.clone())
             .unwrap_or_else(|| requested_domain.clone());
         let mut certificate_domains = vec![domain.clone()];
+        let mut skipped_certificate_domains = Vec::new();
         if route
             .as_ref()
             .is_some_and(|route| route_allows_www_alias(&route.domain, route.rules.www_alias))
         {
-            certificate_domains.push(format!("www.{}", domain));
+            let www_domain = format!("www.{}", domain);
+            match certificate_domain_points_to_proxy(&www_domain).await {
+                Ok(true) => certificate_domains.push(www_domain),
+                Ok(false) => {
+                    info!(
+                        domain = %domain,
+                        www_domain = %www_domain,
+                        "skipping www certificate SAN because it does not resolve to this proxy"
+                    );
+                    skipped_certificate_domains.push(json!({
+                        "domain": www_domain,
+                        "reason": "dns_not_pointed_to_proxy"
+                    }));
+                }
+                Err(error) => {
+                    warn!(
+                        domain = %domain,
+                        www_domain = %www_domain,
+                        error = %error,
+                        "skipping www certificate SAN because DNS preflight failed"
+                    );
+                    skipped_certificate_domains.push(json!({
+                        "domain": www_domain,
+                        "reason": "dns_lookup_failed",
+                        "details": error
+                    }));
+                }
+            }
         }
         certificate_domains.sort();
         certificate_domains.dedup();
@@ -2016,6 +2081,7 @@ impl ApiServer {
                 "status": "issued",
                 "domain": domain,
                 "domains": certificate_domains,
+                "skippedDomains": skipped_certificate_domains,
                 "certPath": installed_cert_paths.first().cloned().unwrap_or_default(),
                 "certPaths": installed_cert_paths,
                 "certificate": self.certificate_status(Some(&domain)).await,
@@ -2619,6 +2685,36 @@ pub async fn load_http_routes_from_file(path: &Path) -> Result<Vec<Route>, BoxEr
         .take(MAX_ROUTES_PER_SOURCE)
         .collect::<Vec<_>>();
     Ok(routes)
+}
+
+fn certificate_proxy_ips() -> Vec<IpAddr> {
+    let configured = std::env::var("PXXL_CERTIFICATE_PUBLIC_IPS")
+        .or_else(|_| std::env::var("PXXL_PUBLIC_IPS"))
+        .unwrap_or_else(|_| "193.181.212.65".to_string());
+
+    configured
+        .split(',')
+        .filter_map(|item| item.trim().parse::<IpAddr>().ok())
+        .collect()
+}
+
+async fn certificate_domain_points_to_proxy(domain: &str) -> Result<bool, String> {
+    let expected_ips = certificate_proxy_ips();
+    if expected_ips.is_empty() {
+        return Ok(false);
+    }
+
+    let resolved_ips = lookup_host((domain, 80))
+        .await
+        .map_err(|error| error.to_string())?
+        .map(|addr| addr.ip())
+        .collect::<Vec<_>>();
+
+    Ok(resolved_ips.iter().any(|resolved_ip| {
+        expected_ips
+            .iter()
+            .any(|expected_ip| expected_ip == resolved_ip)
+    }))
 }
 
 async fn copy_certbot_bundle(
