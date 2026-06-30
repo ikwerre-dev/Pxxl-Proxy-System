@@ -614,7 +614,10 @@ async fn apply_runtime_route_event(
     event: RuntimeRouteEvent,
 ) -> Result<()> {
     let event_type = event.event_type.trim();
-    if !matches!(event_type, "container.healthy" | "route.promote") {
+    if !matches!(
+        event_type,
+        "container.started" | "container.healthy" | "route.promote"
+    ) {
         return Ok(());
     }
     let domain = event
