@@ -1756,10 +1756,24 @@ impl ApiServer {
                 .await
                 .map_err(|error| format!("failed to persist Redis route: {error}"))?;
         }
-        self.persist_route_snapshot()
-            .await
-            .map_err(|error| format!("failed to persist route snapshot: {error}"))?;
+        self.persist_route_snapshot_background();
         Ok(())
+    }
+
+    fn persist_route_snapshot_background(&self) {
+        let Some(path) = self.route_snapshot_path.clone() else {
+            return;
+        };
+        let routes = api_routes_snapshot(&self.state);
+        tokio::spawn(async move {
+            if let Err(error) = save_http_routes_to_file(&path, &routes).await {
+                warn!(
+                    path = %path.display(),
+                    %error,
+                    "failed to persist route snapshot in background"
+                );
+            }
+        });
     }
 
     async fn upsert_internal_route(&self, req: Request<Incoming>, path: &str) -> Response<BoxBody> {
