@@ -374,7 +374,12 @@ impl AdaptiveBlocker {
 
         let totals = window_totals(&window);
         if self.should_watch(&totals) {
-            self.watch_ip(event.ip, "suspicious_path_watch".to_string(), &totals, event.timestamp_unix_ms);
+            self.watch_ip(
+                event.ip,
+                "suspicious_path_watch".to_string(),
+                &totals,
+                event.timestamp_unix_ms,
+            );
         }
         let reason = self.trigger_reason(&totals);
         drop(window);
@@ -465,8 +470,7 @@ impl AdaptiveBlocker {
 
     fn should_watch(&self, totals: &WindowTotals) -> bool {
         totals.suspicious_paths >= self.config.watchlist_suspicious_path_threshold
-            && totals.suspicious_domains
-                >= self.config.watchlist_suspicious_path_domain_threshold
+            && totals.suspicious_domains >= self.config.watchlist_suspicious_path_domain_threshold
     }
 
     fn watch_ip(
@@ -736,7 +740,11 @@ fn window_totals(window: &IpWindow) -> WindowTotals {
 
     let mut sample_domains = domains.iter().take(8).cloned().collect::<Vec<_>>();
     sample_domains.sort();
-    let mut sample_paths = suspicious_path_samples.iter().take(8).cloned().collect::<Vec<_>>();
+    let mut sample_paths = suspicious_path_samples
+        .iter()
+        .take(8)
+        .cloned()
+        .collect::<Vec<_>>();
     sample_paths.sort();
 
     WindowTotals {
@@ -1061,8 +1069,7 @@ mod tests {
     fn test_blocker() -> AdaptiveBlocker {
         let suffix = format!("{}-{}", std::process::id(), now_unix_ms());
         AdaptiveBlocker::new(AdaptiveBlockConfig {
-            snapshot_path: std::env::temp_dir()
-                .join(format!("pxxl-auto-block-test-{suffix}.json")),
+            snapshot_path: std::env::temp_dir().join(format!("pxxl-auto-block-test-{suffix}.json")),
             watchlist_snapshot_path: std::env::temp_dir()
                 .join(format!("pxxl-watchlist-test-{suffix}.json")),
             exempt_cidrs: vec!["10.88.0.0/24".parse().unwrap()],

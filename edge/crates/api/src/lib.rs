@@ -39,6 +39,7 @@ use tokio::{
     time,
 };
 use tracing::{debug, info, warn};
+use x509_parser::{extensions::GeneralName, prelude::*};
 
 type BoxError = Box<dyn std::error::Error + Send + Sync>;
 type BoxBody = http_body_util::combinators::BoxBody<Bytes, BoxError>;
@@ -55,6 +56,12 @@ const SCOPE_ANALYTICS_READ: &str = "analytics:read";
 const ADMIN_LOGIN_MAX_ATTEMPTS: u32 = 5;
 const ADMIN_LOGIN_WINDOW: Duration = Duration::from_secs(10 * 60);
 const ANALYTICS_RECENT_LIMIT_MAX: usize = 5000;
+const CERT_REGISTRY_VERSION: u32 = 1;
+const DEFAULT_CERT_RENEW_BEFORE_DAYS: i64 = 30;
+const DEFAULT_CERT_MAINTENANCE_INTERVAL_SECONDS: u64 = 6 * 60 * 60;
+const DEFAULT_CERT_MAINTENANCE_INITIAL_DELAY_SECONDS: u64 = 60;
+const DEFAULT_CERT_MAINTENANCE_MAX_PER_RUN: usize = 25;
+const DEFAULT_CERT_FAILED_RETRY_SECONDS: u64 = 60 * 60;
 
 #[derive(Clone)]
 struct ApiServer {
@@ -355,9 +362,22 @@ struct CertificateDomainStatus {
     domain: String,
     tls_enabled: bool,
     covered: bool,
-    status: &'static str,
-    reason: &'static str,
+    status: String,
+    reason: String,
     dedicated: bool,
+    renewal_required: bool,
+    cert_path: Option<String>,
+    key_path: Option<String>,
+    issuer: Option<String>,
+    subject: Option<String>,
+    san_domains: Vec<String>,
+    not_before_unix_ms: Option<i64>,
+    not_after_unix_ms: Option<i64>,
+    expires_in_days: Option<i64>,
+    last_checked_unix_ms: Option<u128>,
+    last_attempt_unix_ms: Option<u128>,
+    last_issued_unix_ms: Option<u128>,
+    last_error: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -370,6 +390,35 @@ struct CertificateStatusResponse {
     cert_modified_unix_ms: Option<u128>,
     domains: Vec<CertificateDomainStatus>,
     runtime: TlsCertificateRuntimeSnapshot,
+    registry_path: String,
+    renew_before_days: i64,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+struct CertificateRegistry {
+    version: u32,
+    updated_unix_ms: u128,
+    domains: HashMap<String, DomainCertificateRecord>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+struct DomainCertificateRecord {
+    domain: String,
+    status: String,
+    reason: String,
+    dedicated: bool,
+    renewal_required: bool,
+    cert_path: Option<String>,
+    key_path: Option<String>,
+    issuer: Option<String>,
+    subject: Option<String>,
+    san_domains: Vec<String>,
+    not_before_unix_ms: Option<i64>,
+    not_after_unix_ms: Option<i64>,
+    last_checked_unix_ms: u128,
+    last_attempt_unix_ms: Option<u128>,
+    last_issued_unix_ms: Option<u128>,
+    last_error: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -402,6 +451,10 @@ pub async fn run_admin_api(
         analytics: runtime.analytics,
         auth: runtime.auth,
     };
+    tokio::spawn(run_certificate_maintenance(
+        server.clone(),
+        shutdown.clone(),
+    ));
     info!(%addr, "admin API listening");
     run_api_listener(listener, server, shutdown).await
 }
@@ -1964,6 +2017,42 @@ impl ApiServer {
         certificate_domains.sort();
         certificate_domains.dedup();
 
+        let existing_records = futures_util::future::join_all(
+            certificate_domains
+                .iter()
+                .map(|domain| inspect_domain_certificate(&self.cert_dir, domain)),
+        )
+        .await;
+        if existing_records.iter().all(|record| {
+            record
+                .as_ref()
+                .is_some_and(|record| record.dedicated && !record.renewal_required)
+        }) {
+            let records = existing_records.into_iter().flatten().collect::<Vec<_>>();
+            for record in records {
+                if let Err(error) = upsert_certificate_record(&self.cert_dir, record).await {
+                    warn!(%error, "failed to persist reused certificate record");
+                }
+            }
+            return json_response(
+                StatusCode::OK,
+                json!({
+                    "status": "valid",
+                    "action": "reused",
+                    "domain": domain,
+                    "domains": certificate_domains,
+                    "skippedDomains": skipped_certificate_domains,
+                    "certificate": self.certificate_status(Some(&domain)).await
+                }),
+            );
+        }
+
+        if let Err(error) =
+            mark_certificate_attempt(&self.cert_dir, &certificate_domains, None).await
+        {
+            warn!(%error, "failed to persist certificate attempt state");
+        }
+
         let certbot = std::env::var("PXXL_CERTBOT_BIN").unwrap_or_else(|_| "certbot".to_string());
         let email =
             std::env::var("PXXL_ACME_EMAIL").unwrap_or_else(|_| "admin@pxxl.app".to_string());
@@ -2026,22 +2115,52 @@ impl ApiServer {
         {
             Ok(Ok(output)) => output,
             Ok(Err(error)) => {
-                return json_response(
-                    StatusCode::BAD_GATEWAY,
-                    json!({"error": format!("failed to run certbot: {error}")}),
+                let message = format!("failed to run certbot: {error}");
+                if let Err(persist_error) = mark_certificate_attempt(
+                    &self.cert_dir,
+                    &certificate_domains,
+                    Some(message.clone()),
                 )
+                .await
+                {
+                    warn!(%persist_error, "failed to persist certificate certbot-start error");
+                }
+                return json_response(StatusCode::BAD_GATEWAY, json!({"error": message}));
             }
             Err(_) => {
+                if let Err(persist_error) = mark_certificate_attempt(
+                    &self.cert_dir,
+                    &certificate_domains,
+                    Some("certbot timed out while issuing certificate".to_string()),
+                )
+                .await
+                {
+                    warn!(%persist_error, "failed to persist certificate timeout");
+                }
                 return json_response(
                     StatusCode::GATEWAY_TIMEOUT,
                     json!({"error": "certbot timed out while issuing certificate"}),
-                )
+                );
             }
         };
 
         let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
         let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
         if !output.status.success() {
+            let error_message = if stderr.is_empty() {
+                stdout.clone()
+            } else {
+                stderr.clone()
+            };
+            if let Err(persist_error) = mark_certificate_attempt(
+                &self.cert_dir,
+                &certificate_domains,
+                Some(error_message.clone()),
+            )
+            .await
+            {
+                warn!(%persist_error, "failed to persist certificate issuance failure");
+            }
             return json_response(
                 StatusCode::BAD_GATEWAY,
                 json!({
@@ -2067,12 +2186,24 @@ impl ApiServer {
             let cert_path = domain_dir.join("fullchain.pem");
             let key_path = domain_dir.join("privkey.pem");
             if let Err(error) = copy_certbot_bundle(&live_dir, &cert_path, &key_path).await {
-                return json_response(
-                    StatusCode::BAD_GATEWAY,
-                    json!({"error": format!("certificate issued but could not be installed: {error}")}),
-                );
+                let message = format!("certificate issued but could not be installed: {error}");
+                if let Err(persist_error) = mark_certificate_attempt(
+                    &self.cert_dir,
+                    &certificate_domains,
+                    Some(message.clone()),
+                )
+                .await
+                {
+                    warn!(%persist_error, "failed to persist certificate install failure");
+                }
+                return json_response(StatusCode::BAD_GATEWAY, json!({"error": message}));
             }
             installed_cert_paths.push(cert_path.display().to_string());
+        }
+        if let Err(error) =
+            refresh_certificate_records(&self.cert_dir, &certificate_domains, true).await
+        {
+            warn!(%error, "failed to persist issued certificate records");
         }
 
         json_response(
@@ -2093,6 +2224,9 @@ impl ApiServer {
     async fn certificate_status(&self, domain_filter: Option<&str>) -> CertificateStatusResponse {
         let cert_path = PathBuf::from(&self.cert_dir).join("local-dev-cert.pem");
         let key_path = PathBuf::from(&self.cert_dir).join("local-dev-key.pem");
+        let registry_path = cert_registry_path(&self.cert_dir);
+        let mut registry = load_certificate_registry(&self.cert_dir).await;
+        let mut registry_changed = false;
         let cert_meta = tokio::fs::metadata(&cert_path).await.ok();
         let key_exists = tokio::fs::metadata(&key_path).await.is_ok();
         let generated = cert_meta.is_some() && key_exists;
@@ -2118,12 +2252,18 @@ impl ApiServer {
 
                 let mut statuses = Vec::with_capacity(status_domains.len());
                 for status_domain in status_domains {
-                    let dedicated = domain_certificate_exists(&self.cert_dir, &status_domain).await;
+                    let record = inspect_domain_certificate(&self.cert_dir, &status_domain).await;
+                    if let Some(record) = &record {
+                        registry
+                            .domains
+                            .insert(normalize_domain(&record.domain), record.clone());
+                        registry_changed = true;
+                    }
                     statuses.push(certificate_domain_status(
                         &status_domain,
                         maybe_route.as_ref(),
                         generated,
-                        dedicated,
+                        record.as_ref(),
                     ));
                 }
                 statuses
@@ -2131,11 +2271,56 @@ impl ApiServer {
             None => routes
                 .iter()
                 .map(|route| {
-                    let dedicated = domain_certificate_exists_sync(&self.cert_dir, &route.domain);
-                    certificate_domain_status(&route.domain, Some(route), generated, dedicated)
+                    let record = registry
+                        .domains
+                        .get(&normalize_domain(&route.domain))
+                        .cloned()
+                        .or_else(|| {
+                            if domain_certificate_exists_sync(&self.cert_dir, &route.domain) {
+                                Some(DomainCertificateRecord {
+                                    domain: route.domain.clone(),
+                                    status: "unknown".to_string(),
+                                    reason: "certificate_exists_not_inspected".to_string(),
+                                    dedicated: true,
+                                    renewal_required: false,
+                                    cert_path: Some(
+                                        domain_certificate_path(&self.cert_dir, &route.domain)
+                                            .display()
+                                            .to_string(),
+                                    ),
+                                    key_path: Some(
+                                        domain_private_key_path(&self.cert_dir, &route.domain)
+                                            .display()
+                                            .to_string(),
+                                    ),
+                                    issuer: None,
+                                    subject: None,
+                                    san_domains: Vec::new(),
+                                    not_before_unix_ms: None,
+                                    not_after_unix_ms: None,
+                                    last_checked_unix_ms: 0,
+                                    last_attempt_unix_ms: None,
+                                    last_issued_unix_ms: None,
+                                    last_error: None,
+                                })
+                            } else {
+                                None
+                            }
+                        });
+                    certificate_domain_status(
+                        &route.domain,
+                        Some(route),
+                        generated,
+                        record.as_ref(),
+                    )
                 })
                 .collect(),
         };
+        if registry_changed {
+            if let Err(error) = save_certificate_registry(&self.cert_dir, &registry).await {
+                warn!(%error, "failed to persist certificate registry after status check");
+            }
+        }
 
         CertificateStatusResponse {
             mode: "sni_domain_certs",
@@ -2146,6 +2331,8 @@ impl ApiServer {
             cert_modified_unix_ms,
             domains,
             runtime: self.tls_status.snapshot(),
+            registry_path: registry_path.display().to_string(),
+            renew_before_days: cert_renew_before_days(),
         }
     }
 
@@ -2658,6 +2845,105 @@ fn api_routes_snapshot(state: &EdgeState) -> Vec<Route> {
     routes
 }
 
+async fn run_certificate_maintenance(server: ApiServer, mut shutdown: watch::Receiver<bool>) {
+    if !env_bool("PXXL_CERT_MAINTENANCE_ENABLED", true) {
+        info!("automatic certificate maintenance disabled");
+        return;
+    }
+
+    let initial_delay = Duration::from_secs(env_u64(
+        "PXXL_CERT_MAINTENANCE_INITIAL_DELAY_SECONDS",
+        DEFAULT_CERT_MAINTENANCE_INITIAL_DELAY_SECONDS,
+    ));
+    let interval_duration = Duration::from_secs(env_u64(
+        "PXXL_CERT_MAINTENANCE_INTERVAL_SECONDS",
+        DEFAULT_CERT_MAINTENANCE_INTERVAL_SECONDS,
+    ));
+    let mut interval = time::interval(interval_duration);
+    time::sleep(initial_delay).await;
+
+    loop {
+        tokio::select! {
+            _ = interval.tick() => {
+                server.maintain_domain_certificates().await;
+            }
+            changed = shutdown.changed() => {
+                if changed.is_ok() && *shutdown.borrow() {
+                    break;
+                }
+            }
+        }
+    }
+}
+
+impl ApiServer {
+    async fn maintain_domain_certificates(&self) {
+        let max_per_run = env_usize(
+            "PXXL_CERT_MAINTENANCE_MAX_PER_RUN",
+            DEFAULT_CERT_MAINTENANCE_MAX_PER_RUN,
+        );
+        if max_per_run == 0 {
+            return;
+        }
+
+        let retry_after = Duration::from_secs(env_u64(
+            "PXXL_CERT_FAILED_RETRY_SECONDS",
+            DEFAULT_CERT_FAILED_RETRY_SECONDS,
+        ));
+        let mut attempted = 0_usize;
+        let routes = self.state.routes.snapshot();
+        for route in routes {
+            if !route.tls {
+                continue;
+            }
+            let mut domains = vec![route.domain.clone()];
+            if route_allows_www_alias(&route.domain, route.rules.www_alias) {
+                domains.push(format!("www.{}", route.domain));
+            }
+
+            for domain in domains {
+                if attempted >= max_per_run {
+                    info!(
+                        attempted,
+                        max_per_run, "certificate maintenance pass reached issue cap"
+                    );
+                    return;
+                }
+                let domain = normalize_domain(&domain);
+                if domain.is_empty() {
+                    continue;
+                }
+                match certificate_domain_points_to_proxy(&domain).await {
+                    Ok(true) => {}
+                    Ok(false) => continue,
+                    Err(error) => {
+                        warn!(%domain, %error, "certificate maintenance DNS preflight failed");
+                        continue;
+                    }
+                }
+
+                let record = inspect_domain_certificate(&self.cert_dir, &domain).await;
+                if let Some(record) = &record {
+                    if !record.renewal_required {
+                        let _ = upsert_certificate_record(&self.cert_dir, record.clone()).await;
+                        continue;
+                    }
+                    if let Some(last_attempt) = record.last_attempt_unix_ms {
+                        let retry_after_ms = retry_after.as_millis();
+                        if unix_now_ms().saturating_sub(last_attempt) < retry_after_ms {
+                            continue;
+                        }
+                    }
+                }
+
+                info!(%domain, "certificate maintenance ensuring domain certificate");
+                let _ = self.resync_domain_certificate(&domain).await;
+                attempted += 1;
+            }
+        }
+    }
+}
+
 pub async fn save_http_routes_to_file(path: &Path, routes: &[Route]) -> Result<(), BoxError> {
     if let Some(parent) = path.parent() {
         tokio::fs::create_dir_all(parent).await?;
@@ -2685,6 +2971,313 @@ pub async fn load_http_routes_from_file(path: &Path) -> Result<Vec<Route>, BoxEr
         .take(MAX_ROUTES_PER_SOURCE)
         .collect::<Vec<_>>();
     Ok(routes)
+}
+
+fn env_bool(key: &str, default: bool) -> bool {
+    std::env::var(key)
+        .ok()
+        .map(|value| {
+            matches!(
+                value.trim().to_ascii_lowercase().as_str(),
+                "1" | "true" | "yes" | "on"
+            )
+        })
+        .unwrap_or(default)
+}
+
+fn env_u64(key: &str, default: u64) -> u64 {
+    std::env::var(key)
+        .ok()
+        .and_then(|value| value.trim().parse::<u64>().ok())
+        .unwrap_or(default)
+}
+
+fn env_usize(key: &str, default: usize) -> usize {
+    std::env::var(key)
+        .ok()
+        .and_then(|value| value.trim().parse::<usize>().ok())
+        .unwrap_or(default)
+}
+
+fn cert_renew_before_days() -> i64 {
+    std::env::var("PXXL_CERT_RENEW_BEFORE_DAYS")
+        .ok()
+        .and_then(|value| value.trim().parse::<i64>().ok())
+        .filter(|days| *days > 0)
+        .unwrap_or(DEFAULT_CERT_RENEW_BEFORE_DAYS)
+}
+
+fn cert_registry_path(cert_dir: &str) -> PathBuf {
+    PathBuf::from(cert_dir).join("cert-state.json")
+}
+
+async fn load_certificate_registry(cert_dir: &str) -> CertificateRegistry {
+    let path = cert_registry_path(cert_dir);
+    match tokio::fs::read(&path).await {
+        Ok(bytes) if !bytes.is_empty() => serde_json::from_slice::<CertificateRegistry>(&bytes)
+            .unwrap_or_else(|error| {
+                warn!(path = %path.display(), %error, "failed to parse certificate registry");
+                CertificateRegistry {
+                    version: CERT_REGISTRY_VERSION,
+                    updated_unix_ms: unix_now_ms(),
+                    domains: HashMap::new(),
+                }
+            }),
+        _ => CertificateRegistry {
+            version: CERT_REGISTRY_VERSION,
+            updated_unix_ms: unix_now_ms(),
+            domains: HashMap::new(),
+        },
+    }
+}
+
+async fn save_certificate_registry(
+    cert_dir: &str,
+    registry: &CertificateRegistry,
+) -> std::io::Result<()> {
+    let path = cert_registry_path(cert_dir);
+    if let Some(parent) = path.parent() {
+        tokio::fs::create_dir_all(parent).await?;
+    }
+    let mut registry = registry.clone();
+    registry.version = CERT_REGISTRY_VERSION;
+    registry.updated_unix_ms = unix_now_ms();
+    let bytes = serde_json::to_vec_pretty(&registry)?;
+    let temp_path = path.with_extension("json.tmp");
+    tokio::fs::write(&temp_path, bytes).await?;
+    tokio::fs::rename(&temp_path, path).await
+}
+
+async fn upsert_certificate_record(
+    cert_dir: &str,
+    record: DomainCertificateRecord,
+) -> std::io::Result<()> {
+    let mut registry = load_certificate_registry(cert_dir).await;
+    registry
+        .domains
+        .insert(normalize_domain(&record.domain), record);
+    save_certificate_registry(cert_dir, &registry).await
+}
+
+async fn mark_certificate_attempt(
+    cert_dir: &str,
+    domains: &[String],
+    error: Option<String>,
+) -> std::io::Result<()> {
+    let mut registry = load_certificate_registry(cert_dir).await;
+    let now = unix_now_ms();
+    for domain in domains {
+        let domain = normalize_domain(domain);
+        if domain.is_empty() {
+            continue;
+        }
+        let mut record = registry
+            .domains
+            .remove(&domain)
+            .unwrap_or_else(|| missing_certificate_record(cert_dir, &domain));
+        record.last_attempt_unix_ms = Some(now);
+        record.last_checked_unix_ms = now;
+        record.last_error = error.clone();
+        if error.is_some() {
+            record.status = "error".to_string();
+            record.reason = "certificate_issue_failed".to_string();
+            record.renewal_required = true;
+        }
+        registry.domains.insert(domain, record);
+    }
+    save_certificate_registry(cert_dir, &registry).await
+}
+
+async fn refresh_certificate_records(
+    cert_dir: &str,
+    domains: &[String],
+    issued: bool,
+) -> std::io::Result<()> {
+    let mut registry = load_certificate_registry(cert_dir).await;
+    let now = unix_now_ms();
+    for domain in domains {
+        let domain = normalize_domain(domain);
+        if domain.is_empty() {
+            continue;
+        }
+        let mut record = inspect_domain_certificate(cert_dir, &domain)
+            .await
+            .unwrap_or_else(|| missing_certificate_record(cert_dir, &domain));
+        record.last_attempt_unix_ms = Some(now);
+        if issued {
+            record.last_issued_unix_ms = Some(now);
+        } else if let Some(existing) = registry.domains.get(&domain) {
+            record.last_issued_unix_ms = existing.last_issued_unix_ms;
+        }
+        registry.domains.insert(domain, record);
+    }
+    save_certificate_registry(cert_dir, &registry).await
+}
+
+async fn inspect_domain_certificate(
+    cert_dir: &str,
+    domain: &str,
+) -> Option<DomainCertificateRecord> {
+    let domain = normalize_domain(domain);
+    if domain.is_empty() {
+        return None;
+    }
+    let cert_path = domain_certificate_path(cert_dir, &domain);
+    let key_path = domain_private_key_path(cert_dir, &domain);
+    if tokio::fs::metadata(&cert_path).await.is_err()
+        || tokio::fs::metadata(&key_path).await.is_err()
+    {
+        return Some(missing_certificate_record(cert_dir, &domain));
+    }
+
+    let cert_bytes = match tokio::fs::read(&cert_path).await {
+        Ok(bytes) => bytes,
+        Err(error) => {
+            return Some(error_certificate_record(
+                cert_dir,
+                &domain,
+                format!("failed_to_read_certificate: {error}"),
+            ))
+        }
+    };
+
+    let certs = match rustls_pemfile::certs(&mut std::io::Cursor::new(cert_bytes))
+        .collect::<std::result::Result<Vec<_>, _>>()
+    {
+        Ok(certs) if !certs.is_empty() => certs,
+        Ok(_) => {
+            return Some(error_certificate_record(
+                cert_dir,
+                &domain,
+                "certificate_file_empty".to_string(),
+            ))
+        }
+        Err(error) => {
+            return Some(error_certificate_record(
+                cert_dir,
+                &domain,
+                format!("failed_to_parse_pem: {error}"),
+            ))
+        }
+    };
+
+    let parsed = match X509Certificate::from_der(certs[0].as_ref()) {
+        Ok((_, cert)) => cert,
+        Err(error) => {
+            return Some(error_certificate_record(
+                cert_dir,
+                &domain,
+                format!("failed_to_parse_x509: {error}"),
+            ))
+        }
+    };
+    let issuer = parsed.issuer().to_string();
+    let subject = parsed.subject().to_string();
+    let not_before_unix_ms = Some(parsed.validity().not_before.timestamp() * 1000);
+    let not_after_unix_ms = Some(parsed.validity().not_after.timestamp() * 1000);
+    let san_domains = parsed
+        .subject_alternative_name()
+        .ok()
+        .flatten()
+        .map(|extension| {
+            extension
+                .value
+                .general_names
+                .iter()
+                .filter_map(|name| match name {
+                    GeneralName::DNSName(value) => Some(value.to_ascii_lowercase()),
+                    _ => None,
+                })
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+
+    let mut record = DomainCertificateRecord {
+        domain: domain.clone(),
+        status: "valid".to_string(),
+        reason: "dedicated_sni_certificate".to_string(),
+        dedicated: true,
+        renewal_required: false,
+        cert_path: Some(cert_path.display().to_string()),
+        key_path: Some(key_path.display().to_string()),
+        issuer: Some(issuer),
+        subject: Some(subject),
+        san_domains,
+        not_before_unix_ms,
+        not_after_unix_ms,
+        last_checked_unix_ms: unix_now_ms(),
+        last_attempt_unix_ms: None,
+        last_issued_unix_ms: None,
+        last_error: None,
+    };
+
+    let domain_covered = record
+        .san_domains
+        .iter()
+        .any(|name| name.eq_ignore_ascii_case(&domain));
+    if !domain_covered {
+        record.status = "invalid".to_string();
+        record.reason = "domain_not_in_certificate".to_string();
+        record.renewal_required = true;
+        return Some(record);
+    }
+
+    let now_ms = (chrono::Utc::now().timestamp_millis()).max(0);
+    let renew_before_ms = cert_renew_before_days() * 24 * 60 * 60 * 1000;
+    if let Some(not_after) = record.not_after_unix_ms {
+        if not_after <= now_ms {
+            record.status = "expired".to_string();
+            record.reason = "certificate_expired".to_string();
+            record.renewal_required = true;
+        } else if not_after.saturating_sub(now_ms) <= renew_before_ms {
+            record.status = "expiring_soon".to_string();
+            record.reason = "certificate_expiring_before_renew_window".to_string();
+            record.renewal_required = true;
+        }
+    }
+
+    Some(record)
+}
+
+fn missing_certificate_record(cert_dir: &str, domain: &str) -> DomainCertificateRecord {
+    DomainCertificateRecord {
+        domain: domain.to_string(),
+        status: "missing".to_string(),
+        reason: "dedicated_certificate_missing".to_string(),
+        dedicated: false,
+        renewal_required: true,
+        cert_path: Some(
+            domain_certificate_path(cert_dir, domain)
+                .display()
+                .to_string(),
+        ),
+        key_path: Some(
+            domain_private_key_path(cert_dir, domain)
+                .display()
+                .to_string(),
+        ),
+        issuer: None,
+        subject: None,
+        san_domains: Vec::new(),
+        not_before_unix_ms: None,
+        not_after_unix_ms: None,
+        last_checked_unix_ms: unix_now_ms(),
+        last_attempt_unix_ms: None,
+        last_issued_unix_ms: None,
+        last_error: None,
+    }
+}
+
+fn error_certificate_record(
+    cert_dir: &str,
+    domain: &str,
+    error: String,
+) -> DomainCertificateRecord {
+    let mut record = missing_certificate_record(cert_dir, domain);
+    record.status = "error".to_string();
+    record.reason = "certificate_inspection_failed".to_string();
+    record.last_error = Some(error);
+    record
 }
 
 fn certificate_proxy_ips() -> Vec<IpAddr> {
@@ -2742,59 +3335,138 @@ fn certificate_domain_status(
     domain: &str,
     route: Option<&Route>,
     generated: bool,
-    dedicated: bool,
+    record: Option<&DomainCertificateRecord>,
 ) -> CertificateDomainStatus {
+    let expires_in_days = record
+        .and_then(|record| record.not_after_unix_ms)
+        .map(|not_after| {
+            let now = chrono::Utc::now().timestamp_millis();
+            ((not_after - now) / (24 * 60 * 60 * 1000)).max(0)
+        });
+    let base_from_record = |tls_enabled: bool, covered: bool| CertificateDomainStatus {
+        domain: domain.to_string(),
+        tls_enabled,
+        covered,
+        status: record
+            .map(|record| record.status.clone())
+            .unwrap_or_else(|| "missing".to_string()),
+        reason: record
+            .map(|record| record.reason.clone())
+            .unwrap_or_else(|| "dedicated_certificate_missing".to_string()),
+        dedicated: record.is_some_and(|record| record.dedicated),
+        renewal_required: record.is_none_or(|record| record.renewal_required),
+        cert_path: record.and_then(|record| record.cert_path.clone()),
+        key_path: record.and_then(|record| record.key_path.clone()),
+        issuer: record.and_then(|record| record.issuer.clone()),
+        subject: record.and_then(|record| record.subject.clone()),
+        san_domains: record
+            .map(|record| record.san_domains.clone())
+            .unwrap_or_default(),
+        not_before_unix_ms: record.and_then(|record| record.not_before_unix_ms),
+        not_after_unix_ms: record.and_then(|record| record.not_after_unix_ms),
+        expires_in_days,
+        last_checked_unix_ms: record.map(|record| record.last_checked_unix_ms),
+        last_attempt_unix_ms: record.and_then(|record| record.last_attempt_unix_ms),
+        last_issued_unix_ms: record.and_then(|record| record.last_issued_unix_ms),
+        last_error: record.and_then(|record| record.last_error.clone()),
+    };
+
     match route {
         Some(route) if !route.tls => CertificateDomainStatus {
             domain: domain.to_string(),
             tls_enabled: false,
             covered: false,
-            status: "disabled",
-            reason: "route_tls_disabled",
+            status: "disabled".to_string(),
+            reason: "route_tls_disabled".to_string(),
             dedicated: false,
+            renewal_required: false,
+            cert_path: None,
+            key_path: None,
+            issuer: None,
+            subject: None,
+            san_domains: Vec::new(),
+            not_before_unix_ms: None,
+            not_after_unix_ms: None,
+            expires_in_days: None,
+            last_checked_unix_ms: record.map(|record| record.last_checked_unix_ms),
+            last_attempt_unix_ms: record.and_then(|record| record.last_attempt_unix_ms),
+            last_issued_unix_ms: record.and_then(|record| record.last_issued_unix_ms),
+            last_error: record.and_then(|record| record.last_error.clone()),
         },
-        Some(_) if dedicated => CertificateDomainStatus {
-            domain: domain.to_string(),
-            tls_enabled: true,
-            covered: true,
-            status: "covered",
-            reason: "dedicated_sni_certificate",
-            dedicated: true,
-        },
+        Some(_) if record.is_some_and(|record| record.dedicated && !record.renewal_required) => {
+            base_from_record(true, true)
+        }
+        Some(_) if record.is_some_and(|record| record.dedicated) => base_from_record(true, false),
         Some(_) if generated => CertificateDomainStatus {
             domain: domain.to_string(),
             tls_enabled: true,
-            covered: true,
-            status: "covered",
-            reason: "fallback_certificate_bundle",
+            covered: false,
+            status: "pending".to_string(),
+            reason: "dedicated_certificate_missing_fallback_available".to_string(),
             dedicated: false,
+            renewal_required: true,
+            cert_path: record.and_then(|record| record.cert_path.clone()),
+            key_path: record.and_then(|record| record.key_path.clone()),
+            issuer: record.and_then(|record| record.issuer.clone()),
+            subject: record.and_then(|record| record.subject.clone()),
+            san_domains: record
+                .map(|record| record.san_domains.clone())
+                .unwrap_or_default(),
+            not_before_unix_ms: record.and_then(|record| record.not_before_unix_ms),
+            not_after_unix_ms: record.and_then(|record| record.not_after_unix_ms),
+            expires_in_days,
+            last_checked_unix_ms: record.map(|record| record.last_checked_unix_ms),
+            last_attempt_unix_ms: record.and_then(|record| record.last_attempt_unix_ms),
+            last_issued_unix_ms: record.and_then(|record| record.last_issued_unix_ms),
+            last_error: record.and_then(|record| record.last_error.clone()),
         },
         Some(_) => CertificateDomainStatus {
             domain: domain.to_string(),
             tls_enabled: true,
             covered: false,
-            status: "pending",
-            reason: "certificate_bundle_not_generated_yet",
+            status: "pending".to_string(),
+            reason: "certificate_bundle_not_generated_yet".to_string(),
             dedicated: false,
+            renewal_required: true,
+            cert_path: record.and_then(|record| record.cert_path.clone()),
+            key_path: record.and_then(|record| record.key_path.clone()),
+            issuer: record.and_then(|record| record.issuer.clone()),
+            subject: record.and_then(|record| record.subject.clone()),
+            san_domains: record
+                .map(|record| record.san_domains.clone())
+                .unwrap_or_default(),
+            not_before_unix_ms: record.and_then(|record| record.not_before_unix_ms),
+            not_after_unix_ms: record.and_then(|record| record.not_after_unix_ms),
+            expires_in_days,
+            last_checked_unix_ms: record.map(|record| record.last_checked_unix_ms),
+            last_attempt_unix_ms: record.and_then(|record| record.last_attempt_unix_ms),
+            last_issued_unix_ms: record.and_then(|record| record.last_issued_unix_ms),
+            last_error: record.and_then(|record| record.last_error.clone()),
         },
         None => CertificateDomainStatus {
             domain: domain.to_string(),
             tls_enabled: false,
             covered: false,
-            status: "not_found",
-            reason: "domain_not_registered",
-            dedicated,
+            status: "not_found".to_string(),
+            reason: "domain_not_registered".to_string(),
+            dedicated: record.is_some_and(|record| record.dedicated),
+            renewal_required: false,
+            cert_path: record.and_then(|record| record.cert_path.clone()),
+            key_path: record.and_then(|record| record.key_path.clone()),
+            issuer: record.and_then(|record| record.issuer.clone()),
+            subject: record.and_then(|record| record.subject.clone()),
+            san_domains: record
+                .map(|record| record.san_domains.clone())
+                .unwrap_or_default(),
+            not_before_unix_ms: record.and_then(|record| record.not_before_unix_ms),
+            not_after_unix_ms: record.and_then(|record| record.not_after_unix_ms),
+            expires_in_days,
+            last_checked_unix_ms: record.map(|record| record.last_checked_unix_ms),
+            last_attempt_unix_ms: record.and_then(|record| record.last_attempt_unix_ms),
+            last_issued_unix_ms: record.and_then(|record| record.last_issued_unix_ms),
+            last_error: record.and_then(|record| record.last_error.clone()),
         },
     }
-}
-
-async fn domain_certificate_exists(cert_dir: &str, domain: &str) -> bool {
-    tokio::fs::metadata(domain_certificate_path(cert_dir, domain))
-        .await
-        .is_ok()
-        && tokio::fs::metadata(domain_private_key_path(cert_dir, domain))
-            .await
-            .is_ok()
 }
 
 fn domain_certificate_exists_sync(cert_dir: &str, domain: &str) -> bool {

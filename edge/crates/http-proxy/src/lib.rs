@@ -35,6 +35,7 @@ use pxxl_ddos::{RequestObservationInput, SecurityDecision};
 use pxxl_geo::GeoIpResolver;
 use pxxl_redis_sync::RedisBandwidthTracker;
 use rustls::ServerConfig;
+use serde::Deserialize;
 use sha2::{Digest, Sha256};
 use std::{
     collections::HashMap,
@@ -72,6 +73,9 @@ const DIGEST_REPLAY_EVICT_AT: usize = 100_000;
 const ACME_CHALLENGE_PREFIX: &str = "/.well-known/acme-challenge/";
 const TRUSTED_CLIENT_IP_CIDRS_ENV: &str = "PXXL_TRUSTED_CLIENT_IP_CIDRS";
 const LEGACY_TRUSTED_CLIENT_IP_CIDRS_ENV: &str = "PXXL_TRUSTED_PROXY_CIDRS";
+const RUNTIME_DIAGNOSTICS_URL_ENV: &str = "PXXL_RUNTIME_DIAGNOSTICS_URL";
+const GATEWAY_RUNTIME_DIAGNOSTICS_URL_ENV: &str = "PXXL_GATEWAY_RUNTIME_DIAGNOSTICS_URL";
+const RUNTIME_DIAGNOSTICS_TIMEOUT_MS_ENV: &str = "PXXL_RUNTIME_DIAGNOSTICS_TIMEOUT_MS";
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum ProxyErrorReason {
@@ -282,26 +286,6 @@ impl ErrorPageRenderer {
             });
 
         html_response(status, body)
-    }
-
-    fn response_with_reason(
-        &self,
-        status: StatusCode,
-        reason: ProxyErrorReason,
-        domain: &str,
-        path: &str,
-        request_id: &str,
-        processing_time_ms: u128,
-    ) -> Response<BoxBody> {
-        self.response_with_reason_code(ErrorRenderContext {
-            status,
-            message: reason.public_message(),
-            reason_code: reason.code(),
-            domain,
-            path,
-            request_id,
-            processing_time_ms,
-        })
     }
 
     fn response_with_reason_code(&self, context: ErrorRenderContext<'_>) -> Response<BoxBody> {
@@ -1464,6 +1448,7 @@ pub struct ProxyServer {
     geoip: GeoIpResolver,
     trusted_client_ip: TrustedClientIpConfig,
     bandwidth_tracker: Option<Arc<RedisBandwidthTracker>>,
+    runtime_diagnostics: RuntimeDiagnosticsConfig,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -1503,6 +1488,69 @@ impl TrustedClientIpConfig {
     fn trusted_peer(&self, peer_ip: IpAddr) -> bool {
         self.cidrs.iter().any(|network| network.contains(&peer_ip))
     }
+}
+
+#[derive(Debug, Clone, Default)]
+struct RuntimeDiagnosticsConfig {
+    endpoint: Option<Arc<str>>,
+    token: Option<Arc<str>>,
+    timeout: Duration,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct RuntimeDiagnosticPayload {
+    #[serde(rename = "diagnosticCode")]
+    diagnostic_code: Option<String>,
+    #[serde(rename = "diagnosticSummary")]
+    diagnostic_summary: Option<String>,
+}
+
+impl RuntimeDiagnosticsConfig {
+    fn from_env() -> Self {
+        let endpoint = std::env::var(RUNTIME_DIAGNOSTICS_URL_ENV)
+            .or_else(|_| std::env::var(GATEWAY_RUNTIME_DIAGNOSTICS_URL_ENV))
+            .ok()
+            .map(|value| value.trim().trim_end_matches('/').to_string())
+            .filter(|value| !value.is_empty())
+            .or_else(|| {
+                first_env(&["PXXL_GATEWAY_API_URL", "GATEWAY_API_URL", "PXXL_API_URL"]).map(
+                    |base| {
+                        format!(
+                            "{}/api/v3/internal/proxy-diagnostics",
+                            base.trim().trim_end_matches('/')
+                        )
+                    },
+                )
+            })
+            .map(Arc::<str>::from);
+        let token = first_env(&[
+            "PXXL_PROXY_DIAGNOSTICS_TOKEN",
+            "PXXL_GATEWAY_INTERNAL_TOKEN",
+            "INFRA_TOKEN",
+        ])
+        .map(Arc::<str>::from);
+        let timeout_ms = std::env::var(RUNTIME_DIAGNOSTICS_TIMEOUT_MS_ENV)
+            .ok()
+            .and_then(|value| value.trim().parse::<u64>().ok())
+            .unwrap_or(800)
+            .clamp(100, 5_000);
+        Self {
+            endpoint,
+            token,
+            timeout: Duration::from_millis(timeout_ms),
+        }
+    }
+
+    fn enabled(&self) -> bool {
+        self.endpoint.is_some() && self.token.is_some()
+    }
+}
+
+fn first_env(keys: &[&str]) -> Option<String> {
+    keys.iter()
+        .find_map(|key| std::env::var(key).ok())
+        .map(|value| value.trim().trim_end_matches('/').to_string())
+        .filter(|value| !value.is_empty())
 }
 
 fn https_connector() -> HttpsConnector<HttpConnector> {
@@ -1559,6 +1607,7 @@ impl ProxyServer {
             geoip,
             trusted_client_ip: TrustedClientIpConfig::from_env(),
             bandwidth_tracker: None,
+            runtime_diagnostics: RuntimeDiagnosticsConfig::from_env(),
         }
     }
 
@@ -1728,14 +1777,17 @@ impl ProxyServer {
             Some(matched) => matched,
             None => {
                 self.observe_request(&context, StatusCode::NOT_FOUND, started, None, 0, 0);
-                finish_response!(self.diagnostic_error_response(
-                    StatusCode::NOT_FOUND,
-                    ProxyErrorReason::RouteNotRegistered,
-                    &domain,
-                    &path,
-                    &request_id,
-                    started,
-                ));
+                finish_response!(
+                    self.diagnostic_error_response(
+                        StatusCode::NOT_FOUND,
+                        ProxyErrorReason::RouteNotRegistered,
+                        &domain,
+                        &path,
+                        &request_id,
+                        started,
+                    )
+                    .await
+                );
             }
         };
 
@@ -1998,14 +2050,17 @@ impl ProxyServer {
                         0,
                         0,
                     );
-                    finish_response!(self.diagnostic_error_response(
-                        StatusCode::SERVICE_UNAVAILABLE,
-                        self.route_unavailable_reason(&matched, upstreams),
-                        &domain,
-                        &path,
-                        &request_id,
-                        started,
-                    ));
+                    finish_response!(
+                        self.diagnostic_error_response(
+                            StatusCode::SERVICE_UNAVAILABLE,
+                            self.route_unavailable_reason(&matched, upstreams),
+                            &domain,
+                            &path,
+                            &request_id,
+                            started,
+                        )
+                        .await
+                    );
                 }
             };
 
@@ -2206,14 +2261,17 @@ impl ProxyServer {
                         0,
                         0,
                     );
-                    finish_response!(self.diagnostic_error_response(
-                        StatusCode::BAD_GATEWAY,
-                        self.upstream_failure_reason(&error),
-                        &domain,
-                        &path,
-                        &request_id,
-                        started,
-                    ));
+                    finish_response!(
+                        self.diagnostic_error_response(
+                            StatusCode::BAD_GATEWAY,
+                            self.upstream_failure_reason(&error),
+                            &domain,
+                            &path,
+                            &request_id,
+                            started,
+                        )
+                        .await
+                    );
                 }
             }
         }
@@ -2286,14 +2344,17 @@ impl ProxyServer {
                     0,
                     0,
                 );
-                finish_response!(self.diagnostic_error_response(
-                    StatusCode::SERVICE_UNAVAILABLE,
-                    self.route_unavailable_reason(&matched, upstreams),
-                    &domain,
-                    &path,
-                    &request_id,
-                    started,
-                ));
+                finish_response!(
+                    self.diagnostic_error_response(
+                        StatusCode::SERVICE_UNAVAILABLE,
+                        self.route_unavailable_reason(&matched, upstreams),
+                        &domain,
+                        &path,
+                        &request_id,
+                        started,
+                    )
+                    .await
+                );
             }
         };
 
@@ -2483,14 +2544,17 @@ impl ProxyServer {
                     0,
                     0,
                 );
-                finish_response!(self.diagnostic_error_response(
-                    StatusCode::BAD_GATEWAY,
-                    self.upstream_failure_reason(&error),
-                    &domain,
-                    &path,
-                    &request_id,
-                    started,
-                ));
+                finish_response!(
+                    self.diagnostic_error_response(
+                        StatusCode::BAD_GATEWAY,
+                        self.upstream_failure_reason(&error),
+                        &domain,
+                        &path,
+                        &request_id,
+                        started,
+                    )
+                    .await
+                );
             }
         }
     }
@@ -2727,7 +2791,7 @@ impl ProxyServer {
         )
     }
 
-    fn diagnostic_error_response(
+    async fn diagnostic_error_response(
         &self,
         status: StatusCode,
         reason: ProxyErrorReason,
@@ -2736,14 +2800,110 @@ impl ProxyServer {
         request_id: &str,
         started: Instant,
     ) -> Response<BoxBody> {
-        self.error_pages.response_with_reason(
-            status,
-            reason,
-            domain,
-            path,
-            request_id,
-            started.elapsed().as_millis(),
+        let diagnostic = self.fetch_runtime_diagnostic(domain, path).await;
+        let reason_code = diagnostic
+            .as_ref()
+            .and_then(|payload| clean_diagnostic_value(payload.diagnostic_code.as_deref()))
+            .unwrap_or_else(|| reason.code().to_string());
+        let message = diagnostic
+            .as_ref()
+            .and_then(|payload| clean_diagnostic_value(payload.diagnostic_summary.as_deref()))
+            .unwrap_or_else(|| reason.public_message().to_string());
+        self.error_pages
+            .response_with_reason_code(ErrorRenderContext {
+                status,
+                message: &message,
+                reason_code: &reason_code,
+                domain,
+                path,
+                request_id,
+                processing_time_ms: started.elapsed().as_millis(),
+            })
+    }
+
+    async fn fetch_runtime_diagnostic(
+        &self,
+        domain: &str,
+        path: &str,
+    ) -> Option<RuntimeDiagnosticPayload> {
+        if !self.runtime_diagnostics.enabled() {
+            return None;
+        }
+        let endpoint = self.runtime_diagnostics.endpoint.as_ref()?;
+        let token = self.runtime_diagnostics.token.as_ref()?;
+        let mut url = match url::Url::parse(endpoint) {
+            Ok(url) => url,
+            Err(error) => {
+                warn!(%error, "runtime diagnostics endpoint is invalid");
+                return None;
+            }
+        };
+        url.query_pairs_mut()
+            .append_pair("domain", domain)
+            .append_pair("path", path);
+        let uri: Uri = match url.as_str().parse() {
+            Ok(uri) => uri,
+            Err(error) => {
+                warn!(%error, "runtime diagnostics URI is invalid");
+                return None;
+            }
+        };
+        let token_header = match HeaderValue::from_str(token) {
+            Ok(value) => value,
+            Err(error) => {
+                warn!(%error, "runtime diagnostics token is invalid");
+                return None;
+            }
+        };
+        let request = match Request::builder()
+            .method(Method::GET)
+            .uri(uri)
+            .header("x-pxxl-internal-token", token_header)
+            .body(empty_body())
+        {
+            Ok(request) => request,
+            Err(error) => {
+                warn!(%error, "failed to build runtime diagnostics request");
+                return None;
+            }
+        };
+        let response = match time::timeout(
+            self.runtime_diagnostics.timeout,
+            self.client.request(request),
         )
+        .await
+        {
+            Ok(Ok(response)) => response,
+            Ok(Err(error)) => {
+                debug!(%error, "runtime diagnostics request failed");
+                return None;
+            }
+            Err(_) => {
+                debug!("runtime diagnostics request timed out");
+                return None;
+            }
+        };
+        if !response.status().is_success() {
+            debug!(
+                status = response.status().as_u16(),
+                "runtime diagnostics returned non-success status"
+            );
+            return None;
+        }
+        let body = match response.into_body().collect().await {
+            Ok(collected) => collected.to_bytes(),
+            Err(error) => {
+                debug!(%error, "failed to read runtime diagnostics response");
+                return None;
+            }
+        };
+        match serde_json::from_slice::<RuntimeDiagnosticPayload>(&body) {
+            Ok(payload) => Some(payload),
+            Err(error) => {
+                debug!(%error, "failed to parse runtime diagnostics response");
+                None
+            }
+        }
     }
 
     fn route_unavailable_reason(
@@ -4666,6 +4826,18 @@ fn html_response(status: StatusCode, body: String) -> Response<BoxBody> {
 
 fn text_response(status: StatusCode, message: &str) -> Response<BoxBody> {
     response_with_body(status, "text/plain; charset=utf-8", message.to_string())
+}
+
+fn empty_body() -> BoxBody {
+    boxed_full(Bytes::new())
+}
+
+fn clean_diagnostic_value(value: Option<&str>) -> Option<String> {
+    let value = value?.trim();
+    if value.is_empty() || value.eq_ignore_ascii_case("<nil>") {
+        return None;
+    }
+    Some(value.to_string())
 }
 
 async fn serve_acme_http01_challenge(path: &str) -> Option<Response<BoxBody>> {
