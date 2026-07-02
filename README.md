@@ -226,7 +226,7 @@ ip_allowlist = ["127.0.0.1", "::1"]
 
 `/healthz` and `/readyz` stay public for uptime checks. Other admin endpoints require `Authorization: Bearer <token>` when `auth_enabled = true`.
 
-The installer asks for an initial admin email and password. It stores only `PXXL_ADMIN_EMAIL` plus a PBKDF2-SHA256 password hash in `.env`; the plaintext password is not written to disk. Log in with that account to get a Redis-backed admin token:
+The installer asks for an initial admin email and password. It stores only `PXXL_ADMIN_EMAIL` plus a password hash in `.env`; the plaintext password is not written to disk. New hashes use Argon2id (`$argon2id$...`), while legacy `pbkdf2-sha256:<iterations>:<salt>:<hash>` values are still verified for backward compatibility — logging in with a legacy hash logs a warning to regenerate it. Generate an Argon2id hash with `pxxl-edge hash-password '<password>'`. Log in with that account to get a Redis-backed admin token:
 
 ```sh
 pxxl login
