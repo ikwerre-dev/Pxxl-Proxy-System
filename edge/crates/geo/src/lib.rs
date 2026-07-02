@@ -3,7 +3,6 @@ use ipnet::{IpNet, Ipv4Net, Ipv6Net};
 use maxminddb::{geoip2, Reader};
 use pxxl_common::GeoLocation;
 use std::{
-    collections::BTreeMap,
     net::{IpAddr, Ipv4Addr, Ipv6Addr},
     path::{Path, PathBuf},
     sync::Arc,
@@ -110,22 +109,26 @@ impl GeoIpResolver {
         let mmdb = self.mmdb.as_ref()?;
 
         if let Some(reader) = &mmdb.city {
-            if let Ok(city) = reader.lookup::<geoip2::City>(ip) {
-                let location = location_from_city(city, mmdb.asn.as_ref(), ip);
-                if location.country_code.is_some()
-                    || location.continent_code.is_some()
-                    || location.city.is_some()
-                {
-                    return Some(location);
+            if let Ok(result) = reader.lookup(ip) {
+                if let Ok(Some(city)) = result.decode::<geoip2::City>() {
+                    let location = location_from_city(city, mmdb.asn.as_ref(), ip);
+                    if location.country_code.is_some()
+                        || location.continent_code.is_some()
+                        || location.city.is_some()
+                    {
+                        return Some(location);
+                    }
                 }
             }
         }
 
         if let Some(reader) = &mmdb.country {
-            if let Ok(country) = reader.lookup::<geoip2::Country>(ip) {
-                let location = location_from_country(country, mmdb.asn.as_ref(), ip);
-                if location.country_code.is_some() || location.continent_code.is_some() {
-                    return Some(location);
+            if let Ok(result) = reader.lookup(ip) {
+                if let Ok(Some(country)) = result.decode::<geoip2::Country>() {
+                    let location = location_from_country(country, mmdb.asn.as_ref(), ip);
+                    if location.country_code.is_some() || location.continent_code.is_some() {
+                        return Some(location);
+                    }
                 }
             }
         }
@@ -186,33 +189,15 @@ fn location_from_city(
     ip: IpAddr,
 ) -> GeoLocation {
     let mut location = GeoLocation {
-        country_code: city
-            .country
-            .as_ref()
-            .and_then(|country| country.iso_code)
-            .map(str::to_ascii_uppercase),
-        country_name: city
-            .country
-            .as_ref()
-            .and_then(|country| localized_name(country.names.as_ref())),
-        continent_code: city
-            .continent
-            .as_ref()
-            .and_then(|continent| continent.code)
-            .map(str::to_ascii_uppercase),
-        continent_name: city
-            .continent
-            .as_ref()
-            .and_then(|continent| localized_name(continent.names.as_ref())),
-        region: city.subdivisions.as_ref().and_then(|subdivisions| {
-            subdivisions
-                .first()
-                .and_then(|subdivision| localized_name(subdivision.names.as_ref()))
-        }),
-        city: city
-            .city
-            .as_ref()
-            .and_then(|city| localized_name(city.names.as_ref())),
+        country_code: city.country.iso_code.map(str::to_ascii_uppercase),
+        country_name: localized_name(&city.country.names),
+        continent_code: city.continent.code.map(str::to_ascii_uppercase),
+        continent_name: localized_name(&city.continent.names),
+        region: city
+            .subdivisions
+            .first()
+            .and_then(|subdivision| localized_name(&subdivision.names)),
+        city: localized_name(&city.city.names),
         source: "mmdb_city".to_string(),
     };
 
@@ -229,24 +214,10 @@ fn location_from_country(
     ip: IpAddr,
 ) -> GeoLocation {
     let mut location = GeoLocation {
-        country_code: country
-            .country
-            .as_ref()
-            .and_then(|country| country.iso_code)
-            .map(str::to_ascii_uppercase),
-        country_name: country
-            .country
-            .as_ref()
-            .and_then(|country| localized_name(country.names.as_ref())),
-        continent_code: country
-            .continent
-            .as_ref()
-            .and_then(|continent| continent.code)
-            .map(str::to_ascii_uppercase),
-        continent_name: country
-            .continent
-            .as_ref()
-            .and_then(|continent| localized_name(continent.names.as_ref())),
+        country_code: country.country.iso_code.map(str::to_ascii_uppercase),
+        country_name: localized_name(&country.country.names),
+        continent_code: country.continent.code.map(str::to_ascii_uppercase),
+        continent_name: localized_name(&country.continent.names),
         region: None,
         city: None,
         source: "mmdb_country".to_string(),
@@ -259,17 +230,21 @@ fn location_from_country(
     location
 }
 
-fn localized_name(names: Option<&BTreeMap<&str, &str>>) -> Option<String> {
-    names.and_then(|names| {
-        names
-            .get("en")
-            .or_else(|| names.values().next())
-            .map(|name| (*name).to_string())
-    })
+fn localized_name(names: &geoip2::Names<'_>) -> Option<String> {
+    names
+        .english
+        .or(names.spanish)
+        .or(names.french)
+        .or(names.german)
+        .or(names.japanese)
+        .or(names.brazilian_portuguese)
+        .or(names.russian)
+        .or(names.simplified_chinese)
+        .map(str::to_string)
 }
 
 fn lookup_asn_summary(reader: Option<&Reader<Vec<u8>>>, ip: IpAddr) -> Option<String> {
-    let asn = reader?.lookup::<geoip2::Asn>(ip).ok()?;
+    let asn = reader?.lookup(ip).ok()?.decode::<geoip2::Asn>().ok()??;
     let number = asn.autonomous_system_number?;
     let organization = asn.autonomous_system_organization.unwrap_or("unknown");
     Some(format!("asn{number}:{organization}"))
