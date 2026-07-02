@@ -295,7 +295,7 @@ async fn adaptive_blocker_blocks_cross_domain_abuse_after_threshold() {
     let routes = (0..3)
         .map(|i| {
             Route::new(
-                &format!("site-{i}.pxxlhost"),
+                format!("site-{i}.pxxlhost"),
                 vec![PathRoute::new(
                     "/",
                     vec![Upstream::new(format!("http://{upstream_addr}"))],

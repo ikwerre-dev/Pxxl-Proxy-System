@@ -985,12 +985,12 @@ WHERE timestamp_unix_ms < toUnixTimestamp(today()) * 1000
         let mut day = min_day;
         while day <= max_day {
             if self.rollup_day_already_backfilled(day).await? {
-                day = day + ChronoDuration::days(1);
+                day += ChronoDuration::days(1);
                 continue;
             }
             if self.rollup_day_has_rows(day).await? {
                 self.mark_rollup_day_backfilled(day).await?;
-                day = day + ChronoDuration::days(1);
+                day += ChronoDuration::days(1);
                 continue;
             }
 
@@ -1033,7 +1033,7 @@ GROUP BY
             self.mark_rollup_day_backfilled(day).await?;
             self.clear_read_cache();
             time::sleep(Duration::from_millis(CLICKHOUSE_ROLLUP_BACKFILL_PAUSE_MS)).await;
-            day = day + ChronoDuration::days(1);
+            day += ChronoDuration::days(1);
         }
         Ok(())
     }
