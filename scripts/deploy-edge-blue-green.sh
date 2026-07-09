@@ -97,10 +97,29 @@ remove_edge_dependents() {
 }
 
 restore_edge_dependents() {
-  local compose
-  compose="$(compose_cmd)"
-  [ -n "$compose" ] || return 0
-  $compose -f docker-compose.yml up -d --no-deps prometheus grafana >/dev/null 2>&1 || true
+  podman rm -f pxxl-proxy-grafana pxxl-proxy-prometheus >/dev/null 2>&1 || true
+  podman run \
+    --name=pxxl-proxy-prometheus \
+    --replace \
+    -d \
+    --restart unless-stopped \
+    --net proxy_default \
+    -p 127.0.0.1:9091:9090 \
+    -v "$PWD/monitoring/prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro" \
+    -v "$PWD/data/prometheus:/prometheus" \
+    docker.io/prom/prometheus:v2.55.0 >/dev/null 2>&1 || true
+  podman run \
+    --name=pxxl-proxy-grafana \
+    --replace \
+    -d \
+    --restart unless-stopped \
+    --net proxy_default \
+    -e GF_SECURITY_ADMIN_USER=admin \
+    -e "GF_SECURITY_ADMIN_PASSWORD=${GRAFANA_ADMIN_PASSWORD:-admin}" \
+    -p "127.0.0.1:${GRAFANA_PORT:-13000}:3000" \
+    -v "$PWD/data/grafana:/var/lib/grafana" \
+    -v "$PWD/monitoring/grafana/provisioning:/etc/grafana/provisioning:ro" \
+    docker.io/grafana/grafana:11.2.0 >/dev/null 2>&1 || true
 }
 
 remove_redirects() {
