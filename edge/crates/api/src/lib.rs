@@ -1,5 +1,5 @@
 use bytes::{Bytes, BytesMut};
-use chrono::{Datelike, TimeZone};
+use chrono::{Datelike, TimeZone, Utc};
 use http::{header::AUTHORIZATION, Method, Request, Response, StatusCode};
 use http_body_util::{BodyExt, Full};
 use hyper::{body::Incoming, service::service_fn};
@@ -213,6 +213,10 @@ fn unix_now_ms() -> u128 {
         .duration_since(UNIX_EPOCH)
         .map(|duration| duration.as_millis())
         .unwrap_or_default()
+}
+
+fn unix_now_u64() -> u64 {
+    unix_now_ms().try_into().unwrap_or(u64::MAX)
 }
 
 #[derive(Debug, Deserialize)]
@@ -857,7 +861,10 @@ impl ApiServer {
                 }
                 json_response(
                     StatusCode::OK,
-                    json!({ "routes": redact_routes(self.state.routes.snapshot()) }),
+                    json!({
+                        "schemaVersion": "proxy_routes_v2",
+                        "routes": redact_routes(self.state.routes.snapshot())
+                    }),
                 )
             }
             (Method::GET, "/v1/domains") => {
@@ -883,6 +890,9 @@ impl ApiServer {
                 json_response(
                     StatusCode::OK,
                     json!({
+                        "schemaVersion": "proxy_routes_v2",
+                        "generatedAt": Utc::now().to_rfc3339(),
+                        "routeCount": api_routes_snapshot(&self.state).len(),
                         "routes": redact_routes(api_routes_snapshot(&self.state)),
                     }),
                 )
@@ -928,7 +938,14 @@ impl ApiServer {
                 }
                 match self.state.routes.find_domain(&domain) {
                     Some(route) if route.source == RouteSource::Api => {
-                        json_response(StatusCode::OK, json!({ "route": redact_route(route) }))
+                        json_response(
+                            StatusCode::OK,
+                            json!({
+                                "schemaVersion": "proxy_routes_v2",
+                                "routeVersion": route.route_version,
+                                "route": redact_route(route)
+                            }),
+                        )
                     }
                     _ => json_response(StatusCode::NOT_FOUND, json!({"error": "route not found"})),
                 }
@@ -1815,6 +1832,12 @@ impl ApiServer {
         }
         if let Some(existing) = self.state.routes.find_domain(&route.domain) {
             if existing.source == RouteSource::Api && existing.route_version > route.route_version {
+                warn!(
+                    host = %route.domain,
+                    current_route_version = existing.route_version,
+                    route_version = route.route_version,
+                    "stale global route update rejected"
+                );
                 return json_response(
                     StatusCode::CONFLICT,
                     json!({
@@ -1837,6 +1860,7 @@ impl ApiServer {
         json_response(
             StatusCode::OK,
             json!({
+                "schemaVersion": "proxy_routes_v2",
                 "status": "active",
                 "host": route.domain,
                 "route_version": route.route_version,
@@ -2638,7 +2662,7 @@ impl InternalRouteBody {
         )
         .with_id(format!("runtime-{domain}"));
         route.tls = self.tls.unwrap_or(true);
-        route.route_version = self.route_version.unwrap_or(0);
+        route.route_version = self.route_version.unwrap_or_else(unix_now_u64);
         route.rules = self.rules;
         route.rules.allow_websocket = true;
         route.rules.www_alias = true;

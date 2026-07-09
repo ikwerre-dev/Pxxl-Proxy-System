@@ -33,7 +33,7 @@ const CLICKHOUSE_REQUEST_TIMEOUT_SECONDS: u64 = 5;
 const CLICKHOUSE_BATCH_MAX_EVENTS: usize = 250;
 const CLICKHOUSE_BATCH_FLUSH_MS: u64 = 1_000;
 const CLICKHOUSE_SPOOL_REPLAY_MAX_FILES: usize = 16;
-const CLICKHOUSE_READ_CACHE_TTL_SECONDS: u64 = 5;
+const CLICKHOUSE_READ_CACHE_TTL_SECONDS: u64 = 30;
 const CLICKHOUSE_READ_CACHE_MAX_ENTRIES: usize = 256;
 const CLICKHOUSE_ROLLUP_BACKFILL_PAUSE_MS: u64 = 100;
 const CLICKHOUSE_ROLLUP_DEFAULT_DAYS: u32 = 30;
@@ -404,10 +404,13 @@ CREATE TABLE IF NOT EXISTS pxxl_access_logs (
 ) ENGINE = MergeTree
 PARTITION BY toYYYYMM(toDateTime(timestamp_unix_ms / 1000))
 ORDER BY (domain, timestamp_unix_ms, request_id)
+TTL toDateTime(timestamp_unix_ms / 1000) + INTERVAL 24 HOUR
 "#,
         )
         .await?;
         self.ensure_access_rollup_schema().await?;
+        self.post_sql("ALTER TABLE pxxl_access_logs MODIFY TTL toDateTime(timestamp_unix_ms / 1000) + INTERVAL 24 HOUR")
+            .await?;
         self.post_sql("ALTER TABLE pxxl_access_logs ADD COLUMN IF NOT EXISTS request_id String")
             .await?;
         self.post_sql(
@@ -474,6 +477,70 @@ ORDER BY day
             .await?;
         self.post_sql("ALTER TABLE pxxl_access_rollup_day ADD INDEX IF NOT EXISTS idx_rollup_domain domain TYPE set(100000) GRANULARITY 4")
             .await?;
+        self.post_sql(
+            r#"
+CREATE TABLE IF NOT EXISTS pxxl_access_rollup_hour (
+  bucket DateTime,
+  domain String,
+  country_code String,
+  country_name String,
+  continent_code String,
+  continent_name String,
+  region String,
+  city String,
+  status_class UInt16,
+  requests SimpleAggregateFunction(sum, UInt64),
+  blocked SimpleAggregateFunction(sum, UInt64),
+  errors SimpleAggregateFunction(sum, UInt64),
+  bytes_sent SimpleAggregateFunction(sum, UInt64),
+  bytes_received SimpleAggregateFunction(sum, UInt64),
+  latency_ms_sum SimpleAggregateFunction(sum, UInt64),
+  unique_ips AggregateFunction(uniqCombined64, String)
+) ENGINE = AggregatingMergeTree
+PARTITION BY toYYYYMM(bucket)
+ORDER BY (domain, bucket, country_code, continent_code, region, city, status_class)
+"#,
+        )
+        .await?;
+        self.post_sql("ALTER TABLE pxxl_access_rollup_hour ADD INDEX IF NOT EXISTS idx_rollup_hour_bucket bucket TYPE minmax GRANULARITY 1")
+            .await?;
+        self.post_sql("ALTER TABLE pxxl_access_rollup_hour ADD INDEX IF NOT EXISTS idx_rollup_hour_domain domain TYPE set(100000) GRANULARITY 4")
+            .await?;
+        self.post_sql(
+            r#"
+CREATE MATERIALIZED VIEW IF NOT EXISTS pxxl_access_rollup_hour_mv
+TO pxxl_access_rollup_hour AS
+SELECT
+  toStartOfHour(toDateTime(timestamp_unix_ms / 1000)) AS bucket,
+  domain,
+  ifNull(country_code, '') AS country_code,
+  ifNull(country_name, '') AS country_name,
+  ifNull(continent_code, '') AS continent_code,
+  ifNull(continent_name, '') AS continent_name,
+  ifNull(region, '') AS region,
+  ifNull(city, '') AS city,
+  toUInt16(intDiv(status, 100) * 100) AS status_class,
+  count() AS requests,
+  countIf(status >= 400) AS blocked,
+  countIf(status >= 500) AS errors,
+  sum(bytes_sent) AS bytes_sent,
+  sum(bytes_received) AS bytes_received,
+  sum(latency_ms) AS latency_ms_sum,
+  uniqCombined64State(ifNull(remote_ip, '')) AS unique_ips
+FROM pxxl_access_logs
+GROUP BY
+  bucket,
+  domain,
+  country_code,
+  country_name,
+  continent_code,
+  continent_name,
+  region,
+  city,
+  status_class
+"#,
+        )
+        .await?;
         self.post_sql(
             r#"
 CREATE MATERIALIZED VIEW IF NOT EXISTS pxxl_access_rollup_day_mv

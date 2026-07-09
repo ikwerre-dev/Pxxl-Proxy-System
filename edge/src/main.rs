@@ -14,7 +14,7 @@ use pxxl_api::{
 };
 use pxxl_common::{ip_allowed_for_upstream, parse_ip_net, PathRoute, Route, RouteSource, Upstream};
 use pxxl_config::{HealthCheckConfig, PxxlConfig};
-use pxxl_core::{route_allows_www_alias, EdgeState, RouteRegistry};
+use pxxl_core::{route_allows_www_alias, EdgeState, RouteRegistry, RouteUpstreamHealth};
 use pxxl_database_proxy::{
     load_database_routes_from_file, run_database_proxy, DatabaseProxyRoute, DatabaseRouteRegistry,
 };
@@ -704,12 +704,17 @@ async fn run_health_checks(
         tokio::select! {
             _ = interval.tick() => {
                 let upstreams = collect_upstream_checks(&state.routes.snapshot());
-                let mut health = HashMap::new();
+                let mut health = Vec::new();
                 for upstream in upstreams {
                     let healthy = check_upstream(&client, &upstream, &config.path, timeout).await;
-                    health.insert(upstream.url.clone(), healthy);
+                    health.push(RouteUpstreamHealth {
+                        domain: upstream.domain.clone(),
+                        path_prefix: upstream.path_prefix.clone(),
+                        upstream_url: upstream.url.clone(),
+                        healthy,
+                    });
                 }
-                state.set_upstream_health(&health);
+                state.set_route_upstream_health_many(&health);
             }
             changed = shutdown.changed() => {
                 if changed.is_ok() && *shutdown.borrow() {
@@ -738,6 +743,9 @@ async fn check_upstream(
     let request = match Request::builder()
         .method("GET")
         .uri(uri)
+        .header("Host", upstream.domain.as_str())
+        .header("X-Forwarded-Host", upstream.domain.as_str())
+        .header("X-Pxxl-Health-Check", "1")
         .body(Empty::<Bytes>::new())
     {
         Ok(request) => request,
@@ -836,6 +844,8 @@ fn private_upstreams_allowed() -> bool {
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
 struct UpstreamCheck {
     source: RouteSource,
+    domain: String,
+    path_prefix: String,
     url: String,
 }
 
@@ -845,6 +855,8 @@ fn collect_upstream_checks(routes: &[Route]) -> BTreeSet<UpstreamCheck> {
         for path in &route.paths {
             upstreams.extend(path.upstreams.iter().map(|upstream| UpstreamCheck {
                 source: route.source.clone(),
+                domain: route.domain.clone(),
+                path_prefix: path.prefix.clone(),
                 url: upstream.url.clone(),
             }));
         }
@@ -855,6 +867,8 @@ fn collect_upstream_checks(routes: &[Route]) -> BTreeSet<UpstreamCheck> {
                     .iter()
                     .map(|upstream| UpstreamCheck {
                         source: route.source.clone(),
+                        domain: route.domain.clone(),
+                        path_prefix: "/".to_string(),
                         url: upstream.url.clone(),
                     }),
             );
@@ -862,6 +876,8 @@ fn collect_upstream_checks(routes: &[Route]) -> BTreeSet<UpstreamCheck> {
         for split in &route.rules.traffic_splits {
             upstreams.extend(split.upstreams.iter().map(|upstream| UpstreamCheck {
                 source: route.source.clone(),
+                domain: route.domain.clone(),
+                path_prefix: "/".to_string(),
                 url: upstream.url.clone(),
             }));
         }

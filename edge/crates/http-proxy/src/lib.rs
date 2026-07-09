@@ -1275,6 +1275,7 @@ impl PolicyEnforcer {
         state: &EdgeState,
         config: &PassiveHealthConfig,
         domain: &str,
+        path_prefix: &str,
         upstream: &str,
         status: StatusCode,
         error: Option<&PxxlError>,
@@ -1289,9 +1290,10 @@ impl PolicyEnforcer {
                 .iter()
                 .any(|code| *code == status.as_u16())
             || status.is_server_error();
+        let health_key = route_health_key(domain, path_prefix, upstream);
         let entry = self
             .passive_health
-            .entry(upstream.to_string())
+            .entry(health_key.clone())
             .or_insert_with(|| Mutex::new(PassiveHealthState::default()));
         let mut passive = entry.lock();
 
@@ -1303,7 +1305,12 @@ impl PolicyEnforcer {
                 .with_label_values(&[upstream, "failure"])
                 .inc();
             if passive.failures >= config.failure_threshold.max(1) {
-                state.set_single_upstream_health(upstream, false);
+                state.set_route_upstream_health(pxxl_core::RouteUpstreamHealth {
+                    domain: domain.to_string(),
+                    path_prefix: path_prefix.to_string(),
+                    upstream_url: upstream.to_string(),
+                    healthy: false,
+                });
                 state
                     .metrics
                     .passive_health_events_total
@@ -1316,10 +1323,17 @@ impl PolicyEnforcer {
                     .inc();
                 let state = state.clone();
                 let upstream = upstream.to_string();
+                let domain = domain.to_string();
+                let path_prefix = path_prefix.to_string();
                 let recovery = Duration::from_secs(config.recovery_seconds.max(1));
                 tokio::spawn(async move {
                     tokio::time::sleep(recovery).await;
-                    state.set_single_upstream_health(&upstream, true);
+                    state.set_route_upstream_health(pxxl_core::RouteUpstreamHealth {
+                        domain,
+                        path_prefix,
+                        upstream_url: upstream,
+                        healthy: true,
+                    });
                 });
             }
         } else {
@@ -2151,6 +2165,7 @@ impl ProxyServer {
                         &self.state,
                         &middleware.passive_health,
                         &domain,
+                        &matched.path.prefix,
                         &upstream.url,
                         status,
                         None,
@@ -2239,6 +2254,7 @@ impl ProxyServer {
                         &self.state,
                         &middleware.passive_health,
                         &domain,
+                        &matched.path.prefix,
                         &upstream.url,
                         StatusCode::BAD_GATEWAY,
                         Some(&error),
@@ -2434,6 +2450,7 @@ impl ProxyServer {
                     &self.state,
                     &middleware.passive_health,
                     &domain,
+                    &matched.path.prefix,
                     &upstream.url,
                     status,
                     None,
@@ -2522,6 +2539,7 @@ impl ProxyServer {
                     &self.state,
                     &middleware.passive_health,
                     &domain,
+                    &matched.path.prefix,
                     &upstream.url,
                     StatusCode::BAD_GATEWAY,
                     Some(&error),
@@ -4778,6 +4796,10 @@ fn mirror_should_run(domain: &str, uri: &Uri, upstream: &str, percent: u8) -> bo
 
 fn circuit_key(route_id: &str, path_prefix: &str, upstream: &str) -> String {
     format!("{route_id}:{path_prefix}:{upstream}")
+}
+
+fn route_health_key(domain: &str, path_prefix: &str, upstream: &str) -> String {
+    format!("{domain}:{path_prefix}:{upstream}")
 }
 
 fn in_flight_key(

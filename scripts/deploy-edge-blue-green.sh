@@ -180,8 +180,8 @@ run_edge() {
     --network-alias edge \
     "${port_args[@]}" \
     --restart unless-stopped \
-    --cpus "${PXXL_EDGE_CPUS:-1.0}" \
-    -m "${PXXL_EDGE_MEMORY:-512m}" \
+    --cpus "${PXXL_EDGE_CPUS:-4.0}" \
+    -m "${PXXL_EDGE_MEMORY:-15g}" \
     "${common_env[@]}" \
     "$image" >/dev/null
 }

@@ -486,7 +486,7 @@ fn default_podman_published_host() -> String {
 }
 
 fn default_docker_poll_seconds() -> u64 {
-    5
+    60
 }
 
 fn default_error_pages_dir() -> String {

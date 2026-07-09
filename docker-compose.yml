@@ -56,7 +56,7 @@ services:
     cap_add:
       - NET_BIND_SERVICE
     mem_limit: 15g
-    cpus: "1.0"
+    cpus: "${PXXL_EDGE_CPUS:-4.0}"
     healthcheck:
       test: ["CMD-SHELL", "test -x /usr/local/bin/pxxl-edge"]
       interval: 30s

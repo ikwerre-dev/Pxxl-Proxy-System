@@ -26,6 +26,14 @@ const RECENT_VISIT_LIMIT: usize = 5000;
 const MAX_COUNTER_KEYS: usize = 1_000;
 const OVERFLOW_COUNTER_KEY: &str = "__other__";
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RouteUpstreamHealth {
+    pub domain: String,
+    pub path_prefix: String,
+    pub upstream_url: String,
+    pub healthy: bool,
+}
+
 #[derive(Debug)]
 pub struct RouteRegistry {
     routes: ArcSwap<RouteTable>,
@@ -211,6 +219,85 @@ impl RouteRegistry {
     pub fn set_single_upstream_health(&self, upstream_url: &str, healthy: bool) {
         self.set_upstream_health(&HashMap::from([(upstream_url.to_string(), healthy)]));
     }
+
+    pub fn set_route_upstream_health(&self, update: &RouteUpstreamHealth) {
+        let domain = normalize_domain(&update.domain);
+        if domain.is_empty() || update.upstream_url.trim().is_empty() {
+            return;
+        }
+        let mut routes = self.snapshot();
+        for route in &mut routes {
+            if route.domain != domain {
+                continue;
+            }
+            for path in &mut route.paths {
+                if path.prefix == update.path_prefix {
+                    for upstream in &mut path.upstreams {
+                        if upstream.url == update.upstream_url {
+                            upstream.healthy = update.healthy;
+                        }
+                    }
+                }
+            }
+            for split in &mut route.rules.traffic_splits {
+                for upstream in &mut split.upstreams {
+                    if upstream.url == update.upstream_url {
+                        upstream.healthy = update.healthy;
+                    }
+                }
+            }
+            for location_route in &mut route.rules.location_routes {
+                for upstream in &mut location_route.upstreams {
+                    if upstream.url == update.upstream_url {
+                        upstream.healthy = update.healthy;
+                    }
+                }
+            }
+        }
+        self.replace_all(routes);
+    }
+
+    pub fn set_route_upstream_health_many(&self, updates: &[RouteUpstreamHealth]) {
+        if updates.is_empty() {
+            return;
+        }
+        let mut routes = self.snapshot();
+        for update in updates {
+            let domain = normalize_domain(&update.domain);
+            if domain.is_empty() || update.upstream_url.trim().is_empty() {
+                continue;
+            }
+            for route in &mut routes {
+                if route.domain != domain {
+                    continue;
+                }
+                for path in &mut route.paths {
+                    if path.prefix == update.path_prefix {
+                        for upstream in &mut path.upstreams {
+                            if upstream.url == update.upstream_url {
+                                upstream.healthy = update.healthy;
+                            }
+                        }
+                    }
+                }
+                for split in &mut route.rules.traffic_splits {
+                    for upstream in &mut split.upstreams {
+                        if upstream.url == update.upstream_url {
+                            upstream.healthy = update.healthy;
+                        }
+                    }
+                }
+                for location_route in &mut route.rules.location_routes {
+                    for upstream in &mut location_route.upstreams {
+                        if upstream.url == update.upstream_url {
+                            upstream.healthy = update.healthy;
+                        }
+                    }
+                }
+            }
+        }
+        self.replace_all(routes);
+    }
 }
 
 #[derive(Clone)]
@@ -289,6 +376,30 @@ impl EdgeState {
             .with_label_values(&[upstream_url])
             .set(i64::from(healthy));
     }
+
+    pub fn set_route_upstream_health(&self, update: RouteUpstreamHealth) {
+        self.routes.set_route_upstream_health(&update);
+        let label = route_upstream_health_label(&update.domain, &update.path_prefix, &update.upstream_url);
+        self.metrics
+            .upstream_health_status
+            .with_label_values(&[&label])
+            .set(i64::from(update.healthy));
+    }
+
+    pub fn set_route_upstream_health_many(&self, updates: &[RouteUpstreamHealth]) {
+        self.routes.set_route_upstream_health_many(updates);
+        for update in updates {
+            let label = route_upstream_health_label(&update.domain, &update.path_prefix, &update.upstream_url);
+            self.metrics
+                .upstream_health_status
+                .with_label_values(&[&label])
+                .set(i64::from(update.healthy));
+        }
+    }
+}
+
+fn route_upstream_health_label(domain: &str, path_prefix: &str, upstream_url: &str) -> String {
+    format!("{domain}|{path_prefix}|{upstream_url}")
 }
 
 #[derive(Debug, Default)]
