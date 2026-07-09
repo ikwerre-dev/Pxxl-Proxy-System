@@ -7,6 +7,12 @@ PULL_LATEST=true
 
 log() { printf '[%s] %s\n' "$APP_NAME" "$*"; }
 die() { printf '[%s] ERROR: %s\n' "$APP_NAME" "$*" >&2; exit 1; }
+ensure_writable_dir() {
+  local dir="$1"
+  mkdir -p "$dir"
+  chmod 0777 "$dir" >/dev/null 2>&1 || true
+  [ -w "$dir" ] || die "directory is not writable: $dir"
+}
 
 for arg in "$@"; do
   case "$arg" in
@@ -55,15 +61,13 @@ case "$database_routes_dir" in
   /data/*) database_routes_host_dir="$PWD/data/${database_routes_dir#/data/}" ;;
   *) die "PXXL_DATABASE_PROXY_ROUTES_PATH must live under /data" ;;
 esac
-mkdir -p "$database_routes_host_dir"
-chmod 0777 "$database_routes_host_dir"
+ensure_writable_dir "$database_routes_host_dir"
 http_routes_dir="${HTTP_ROUTE_SNAPSHOT_PATH%/*}"
 case "$http_routes_dir" in
   /data/*) http_routes_host_dir="$PWD/data/${http_routes_dir#/data/}" ;;
   *) die "PXXL_ROUTE_SNAPSHOT_PATH must live under /data" ;;
 esac
-mkdir -p "$http_routes_host_dir"
-chmod 0777 "$http_routes_host_dir"
+ensure_writable_dir "$http_routes_host_dir"
 
 cleanup_candidate() {
   podman rm -f "$candidate" >/dev/null 2>&1 || true
