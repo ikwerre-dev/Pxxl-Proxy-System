@@ -20,6 +20,14 @@ pub enum PxxlError {
     NoHealthyUpstreams { route_id: String },
     #[error("invalid upstream URL {0}")]
     InvalidUpstream(String),
+    #[error("could not resolve upstream host for {0}")]
+    UpstreamDnsResolutionFailed(String),
+    #[error("upstream connection was refused for {0}")]
+    UpstreamConnectionRefused(String),
+    #[error("upstream connection timed out for {0}")]
+    UpstreamConnectionTimeout(String),
+    #[error("upstream connection failed for {0}")]
+    UpstreamConnectionFailed(String),
     #[error("invalid host header")]
     InvalidHost,
     #[error("invalid request path: {0}")]

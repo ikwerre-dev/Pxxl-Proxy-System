@@ -1,7 +1,7 @@
 use bytes::Bytes;
 use http::{Request, Response, StatusCode};
 use http_body_util::{BodyExt, Empty, Full};
-use hyper::service::service_fn;
+use hyper::{body::Incoming, service::service_fn};
 use hyper_util::{
     client::legacy::{connect::HttpConnector, Client},
     rt::{TokioExecutor, TokioIo},
@@ -130,6 +130,112 @@ async fn assigns_request_id_to_response_upstream_and_analytics() {
     assert_eq!(visits.len(), 1);
     assert_eq!(visits[0].request_id, response_request_id);
     assert_eq!(visits[0].path, "/tracked");
+}
+
+#[tokio::test]
+async fn reports_a_registered_route_with_a_refused_runtime_port() {
+    let unused_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let unused_addr = unused_listener.local_addr().unwrap();
+    drop(unused_listener);
+
+    let proxy_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let proxy_addr = proxy_listener.local_addr().unwrap();
+    let (shutdown_tx, shutdown_rx) = watch::channel(false);
+    let route = Route::new(
+        "wrong-port.example",
+        vec![PathRoute::new(
+            "/",
+            vec![Upstream::new(format!("http://{unused_addr}"))],
+        )],
+        RouteSource::Static,
+    );
+    let server = tokio::spawn(run_http_proxy_on_listener(
+        proxy_listener,
+        test_state(vec![route]),
+        shutdown_rx,
+    ));
+
+    let response = proxy_request(proxy_addr, "wrong-port.example", "/").await;
+    let status = response.status();
+    let headers = response.headers().clone();
+    let body = response.into_body().collect().await.unwrap().to_bytes();
+    let body = std::str::from_utf8(&body).unwrap();
+
+    shutdown_tx.send(true).unwrap();
+    server.await.unwrap().unwrap();
+
+    assert_eq!(status, StatusCode::BAD_GATEWAY);
+    assert_eq!(
+        headers
+            .get("x-pxxl-error-code")
+            .and_then(|value| value.to_str().ok()),
+        Some("upstream_connection_refused")
+    );
+    assert!(body.contains("wrong-port.example"));
+    assert!(body.contains("runtime refused the connection"));
+    assert!(body.contains(headers.get("x-request-id").unwrap().to_str().unwrap()));
+    assert!(!body.contains(&unused_addr.to_string()));
+}
+
+#[tokio::test]
+async fn distinguishes_a_missing_route_from_an_unhealthy_service() {
+    let proxy_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let proxy_addr = proxy_listener.local_addr().unwrap();
+    let (shutdown_tx, shutdown_rx) = watch::channel(false);
+    let mut unhealthy_upstream = Upstream::new("http://runtime.internal:3000");
+    unhealthy_upstream.healthy = false;
+    let route = Route::new(
+        "unhealthy.example",
+        vec![PathRoute::new("/", vec![unhealthy_upstream])],
+        RouteSource::Static,
+    );
+    let server = tokio::spawn(run_http_proxy_on_listener(
+        proxy_listener,
+        test_state(vec![route]),
+        shutdown_rx,
+    ));
+
+    let missing = proxy_request(proxy_addr, "missing.example", "/").await;
+    let missing_status = missing.status();
+    let missing_code = missing
+        .headers()
+        .get("x-pxxl-error-code")
+        .unwrap()
+        .to_str()
+        .unwrap()
+        .to_string();
+    let missing_body = missing.into_body().collect().await.unwrap().to_bytes();
+
+    let unhealthy = proxy_request(proxy_addr, "unhealthy.example", "/").await;
+    let unhealthy_status = unhealthy.status();
+    let unhealthy_code = unhealthy
+        .headers()
+        .get("x-pxxl-error-code")
+        .unwrap()
+        .to_str()
+        .unwrap()
+        .to_string();
+    let unhealthy_body = unhealthy.into_body().collect().await.unwrap().to_bytes();
+
+    shutdown_tx.send(true).unwrap();
+    server.await.unwrap().unwrap();
+
+    assert_eq!(missing_status, StatusCode::NOT_FOUND);
+    assert_eq!(missing_code, "route_not_registered");
+    assert!(std::str::from_utf8(&missing_body)
+        .unwrap()
+        .contains("No route is registered"));
+    assert!(std::str::from_utf8(&missing_body)
+        .unwrap()
+        .contains("missing.example"));
+    assert_eq!(unhealthy_status, StatusCode::SERVICE_UNAVAILABLE);
+    assert_eq!(unhealthy_code, "all_upstreams_unhealthy");
+    assert!(std::str::from_utf8(&unhealthy_body)
+        .unwrap()
+        .contains("no registered runtime replica"));
+    assert!(!std::str::from_utf8(&unhealthy_body)
+        .unwrap()
+        .contains("runtime.internal"));
 }
 
 #[tokio::test]
@@ -1258,6 +1364,18 @@ async fn spawn_upstream_with_content_type(
     });
 
     addr
+}
+
+async fn proxy_request(proxy_addr: SocketAddr, host: &str, path: &str) -> Response<Incoming> {
+    let client: Client<HttpConnector, Empty<Bytes>> =
+        Client::builder(TokioExecutor::new()).build_http();
+    let request = Request::builder()
+        .method("GET")
+        .uri(format!("http://{proxy_addr}{path}"))
+        .header("host", host)
+        .body(Empty::<Bytes>::new())
+        .unwrap();
+    client.request(request).await.unwrap()
 }
 
 fn digest_nonce_from_header(value: &str) -> String {

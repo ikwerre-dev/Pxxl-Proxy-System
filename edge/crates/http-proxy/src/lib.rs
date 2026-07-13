@@ -76,6 +76,9 @@ const LEGACY_TRUSTED_CLIENT_IP_CIDRS_ENV: &str = "PXXL_TRUSTED_PROXY_CIDRS";
 const RUNTIME_DIAGNOSTICS_URL_ENV: &str = "PXXL_RUNTIME_DIAGNOSTICS_URL";
 const GATEWAY_RUNTIME_DIAGNOSTICS_URL_ENV: &str = "PXXL_GATEWAY_RUNTIME_DIAGNOSTICS_URL";
 const RUNTIME_DIAGNOSTICS_TIMEOUT_MS_ENV: &str = "PXXL_RUNTIME_DIAGNOSTICS_TIMEOUT_MS";
+const UPSTREAM_CONNECT_TIMEOUT_SECONDS: u64 = 5;
+const MAX_RUNTIME_DIAGNOSTIC_BYTES: usize = 16 * 1024;
+const PXXL_ERROR_CODE_HEADER: &str = "x-pxxl-error-code";
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum ProxyErrorReason {
@@ -83,7 +86,13 @@ enum ProxyErrorReason {
     RouteHasNoUpstreams,
     AllUpstreamsUnhealthy,
     CircuitBreakerOpen,
-    UpstreamTcpUnreachable,
+    UpstreamDnsResolutionFailed,
+    UpstreamConnectionRefused,
+    UpstreamConnectionTimeout,
+    UpstreamPortIncorrect,
+    UpstreamPortNotListening,
+    UpstreamConfigurationInvalid,
+    UpstreamConnectionFailed,
     ProxyInternal,
 }
 
@@ -94,7 +103,13 @@ impl ProxyErrorReason {
             Self::RouteHasNoUpstreams => "route_has_no_upstreams",
             Self::AllUpstreamsUnhealthy => "all_upstreams_unhealthy",
             Self::CircuitBreakerOpen => "circuit_breaker_open",
-            Self::UpstreamTcpUnreachable => "upstream_tcp_unreachable",
+            Self::UpstreamDnsResolutionFailed => "upstream_dns_resolution_failed",
+            Self::UpstreamConnectionRefused => "upstream_connection_refused",
+            Self::UpstreamConnectionTimeout => "upstream_connection_timeout",
+            Self::UpstreamPortIncorrect => "upstream_port_incorrect",
+            Self::UpstreamPortNotListening => "upstream_port_not_listening",
+            Self::UpstreamConfigurationInvalid => "upstream_configuration_invalid",
+            Self::UpstreamConnectionFailed => "upstream_connection_failed",
             Self::ProxyInternal => "proxy_internal_error",
         }
     }
@@ -108,13 +123,31 @@ impl ProxyErrorReason {
                 "This domain is registered, but it does not have a runtime container target yet."
             }
             Self::AllUpstreamsUnhealthy => {
-                "The app route exists, but Pxxl cannot reach the port registered for this deployment. Make sure your app listens on the same port configured in your Pxxl project settings, or reads the PORT environment variable provided by Pxxl."
+                "The deployment and route exist, but no registered runtime replica is currently healthy. Pxxl will resume traffic when a healthy replica is available."
             }
             Self::CircuitBreakerOpen => {
                 "The app route exists, but recent upstream failures temporarily opened the protection circuit."
             }
-            Self::UpstreamTcpUnreachable => {
-                "The app route exists, but Pxxl could not connect to the registered runtime port. Check that your app is binding to 0.0.0.0 and listening on the same port configured in your Pxxl project settings, preferably through the PORT environment variable."
+            Self::UpstreamDnsResolutionFailed => {
+                "The route exists, but its runtime service name could not be resolved. Pxxl is retrying service discovery."
+            }
+            Self::UpstreamConnectionRefused => {
+                "The route exists, but the runtime refused the connection. The app may still be starting or may only be bound to localhost."
+            }
+            Self::UpstreamConnectionTimeout => {
+                "The route exists, but the runtime did not accept a connection before the timeout. The app or runtime network may be unavailable."
+            }
+            Self::UpstreamPortIncorrect => {
+                "The deployment exists, but its registered runtime port does not match the route. Configure the app to listen on the PORT value supplied by Pxxl and bind to 0.0.0.0."
+            }
+            Self::UpstreamPortNotListening => {
+                "The deployment exists, but nothing is listening on its registered runtime port. Make sure the app uses the PORT value supplied by Pxxl and binds to 0.0.0.0."
+            }
+            Self::UpstreamConfigurationInvalid => {
+                "The route exists, but its runtime target is invalid. Review the deployment port and protocol, then redeploy the service."
+            }
+            Self::UpstreamConnectionFailed => {
+                "The route exists, but Pxxl could not establish a connection to the runtime. The runtime may be restarting or temporarily unreachable."
             }
             Self::ProxyInternal => "The proxy hit an internal routing error while serving this request.",
         }
@@ -290,7 +323,9 @@ impl ErrorPageRenderer {
 
     fn response_with_reason_code(&self, context: ErrorRenderContext<'_>) -> Response<BoxBody> {
         if !self.enabled {
-            return text_response(context.status, context.message);
+            let mut response = text_response(context.status, context.message);
+            attach_error_code_header(response.headers_mut(), context.reason_code);
+            return response;
         }
 
         let body = self
@@ -310,7 +345,9 @@ impl ErrorPageRenderer {
                 )
             });
 
-        html_response(context.status, body)
+        let mut response = html_response(context.status, body);
+        attach_error_code_header(response.headers_mut(), context.reason_code);
+        response
     }
 
     pub fn bandwidth_exceeded_response(
@@ -1515,8 +1552,6 @@ struct RuntimeDiagnosticsConfig {
 struct RuntimeDiagnosticPayload {
     #[serde(rename = "diagnosticCode")]
     diagnostic_code: Option<String>,
-    #[serde(rename = "diagnosticSummary")]
-    diagnostic_summary: Option<String>,
 }
 
 impl RuntimeDiagnosticsConfig {
@@ -1570,6 +1605,7 @@ fn first_env(keys: &[&str]) -> Option<String> {
 fn https_connector() -> HttpsConnector<HttpConnector> {
     let mut http = HttpConnector::new();
     http.enforce_http(false);
+    http.set_connect_timeout(Some(Duration::from_secs(UPSTREAM_CONNECT_TIMEOUT_SECONDS)));
 
     hyper_rustls::HttpsConnectorBuilder::new()
         .with_native_roots()
@@ -2675,7 +2711,7 @@ impl ProxyServer {
             .client
             .request(req)
             .await
-            .map_err(|_| PxxlError::InvalidUpstream(context.upstream.url.clone()))?;
+            .map_err(|error| classify_upstream_client_error(&error, &context.upstream.url))?;
         BufferedResponse::from_response(
             response,
             context.middleware.response_buffering.max_response_bytes,
@@ -2749,7 +2785,7 @@ impl ProxyServer {
             .client
             .request(req)
             .await
-            .map_err(|_| PxxlError::InvalidUpstream(context.upstream.url.clone()))?;
+            .map_err(|error| classify_upstream_client_error(&error, &context.upstream.url))?;
 
         if websocket_upgrade && response.status() == StatusCode::SWITCHING_PROTOCOLS {
             let mut response = response.map(|body| {
@@ -2819,21 +2855,17 @@ impl ProxyServer {
         started: Instant,
     ) -> Response<BoxBody> {
         let diagnostic = self.fetch_runtime_diagnostic(domain, path).await;
-        let reason_code = diagnostic
+        let reason = diagnostic
             .as_ref()
-            .and_then(|payload| clean_diagnostic_value(payload.diagnostic_code.as_deref()))
-            .unwrap_or_else(|| reason.code().to_string());
-        let message = diagnostic
-            .as_ref()
-            .and_then(|payload| clean_diagnostic_value(payload.diagnostic_summary.as_deref()))
-            .unwrap_or_else(|| reason.public_message().to_string());
+            .and_then(|payload| runtime_diagnostic_reason(payload.diagnostic_code.as_deref()))
+            .unwrap_or(reason);
         self.error_pages
             .response_with_reason_code(ErrorRenderContext {
                 status,
-                message: &message,
-                reason_code: &reason_code,
+                message: reason.public_message(),
+                reason_code: reason.code(),
                 domain,
-                path,
+                path: "/",
                 request_id,
                 processing_time_ms: started.elapsed().as_millis(),
             })
@@ -2908,7 +2940,10 @@ impl ProxyServer {
             );
             return None;
         }
-        let body = match response.into_body().collect().await {
+        let body = match Limited::new(response.into_body(), MAX_RUNTIME_DIAGNOSTIC_BYTES)
+            .collect()
+            .await
+        {
             Ok(collected) => collected.to_bytes(),
             Err(error) => {
                 debug!(%error, "failed to read runtime diagnostics response");
@@ -2954,7 +2989,13 @@ impl ProxyServer {
 
     fn upstream_failure_reason(&self, error: &PxxlError) -> ProxyErrorReason {
         match error {
-            PxxlError::InvalidUpstream(_) => ProxyErrorReason::UpstreamTcpUnreachable,
+            PxxlError::UpstreamDnsResolutionFailed(_) => {
+                ProxyErrorReason::UpstreamDnsResolutionFailed
+            }
+            PxxlError::UpstreamConnectionRefused(_) => ProxyErrorReason::UpstreamConnectionRefused,
+            PxxlError::UpstreamConnectionTimeout(_) => ProxyErrorReason::UpstreamConnectionTimeout,
+            PxxlError::UpstreamConnectionFailed(_) => ProxyErrorReason::UpstreamConnectionFailed,
+            PxxlError::InvalidUpstream(_) => ProxyErrorReason::UpstreamConfigurationInvalid,
             _ => ProxyErrorReason::ProxyInternal,
         }
     }
@@ -4854,12 +4895,91 @@ fn empty_body() -> BoxBody {
     boxed_full(Bytes::new())
 }
 
-fn clean_diagnostic_value(value: Option<&str>) -> Option<String> {
-    let value = value?.trim();
-    if value.is_empty() || value.eq_ignore_ascii_case("<nil>") {
-        return None;
+fn runtime_diagnostic_reason(value: Option<&str>) -> Option<ProxyErrorReason> {
+    match value?.trim().to_ascii_lowercase().as_str() {
+        "route_not_registered"
+        | "route_missing"
+        | "global_route_missing"
+        | "domain_mapping_missing" => Some(ProxyErrorReason::RouteNotRegistered),
+        "route_has_no_upstreams"
+        | "deployment_mapping_issue"
+        | "container_missing"
+        | "allocated_port_missing"
+        | "published_port_missing" => Some(ProxyErrorReason::RouteHasNoUpstreams),
+        "all_upstreams_unhealthy"
+        | "service_unhealthy"
+        | "deployment_unhealthy"
+        | "app_crashed" => Some(ProxyErrorReason::AllUpstreamsUnhealthy),
+        "circuit_breaker_open" => Some(ProxyErrorReason::CircuitBreakerOpen),
+        "upstream_dns_resolution_failed" | "dns_resolution_failed" | "dns_error" => {
+            Some(ProxyErrorReason::UpstreamDnsResolutionFailed)
+        }
+        "upstream_connection_refused" | "connection_refused" => {
+            Some(ProxyErrorReason::UpstreamConnectionRefused)
+        }
+        "upstream_connection_timeout" | "connection_timeout" | "upstream_timeout" => {
+            Some(ProxyErrorReason::UpstreamConnectionTimeout)
+        }
+        "upstream_port_incorrect"
+        | "incorrect_port"
+        | "wrong_port"
+        | "port_mismatch"
+        | "allocated_port_wrong" => Some(ProxyErrorReason::UpstreamPortIncorrect),
+        "upstream_port_not_listening" | "no_listener" => {
+            Some(ProxyErrorReason::UpstreamPortNotListening)
+        }
+        "upstream_configuration_invalid" | "stale_route_target" => {
+            Some(ProxyErrorReason::UpstreamConfigurationInvalid)
+        }
+        "upstream_connection_failed" | "upstream_tcp_unreachable" => {
+            Some(ProxyErrorReason::UpstreamConnectionFailed)
+        }
+        _ => None,
     }
-    Some(value.to_string())
+}
+
+fn classify_upstream_client_error(
+    error: &(dyn std::error::Error + 'static),
+    upstream: &str,
+) -> PxxlError {
+    let mut source = Some(error);
+    let mut dns_failure = false;
+    while let Some(current) = source {
+        if let Some(io_error) = current.downcast_ref::<std::io::Error>() {
+            match io_error.kind() {
+                std::io::ErrorKind::ConnectionRefused => {
+                    return PxxlError::UpstreamConnectionRefused(upstream.to_string());
+                }
+                std::io::ErrorKind::TimedOut => {
+                    return PxxlError::UpstreamConnectionTimeout(upstream.to_string());
+                }
+                _ => {}
+            }
+        }
+        let message = current.to_string().to_ascii_lowercase();
+        dns_failure |= [
+            "dns error",
+            "failed to lookup address",
+            "name or service not known",
+            "nodename nor servname provided",
+            "no such host",
+            "temporary failure in name resolution",
+        ]
+        .iter()
+        .any(|marker| message.contains(marker));
+        source = current.source();
+    }
+    if dns_failure {
+        PxxlError::UpstreamDnsResolutionFailed(upstream.to_string())
+    } else {
+        PxxlError::UpstreamConnectionFailed(upstream.to_string())
+    }
+}
+
+fn attach_error_code_header(headers: &mut HeaderMap, reason_code: &str) {
+    if let Ok(value) = HeaderValue::from_str(reason_code) {
+        headers.insert(HeaderName::from_static(PXXL_ERROR_CODE_HEADER), value);
+    }
 }
 
 async fn serve_acme_http01_challenge(path: &str) -> Option<Response<BoxBody>> {
@@ -5058,6 +5178,75 @@ mod tests {
         assert!(rendered.contains("upstream_tcp_unreachable"));
         assert!(rendered.contains("app.pxxlhost/users?name=&lt;x&gt;"));
         assert!(rendered.contains("17"));
+    }
+
+    #[test]
+    fn maps_only_allowlisted_runtime_diagnostics_to_public_messages() {
+        let incorrect_port = runtime_diagnostic_reason(Some("allocated_port_wrong")).unwrap();
+        assert_eq!(incorrect_port, ProxyErrorReason::UpstreamPortIncorrect);
+        assert_eq!(incorrect_port.code(), "upstream_port_incorrect");
+        assert!(incorrect_port.public_message().contains("PORT"));
+
+        let not_listening = runtime_diagnostic_reason(Some("no_listener")).unwrap();
+        assert_eq!(not_listening, ProxyErrorReason::UpstreamPortNotListening);
+        assert!(runtime_diagnostic_reason(Some("https://10.0.0.4:4646?token=secret")).is_none());
+        assert!(runtime_diagnostic_reason(Some("healthy")).is_none());
+    }
+
+    #[test]
+    fn classifies_upstream_io_failures_without_exposing_the_target() {
+        let upstream = "http://internal-runtime.service.consul:49152";
+        let refused = std::io::Error::new(std::io::ErrorKind::ConnectionRefused, "refused");
+        let timed_out = std::io::Error::new(std::io::ErrorKind::TimedOut, "timed out");
+        let dns = std::io::Error::other("failed to lookup address information");
+
+        assert!(matches!(
+            classify_upstream_client_error(&refused, upstream),
+            PxxlError::UpstreamConnectionRefused(_)
+        ));
+        assert!(matches!(
+            classify_upstream_client_error(&timed_out, upstream),
+            PxxlError::UpstreamConnectionTimeout(_)
+        ));
+        assert!(matches!(
+            classify_upstream_client_error(&dns, upstream),
+            PxxlError::UpstreamDnsResolutionFailed(_)
+        ));
+
+        for reason in [
+            ProxyErrorReason::UpstreamConnectionRefused,
+            ProxyErrorReason::UpstreamConnectionTimeout,
+            ProxyErrorReason::UpstreamDnsResolutionFailed,
+        ] {
+            assert!(!reason.public_message().contains("internal-runtime"));
+            assert!(!reason.public_message().contains("49152"));
+        }
+    }
+
+    #[tokio::test]
+    async fn diagnostic_error_response_includes_safe_code_host_and_request_id() {
+        let renderer = ErrorPageRenderer::default();
+        let response = renderer.response_with_reason_code(ErrorRenderContext {
+            status: StatusCode::BAD_GATEWAY,
+            message: ProxyErrorReason::UpstreamPortIncorrect.public_message(),
+            reason_code: ProxyErrorReason::UpstreamPortIncorrect.code(),
+            domain: "customer.example",
+            path: "/private-path",
+            request_id: "request-safe-123",
+            processing_time_ms: 8,
+        });
+        assert_eq!(
+            response
+                .headers()
+                .get(PXXL_ERROR_CODE_HEADER)
+                .and_then(|value| value.to_str().ok()),
+            Some("upstream_port_incorrect")
+        );
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let body = std::str::from_utf8(&body).unwrap();
+        assert!(body.contains("customer.example"));
+        assert!(body.contains("request-safe-123"));
+        assert!(!body.contains("/private-path"));
     }
 
     #[test]
