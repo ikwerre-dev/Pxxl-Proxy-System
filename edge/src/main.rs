@@ -650,7 +650,10 @@ async fn apply_runtime_route_event(
     route
         .validate_for_dynamic_control_plane()
         .map_err(|reason| anyhow::anyhow!("invalid runtime route event for {domain}: {reason}"))?;
-    state.routes.upsert_api_route(route.clone());
+    let changed = state.upsert_api_route(route.clone());
+    if !changed {
+        return Ok(());
+    }
     route_store.upsert_route(&route).await?;
     save_http_routes_to_file(route_snapshot_path, &api_routes_for_snapshot(state))
         .await

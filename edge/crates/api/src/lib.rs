@@ -1853,15 +1853,17 @@ impl ApiServer {
             return json_response(StatusCode::BAD_REQUEST, json!({"error": error}));
         }
 
-        self.state.upsert_api_route(route.clone());
-        if let Err(error) = self.persist_route_stores(&route).await {
-            return json_response(StatusCode::BAD_GATEWAY, json!({"error": error}));
+        let changed = self.state.upsert_api_route(route.clone());
+        if changed {
+            if let Err(error) = self.persist_route_stores(&route).await {
+                return json_response(StatusCode::BAD_GATEWAY, json!({"error": error}));
+            }
         }
         json_response(
             StatusCode::OK,
             json!({
                 "schemaVersion": "proxy_routes_v2",
-                "status": "active",
+                "status": if changed { "active" } else { "unchanged" },
                 "host": route.domain,
                 "route_version": route.route_version,
                 "route": redact_route(route),
@@ -1983,15 +1985,17 @@ impl ApiServer {
             );
         }
 
-        self.state.upsert_api_route(route.clone());
-        if let Err(error) = self.persist_route_stores(&route).await {
-            return json_response(StatusCode::BAD_GATEWAY, json!({"error": error}));
+        let changed = self.state.upsert_api_route(route.clone());
+        if changed {
+            if let Err(error) = self.persist_route_stores(&route).await {
+                return json_response(StatusCode::BAD_GATEWAY, json!({"error": error}));
+            }
         }
         let certificate = self.certificate_status(Some(&route.domain)).await;
         json_response(
-            StatusCode::CREATED,
+            if changed { StatusCode::CREATED } else { StatusCode::OK },
             json!({
-                "status": "created",
+                "status": if changed { "created" } else { "unchanged" },
                 "domain": redact_route(route),
                 "certificate": certificate
             }),

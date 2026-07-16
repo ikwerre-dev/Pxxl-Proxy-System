@@ -20,7 +20,7 @@ use std::{
     },
 };
 use tokio::sync::mpsc;
-use tracing::{info, warn};
+use tracing::{debug, info, warn};
 
 const RECENT_VISIT_LIMIT: usize = 5000;
 const MAX_COUNTER_KEYS: usize = 1_000;
@@ -116,6 +116,14 @@ impl RouteRegistry {
     }
 
     pub fn upsert_api_route(&self, route: Route) {
+        if self
+            .snapshot()
+            .into_iter()
+            .any(|existing| api_routes_equivalent(&existing, &route))
+        {
+            return;
+        }
+
         let mut merged: Vec<Route> = self
             .snapshot()
             .into_iter()
@@ -300,6 +308,18 @@ impl RouteRegistry {
     }
 }
 
+fn api_routes_equivalent(existing: &Route, next: &Route) -> bool {
+    existing.source == RouteSource::Api
+        && next.source == RouteSource::Api
+        && existing.id == next.id
+        && existing.domain == next.domain
+        && existing.paths == next.paths
+        && existing.tls == next.tls
+        && existing.algorithm == next.algorithm
+        && existing.rules == next.rules
+        && existing.route_version == next.route_version
+}
+
 #[derive(Clone)]
 pub struct EdgeState {
     pub routes: Arc<RouteRegistry>,
@@ -346,10 +366,21 @@ impl EdgeState {
         refresh_route_metrics(&self.routes, &self.metrics);
     }
 
-    pub fn upsert_api_route(&self, route: Route) {
+    pub fn upsert_api_route(&self, route: Route) -> bool {
+        if self
+            .routes
+            .snapshot()
+            .into_iter()
+            .any(|existing| api_routes_equivalent(&existing, &route))
+        {
+            debug!(domain = %route.domain, "skipping unchanged API route");
+            return false;
+        }
+
         info!(domain = %route.domain, "upserting API route");
         self.routes.upsert_api_route(route);
         refresh_route_metrics(&self.routes, &self.metrics);
+        true
     }
 
     pub fn delete_api_domain(&self, domain: &str) -> bool {
