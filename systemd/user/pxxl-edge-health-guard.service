@@ -1,0 +1,9 @@
+[Unit]
+Description=Pxxl Edge health guard
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=oneshot
+WorkingDirectory=%h/pxxl/proxy
+ExecStart=%h/pxxl/proxy/scripts/edge-health-guard.sh
