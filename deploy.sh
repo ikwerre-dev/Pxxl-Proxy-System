@@ -51,11 +51,23 @@ active_gateway_upstream() {
   fi
 }
 
-active_frontend_upstream() {
-  if [ -n "${PXXL_FRONTEND_UPSTREAM:-}" ]; then
+active_app_upstream() {
+  if [ -n "${PXXL_APP_UPSTREAM:-}" ]; then
+    printf '%s' "$PXXL_APP_UPSTREAM"
+  elif [ -n "${PXXL_FRONTEND_UPSTREAM:-}" ]; then
     printf '%s' "$PXXL_FRONTEND_UPSTREAM"
   elif [ -s ../frontend/.active_upstream ]; then
     tr -d '\n' < ../frontend/.active_upstream
+  else
+    printf ''
+  fi
+}
+
+active_web_upstream() {
+  if [ -n "${PXXL_WEB_UPSTREAM:-}" ]; then
+    printf '%s' "$PXXL_WEB_UPSTREAM"
+  elif [ -s ../web/.active_upstream ]; then
+    tr -d '\n' < ../web/.active_upstream
   else
     printf ''
   fi
@@ -65,20 +77,27 @@ sync_control_plane_routes() {
   [ "${PXXL_PROXY_SYNC_ROUTES:-true}" = "true" ] || return 0
 
   local admin_url="${PXXL_PROXY_ADMIN_URL:-http://127.0.0.1:8081}"
-  local token gateway_upstream frontend_upstream domain payload
-  local gateway_domains="${PXXL_GATEWAY_PROXY_DOMAINS:-gateway.pxxl.app}"
-  local frontend_domains="${PXXL_FRONTEND_PROXY_DOMAINS:-v3.pxxl.app}"
+  local token gateway_upstream app_upstream web_upstream domain payload
+  local gateway_domains="${PXXL_GATEWAY_PROXY_DOMAINS:-server.pxxl.app}"
+  local gateway_alias_domains="${PXXL_GATEWAY_ALIAS_DOMAINS:-gateway.pxxl.app}"
+  local app_domains="${PXXL_APP_PROXY_DOMAINS:-app.pxxl.app}"
+  local web_domains="${PXXL_WEB_PROXY_DOMAINS:-pxxl.app www.pxxl.app}"
   local posthog_api_upstream="${PXXL_POSTHOG_API_UPSTREAM:-https://us.i.posthog.com}"
   local posthog_assets_upstream="${PXXL_POSTHOG_ASSETS_UPSTREAM:-https://us-assets.i.posthog.com}"
   local -a curl_args
 
   token="$(proxy_admin_token)"
   gateway_upstream="$(active_gateway_upstream)"
-  frontend_upstream="$(active_frontend_upstream)"
+  app_upstream="$(active_app_upstream)"
+  web_upstream="$(active_web_upstream)"
 
-  if [ -z "$gateway_upstream" ] && [ -z "$frontend_upstream" ]; then
-    log "No active Gateway/frontend upstream markers found; skipping route sync"
+  if [ -z "$gateway_upstream" ] && [ -z "$app_upstream" ] && [ -z "$web_upstream" ]; then
+    log "No active Gateway/app/web upstream markers found; skipping route sync"
     return 0
+  fi
+
+  if bool_enabled "${PXXL_GATEWAY_ALIAS_ENABLED:-false}"; then
+    gateway_domains="$gateway_domains $gateway_alias_domains"
   fi
 
   for domain in $gateway_domains; do
@@ -95,14 +114,27 @@ sync_control_plane_routes() {
     curl "${curl_args[@]}" -d "$payload" >/dev/null
   done
 
-  for domain in $frontend_domains; do
-    [ -n "$gateway_upstream" ] || continue
-    [ -n "$frontend_upstream" ] || continue
+  for domain in $app_domains; do
+    [ -n "$app_upstream" ] || continue
     payload=$(
-      printf '{"domain":"%s","id":"frontend-%s","tls":true,"paths":[{"prefix":"/api/surveys","upstreams":[{"url":"%s","weight":1}]},{"prefix":"/i","upstreams":[{"url":"%s","weight":1}]},{"prefix":"/e","upstreams":[{"url":"%s","weight":1}]},{"prefix":"/batch","upstreams":[{"url":"%s","weight":1}]},{"prefix":"/decide","upstreams":[{"url":"%s","weight":1}]},{"prefix":"/flags","upstreams":[{"url":"%s","weight":1}]},{"prefix":"/capture","upstreams":[{"url":"%s","weight":1}]},{"prefix":"/engage","upstreams":[{"url":"%s","weight":1}]},{"prefix":"/array","upstreams":[{"url":"%s","weight":1}]},{"prefix":"/static","upstreams":[{"url":"%s","weight":1}]},{"prefix":"/api","upstreams":[{"url":"%s","weight":1}]},{"prefix":"/","upstreams":[{"url":"%s","weight":1}]}]}' \
-        "$domain" "$domain" "$posthog_api_upstream" "$posthog_api_upstream" "$posthog_api_upstream" "$posthog_api_upstream" "$posthog_api_upstream" "$posthog_api_upstream" "$posthog_api_upstream" "$posthog_api_upstream" "$posthog_assets_upstream" "$posthog_assets_upstream" "$gateway_upstream" "$frontend_upstream"
+      printf '{"domain":"%s","id":"app-%s","tls":true,"paths":[{"prefix":"/api/surveys","upstreams":[{"url":"%s","weight":1}]},{"prefix":"/i","upstreams":[{"url":"%s","weight":1}]},{"prefix":"/e","upstreams":[{"url":"%s","weight":1}]},{"prefix":"/batch","upstreams":[{"url":"%s","weight":1}]},{"prefix":"/decide","upstreams":[{"url":"%s","weight":1}]},{"prefix":"/flags","upstreams":[{"url":"%s","weight":1}]},{"prefix":"/capture","upstreams":[{"url":"%s","weight":1}]},{"prefix":"/engage","upstreams":[{"url":"%s","weight":1}]},{"prefix":"/array","upstreams":[{"url":"%s","weight":1}]},{"prefix":"/static","upstreams":[{"url":"%s","weight":1}]},{"prefix":"/","upstreams":[{"url":"%s","weight":1}]}]}' \
+        "$domain" "$domain" "$posthog_api_upstream" "$posthog_api_upstream" "$posthog_api_upstream" "$posthog_api_upstream" "$posthog_api_upstream" "$posthog_api_upstream" "$posthog_api_upstream" "$posthog_api_upstream" "$posthog_assets_upstream" "$posthog_assets_upstream" "$app_upstream"
     )
-    log "Syncing proxy route $domain -> /api $gateway_upstream, PostHog first-party, / $frontend_upstream"
+    log "Syncing proxy route $domain -> PostHog first-party, / $app_upstream"
+    curl_args=(-fsS -X POST "$admin_url/v1/domains" -H 'Content-Type: application/json')
+    if [ -n "$token" ]; then
+      curl_args+=(-H "Authorization: Bearer $token")
+    fi
+    curl "${curl_args[@]}" -d "$payload" >/dev/null
+  done
+
+  for domain in $web_domains; do
+    [ -n "$web_upstream" ] || continue
+    payload=$(
+      printf '{"domain":"%s","id":"web-%s","tls":true,"upstreams":[{"url":"%s","weight":1}]}' \
+        "$domain" "$domain" "$web_upstream"
+    )
+    log "Syncing proxy route $domain -> $web_upstream"
     curl_args=(-fsS -X POST "$admin_url/v1/domains" -H 'Content-Type: application/json')
     if [ -n "$token" ]; then
       curl_args+=(-H "Authorization: Bearer $token")
@@ -123,6 +155,7 @@ replace_edge_container_after_build() {
   podman rm -f pxxl-proxy-edge >/dev/null 2>&1 || true
 }
 
+main() {
 for arg in "$@"; do
   case "$arg" in
     --no-pull) PULL_LATEST=false ;;
@@ -179,3 +212,8 @@ sync_control_plane_routes
 
 log "Proxy is healthy"
 prune_after_build
+}
+
+if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then
+  main "$@"
+fi
