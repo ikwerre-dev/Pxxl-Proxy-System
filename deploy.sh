@@ -98,6 +98,15 @@ sync_control_plane_routes() {
 
   if bool_enabled "${PXXL_GATEWAY_ALIAS_ENABLED:-false}"; then
     gateway_domains="$gateway_domains $gateway_alias_domains"
+  else
+    for domain in $gateway_alias_domains; do
+      log "Removing unpublished Gateway alias route $domain"
+      curl_args=(-fsS -X DELETE "$admin_url/v1/domains/$domain")
+      if [ -n "$token" ]; then
+        curl_args+=(-H "Authorization: Bearer $token")
+      fi
+      curl "${curl_args[@]}" >/dev/null
+    done
   fi
 
   for domain in $gateway_domains; do
