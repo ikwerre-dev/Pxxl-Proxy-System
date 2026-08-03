@@ -8,9 +8,9 @@ use hyper_util::{
     rt::TokioExecutor,
 };
 use pxxl_api::{
-    load_http_routes_from_file, run_admin_api, run_metrics_server, save_http_routes_to_file,
-    AdminApiAuth, AdminApiRuntime, AdminLoginAccount, DatabasePortProxyManager, MetricsAuth,
-    TlsCertificateRuntimeStatus,
+    hash_admin_password, load_http_routes_from_file, run_admin_api, run_metrics_server,
+    save_http_routes_to_file, AdminApiAuth, AdminApiRuntime, AdminLoginAccount,
+    DatabasePortProxyManager, MetricsAuth, TlsCertificateRuntimeStatus,
 };
 use pxxl_common::{ip_allowed_for_upstream, parse_ip_net, PathRoute, Route, RouteSource, Upstream};
 use pxxl_config::{HealthCheckConfig, PxxlConfig};
@@ -56,6 +56,10 @@ const DEFAULT_ROUTE_SNAPSHOT_PATH: &str = "/var/lib/pxxl-proxy/routes.snapshot.j
 
 #[tokio::main]
 async fn main() -> Result<()> {
+    if let Some(exit) = handle_cli_subcommand()? {
+        return exit;
+    }
+
     init_tracing();
 
     let config_path =
@@ -1170,6 +1174,41 @@ fn apply_env_overrides(config: &mut PxxlConfig) {
     }
     if let Ok(value) = std::env::var("PXXL_HEALTH_CHECKS_ENABLED") {
         config.health_checks.enabled = parse_bool(&value);
+    }
+}
+
+/// Handles offline CLI subcommands that must run without booting the proxy.
+/// Returns `Ok(Some(result))` when a subcommand was handled (the caller should
+/// return `result`), or `Ok(None)` to continue normal startup.
+fn handle_cli_subcommand() -> Result<Option<Result<()>>> {
+    let mut args = std::env::args().skip(1);
+    let Some(command) = args.next() else {
+        return Ok(None);
+    };
+    match command.as_str() {
+        "hash-password" => {
+            let password = match args.next() {
+                Some(value) => value,
+                None => {
+                    use std::io::Read;
+                    let mut buffer = String::new();
+                    std::io::stdin()
+                        .read_to_string(&mut buffer)
+                        .context("reading password from stdin")?;
+                    buffer.trim_end_matches(['\r', '\n']).to_string()
+                }
+            };
+            if password.is_empty() {
+                anyhow::bail!(
+                    "hash-password requires a non-empty password as an argument or on stdin"
+                );
+            }
+            let hash =
+                hash_admin_password(&password).map_err(|error| anyhow::anyhow!("{error}"))?;
+            println!("{hash}");
+            Ok(Some(Ok(())))
+        }
+        _ => Ok(None),
     }
 }
 

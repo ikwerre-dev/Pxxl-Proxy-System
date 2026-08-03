@@ -1,3 +1,7 @@
+use argon2::{
+    password_hash::{PasswordHash, PasswordHasher, PasswordVerifier, SaltString},
+    Argon2,
+};
 use bytes::{Bytes, BytesMut};
 use chrono::{Datelike, TimeZone, Utc};
 use http::{header::AUTHORIZATION, Method, Request, Response, StatusCode};
@@ -241,10 +245,15 @@ pub struct AdminLoginAccount {
 }
 
 #[derive(Clone)]
-struct PasswordHashSpec {
-    iterations: u32,
-    salt: String,
-    hash: Vec<u8>,
+enum PasswordHashSpec {
+    /// Argon2id password hash encoded as a PHC string (`$argon2id$v=19$...`).
+    Argon2(String),
+    /// Legacy PBKDF2-HMAC-SHA256 hash kept for backward-compatible verification.
+    Pbkdf2 {
+        iterations: u32,
+        salt: String,
+        hash: Vec<u8>,
+    },
 }
 
 #[derive(Clone, Debug)]
@@ -621,14 +630,33 @@ impl AdminLoginAccount {
 
         self.password_hash.verify(password.as_bytes())
     }
+
+    /// Returns true when the configured hash uses a legacy scheme and should be
+    /// upgraded to Argon2id.
+    fn needs_rehash(&self) -> bool {
+        self.password_hash.is_legacy()
+    }
 }
 
 impl PasswordHashSpec {
     fn parse(encoded: &str) -> Result<Self, String> {
+        let encoded = encoded.trim();
+        if encoded.starts_with("$argon2") {
+            let parsed = PasswordHash::new(encoded).map_err(|error| {
+                format!("admin password hash is not a valid argon2 PHC string: {error}")
+            })?;
+            if parsed.algorithm != argon2::Algorithm::Argon2id.ident() {
+                return Err("admin password hash must use the argon2id variant".to_string());
+            }
+            return Ok(Self::Argon2(encoded.to_string()));
+        }
+
         let parts = encoded.split(':').collect::<Vec<_>>();
         if parts.len() != 4 || parts[0] != "pbkdf2-sha256" {
             return Err(
-                "admin password hash must use pbkdf2-sha256:<iterations>:<salt>:<hash>".to_string(),
+                "admin password hash must use argon2id ($argon2id$...) or the legacy \
+                 pbkdf2-sha256:<iterations>:<salt>:<hash> format"
+                    .to_string(),
             );
         }
 
@@ -651,7 +679,7 @@ impl PasswordHashSpec {
             return Err("admin password hash must be a 32-byte SHA-256 derived key".to_string());
         }
 
-        Ok(Self {
+        Ok(Self::Pbkdf2 {
             iterations,
             salt,
             hash,
@@ -659,14 +687,40 @@ impl PasswordHashSpec {
     }
 
     fn verify(&self, password: &[u8]) -> bool {
-        let derived = pbkdf2_sha256(
-            password,
-            self.salt.as_bytes(),
-            self.iterations,
-            self.hash.len(),
-        );
-        constant_time_eq(&derived, &self.hash)
+        match self {
+            Self::Argon2(encoded) => {
+                let Ok(parsed) = PasswordHash::new(encoded) else {
+                    return false;
+                };
+                Argon2::default().verify_password(password, &parsed).is_ok()
+            }
+            Self::Pbkdf2 {
+                iterations,
+                salt,
+                hash,
+            } => {
+                let derived = pbkdf2_sha256(password, salt.as_bytes(), *iterations, hash.len());
+                constant_time_eq(&derived, hash)
+            }
+        }
     }
+
+    /// Returns true when the stored hash uses the legacy PBKDF2 scheme and should
+    /// be re-generated with Argon2id.
+    fn is_legacy(&self) -> bool {
+        matches!(self, Self::Pbkdf2 { .. })
+    }
+}
+
+/// Hashes a plaintext password with Argon2id and returns a PHC string suitable
+/// for `PXXL_ADMIN_PASSWORD_HASH`.
+pub fn hash_admin_password(password: &str) -> Result<String, String> {
+    let salt = SaltString::encode_b64(uuid::Uuid::new_v4().as_bytes())
+        .map_err(|error| format!("failed to generate password salt: {error}"))?;
+    Argon2::default()
+        .hash_password(password.as_bytes(), &salt)
+        .map(|hash| hash.to_string())
+        .map_err(|error| format!("failed to hash admin password with argon2id: {error}"))
 }
 
 impl AdminPrincipal {
@@ -2472,6 +2526,17 @@ impl ApiServer {
         }
         clear_login_attempts(remote_ip);
 
+        // Rehash-on-login: the credential is sourced from an immutable env var
+        // (`PXXL_ADMIN_PASSWORD_HASH`) with no writable store, so we cannot
+        // persist a new hash ourselves. Prompt the operator to regenerate it
+        // with Argon2id instead of silently logging a password-derived value.
+        if account.needs_rehash() {
+            warn!(
+                account = %account.email(),
+                "admin password uses the legacy pbkdf2-sha256 hash; regenerate PXXL_ADMIN_PASSWORD_HASH with argon2id (see `pxxl account setup`)"
+            );
+        }
+
         let token_name = account.token_name();
         if let Err(error) = store.revoke_tokens_by_name(&token_name).await {
             return json_response(
@@ -4127,5 +4192,40 @@ mod tests {
         assert!(account.verify("owner@example.com", "test-password"));
         assert!(!account.verify("owner@example.com", "wrong-password"));
         assert!(!account.verify("other@example.com", "test-password"));
+    }
+
+    #[test]
+    fn legacy_pbkdf2_hash_is_flagged_for_rehash() {
+        let account = AdminLoginAccount::new(
+            "owner@example.com",
+            "pbkdf2-sha256:200000:0011223344556677:b8902efe5e8915505b74f56b9ede5f79346e2ca7aefd413fcf1a3794feadbed7",
+        )
+        .unwrap();
+
+        assert!(account.needs_rehash());
+    }
+
+    #[test]
+    fn verifies_argon2id_admin_account_password_hash() {
+        let hash = hash_admin_password("test-password").unwrap();
+        assert!(hash.starts_with("$argon2id$"));
+
+        let account = AdminLoginAccount::new("Owner@Example.com", &hash).unwrap();
+        assert_eq!(account.email(), "owner@example.com");
+        assert!(account.verify("owner@example.com", "test-password"));
+        assert!(!account.verify("owner@example.com", "wrong-password"));
+        assert!(!account.verify("other@example.com", "test-password"));
+        assert!(!account.needs_rehash());
+    }
+
+    #[test]
+    fn rejects_non_argon2id_phc_hash() {
+        let bcrypt_like = "$argon2i$v=19$m=19456,t=2,p=1$c29tZXNhbHQ$c29tZWhhc2h2YWx1ZQ";
+        assert!(PasswordHashSpec::parse(bcrypt_like).is_err());
+    }
+
+    #[test]
+    fn rejects_unknown_hash_format() {
+        assert!(PasswordHashSpec::parse("plaintext-password").is_err());
     }
 }
