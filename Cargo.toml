@@ -20,7 +20,7 @@ hyper-rustls = { version = "0.27", features = ["http1", "http2", "native-tokio"]
 hyper-util = { version = "0.1", features = ["client", "client-legacy", "http1", "http2", "server", "server-auto", "tokio"] }
 ipnet = { version = "2.10", features = ["serde"] }
 jsonwebtoken = "9.3"
-maxminddb = "0.24"
+maxminddb = "0.27"
 parking_lot = "0.12"
 prometheus = "0.13"
 rcgen = "0.12"

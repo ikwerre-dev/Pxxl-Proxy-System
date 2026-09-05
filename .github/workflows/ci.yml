@@ -1,0 +1,87 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+
+jobs:
+  # Mirrors the local gate documented in CONTRIBUTING.md:
+  #   cargo fmt --all --check
+  #   cargo clippy --workspace --all-targets -- -D warnings
+  #   cargo test --workspace --all-targets
+  lint-and-test:
+    name: fmt + clippy + test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - name: Cache cargo artifacts
+        uses: Swatinem/rust-cache@v2
+
+      - name: Format check
+        run: cargo fmt --all --check
+
+      - name: Clippy (deny warnings)
+        run: cargo clippy --workspace --all-targets -- -D warnings
+
+      - name: Test
+        run: cargo test --workspace --all-targets
+
+  # Fails the build on known RUSTSEC advisories in the dependency tree.
+  # Relevant for an edge-facing proxy per SECURITY.md.
+  security-audit:
+    name: cargo audit
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Install cargo-audit
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-audit
+
+      # RUSTSEC-2024-0437 (protobuf 2.x recursion crash) is a transitive dependency
+      # of prometheus 0.13. The crash requires parsing untrusted protobuf input, but
+      # Pxxl only *serves* the Prometheus text exposition format and never parses
+      # protobuf, so the vulnerable path is unreachable. Remove this ignore once
+      # prometheus is upgraded to a release that uses protobuf >= 3.7.2.
+      - name: Audit dependencies
+        run: cargo audit --ignore RUSTSEC-2024-0437
+
+  # Validates the production image defined in the Makefile `docker-build` target.
+  docker-build:
+    name: docker build (edge)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Build edge image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: edge/docker/Dockerfile
+          push: false
+          tags: pxxl/edge:ci
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
