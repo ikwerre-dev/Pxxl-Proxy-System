@@ -1191,7 +1191,11 @@ impl PolicyEnforcer {
             insert_static_header(headers, "x-frame-options", "DENY");
             insert_static_header(headers, "x-content-type-options", "nosniff");
             insert_static_header(headers, "referrer-policy", "origin-when-cross-origin");
-            insert_static_header(
+            // Preserve an explicit application policy. Browsers combine duplicate
+            // Permissions-Policy headers using the most restrictive result, so
+            // adding the edge default beside an application's camera/geolocation
+            // policy silently disables those features.
+            insert_static_header_if_absent(
                 headers,
                 "permissions-policy",
                 "camera=(), microphone=(), geolocation=()",
@@ -4336,6 +4340,16 @@ fn insert_static_header(headers: &mut HeaderMap, name: &'static str, value: &'st
     );
 }
 
+fn insert_static_header_if_absent(
+    headers: &mut HeaderMap,
+    name: &'static str,
+    value: &'static str,
+) {
+    if !headers.contains_key(name) {
+        insert_static_header(headers, name, value);
+    }
+}
+
 async fn collect_body_with_limit(body: Incoming, max_bytes: u64) -> Result<Bytes, BufferError> {
     let mut body = body;
     let mut collected = BytesMut::new();
@@ -5156,6 +5170,46 @@ mod tests {
         let built = build_upstream_uri(&upstream, &uri).unwrap();
 
         assert_eq!(built.to_string(), "http://api:3000/v1/users?page=1");
+    }
+
+    #[test]
+    fn security_default_preserves_explicit_permissions_policy() {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            HeaderName::from_static("permissions-policy"),
+            HeaderValue::from_static("camera=(self), geolocation=(self)"),
+        );
+
+        insert_static_header_if_absent(
+            &mut headers,
+            "permissions-policy",
+            "camera=(), microphone=(), geolocation=()",
+        );
+
+        assert_eq!(
+            headers
+                .get("permissions-policy")
+                .and_then(|value| value.to_str().ok()),
+            Some("camera=(self), geolocation=(self)")
+        );
+    }
+
+    #[test]
+    fn security_default_adds_permissions_policy_when_upstream_omits_it() {
+        let mut headers = HeaderMap::new();
+
+        insert_static_header_if_absent(
+            &mut headers,
+            "permissions-policy",
+            "camera=(), microphone=(), geolocation=()",
+        );
+
+        assert_eq!(
+            headers
+                .get("permissions-policy")
+                .and_then(|value| value.to_str().ok()),
+            Some("camera=(), microphone=(), geolocation=()")
+        );
     }
 
     #[test]
